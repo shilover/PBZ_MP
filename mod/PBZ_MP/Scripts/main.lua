@@ -21,7 +21,7 @@
 
 local UEHelpers = require("UEHelpers")
 
-local VERSION = "0.27.18"
+local VERSION = "0.27.23"
 local TAG = "[PBZ_MP] "
 -- v0.14.0：所有文件都放在模组自己的目录（…/Mods/PBZ_MP/），不再写死本机的游戏路径，别人的电脑上也能用。
 -- 从本脚本的路径推出模组目录（脚本在 PBZ_MP/Scripts/main.lua）；拿不到时退回 UE4SS 的工作目录（游戏 exe 所在的 platform/steam）下的相对路径
@@ -240,7 +240,7 @@ function PIPE.close(why)
     if PIPE.up then pcall(function() PIPE.up:close() end) end
     if PIPE.down then pcall(function() PIPE.down:close() end) end
     PIPE.up, PIPE.down = nil, nil
-    if PIPE.on then out("管道断开（%s），退回文件交接", tostring(why)) end
+    if PIPE.on then out("管道断开（%s），退回文件交接", tostring(why)); PIPE.lostAt = os.time() end   -- §99 NETUI.watchPipe 看着
     PIPE.on = false
     PIPE.retryAt = os.clock() + PIPE.RETRY
 end
@@ -424,6 +424,92 @@ local function hpTraceStep()
     end
 end
 
+-- ============================================================ §99 悬空等地形加载
+
+-- 2026-11-05 20:33 内测：两人在同一张大地图（PBZ_Xigu_WP）的不同区域，客机连上后被放到主机身边（22009 外）、
+-- 替身也被瞬移到主机那边——那片地形在客机这台电脑上还没加载出来，客机"往下掉了 1537"，替身看不见了
+-- （掉出世界被引擎藏起来，重新连一次走"替身复用"才重新显示）。
+-- 做法：跳得远（> FAR）或者替身在对方站在地上时往下掉了 DROP 以上 → 放回落点、悬空（G.hover，不受重力）；
+-- 每 TRY 秒放回走路试一次，再往下掉就再悬空；落地站住 OK 秒算地形到了；最多 MAX 秒。
+-- pos 可以是坐标，也可以是返回坐标的函数（替身跟着对方现在的网络位置）
+-- 全局（主代码块的 local 已满 200 个）
+HOV = { list = {}, FAR = 5000.0, DROP = 300.0, TRY = 1.0, OK = 1.5, MAX = 30.0, logs = 0, n = 0, unhid = 0 }
+
+function HOV.posOf(e)
+    if type(e.pos) == "function" then return e.pos() end
+    return e.pos
+end
+
+function HOV.has(actor)
+    return valid(actor) and HOV.list[pathOf(actor)] ~= nil
+end
+
+function HOV.log(fmt, ...)
+    HOV.logs = HOV.logs + 1
+    if HOV.logs <= 40 then out(fmt, ...) end
+end
+
+-- 放到 pos（抬高 20）并悬空
+function HOV.hold(actor, pos, why, tn)
+    if not valid(actor) then return end
+    local key = pathOf(actor)
+    local e = HOV.list[key]
+    if not e then
+        e = { actor = actor, pos = pos, why = why, since = tn, tries = 0 }
+        HOV.list[key] = e
+        HOV.n = HOV.n + 1
+    end
+    local p = HOV.posOf(e)
+    if p then pcall(function() actor:K2_SetActorLocation({ X = p.X, Y = p.Y, Z = p.Z + 20.0 }, false, {}, true) end) end
+    G.hover(actor, true)
+    e.flying, e.next, e.okAt = true, tn + HOV.TRY, nil
+    HOV.log("%s：先悬空等地形加载（第 %d 次放回）", why, e.tries + 1)
+end
+
+-- 每次驱动调
+function HOV.step(tn)
+    for key, e in pairs(HOV.list) do
+        if not valid(e.actor) then
+            HOV.list[key] = nil
+        elseif tn - e.since > HOV.MAX then
+            HOV.list[key] = nil
+            G.hover(e.actor, false)
+            HOV.log("!! %s：%.0f 秒了地形还是没站住，不再悬空（放回 %d 次）", e.why, HOV.MAX, e.tries)
+        elseif e.flying then
+            if tn >= e.next then
+                G.hover(e.actor, false)
+                e.flying, e.okAt = false, tn + HOV.OK
+            end
+        else
+            local loc = try("hov loc", function() return e.actor:K2_GetActorLocation() end)
+            local p = HOV.posOf(e)
+            if loc and p and loc.Z < p.Z - HOV.DROP then
+                e.tries = e.tries + 1
+                HOV.hold(e.actor, p, e.why, tn)
+            elseif e.okAt and tn >= e.okAt then
+                HOV.list[key] = nil
+                HOV.log("%s：站住了（用时 %.1f 秒，放回 %d 次）", e.why, tn - e.since, e.tries)
+            end
+        end
+    end
+end
+
+-- 替身：每次驱动后看一眼。对方在地上（不在空中）、替身却比对方的网络位置低 DROP 以上还在往下掉 → 悬空跟着对方；
+-- 被引擎藏起来了（掉出世界）→ 重新显示
+function HOV.watchPuppet(pup, tn, remoteAir)
+    if ST.ticks % 15 == 0 and G.unhide(pup) then
+        HOV.unhid = HOV.unhid + 1
+        if HOV.unhid <= 10 then out("!! 替身被引擎藏起来了（掉出世界？），重新显示（第 %d 次）", HOV.unhid) end
+    end
+    if remoteAir or not NET.pos or HOV.has(pup) then return end
+    local st = G.airOf(pup)
+    if not (st and st.falling) then return end
+    local loc = try("hov pup", function() return pup:K2_GetActorLocation() end)
+    if loc and loc.Z < NET.pos.Z - HOV.DROP then
+        HOV.hold(pup, function() return NET.pos end, "替身往下掉（对方站在地上，这里地形没加载？）", tn)
+    end
+end
+
 -- ============================================================ 替身移动
 
 -- 速度匹配跟随：v = 目标速度 + 3 × 位置误差（交接文档 §3.8）
@@ -459,6 +545,8 @@ local function drivePuppet(pup, pos, vel, yaw)
         ST.lagSince = nil
         pcall(function() pup:K2_SetActorLocation({ X = pos.X, Y = pos.Y, Z = pos.Z + 20.0 }, false, {}, true) end)
         setYaw(pup, yaw)
+        -- §99 跳到远处：那片地形可能还没加载，先悬空跟着对方的网络位置
+        if dist > HOV.FAR then HOV.hold(pup, function() return NET.pos end, "替身瞬移到远处", now()) end
         ST.snaps = (ST.snaps or 0) + 1
         if not ST.snapLogAt or now() - ST.snapLogAt > 2.0 then
             ST.snapLogAt = now()
@@ -886,6 +974,11 @@ function LO.isHitMontage(m)
         if m:find(k, 1, true) then return true end
     end
     return false
+end
+
+-- §103 喝药动作：AM_Hun_Medicine_LongBlade / _TangBlade / _DoubleBlade……（按手上武器不同，2026-11-05 日志里见过这三个）
+function LO.isMedMontage(m)
+    return m ~= nil and m:find("AM_Hun_Medicine_", 1, true) == 1
 end
 
 function LO.zmHeal(p1, atkId, dmg)
@@ -2163,6 +2256,106 @@ function LAT.report()
         #why > 0 and ("（" .. table.concat(why, "，") .. "）") or "", nl, nok)
 end
 
+-- ============================================================ §100 替身放招成功却没换动作（v0.27.20）
+-- 2026-11-05 22:31–22:32 实战（对方白影 / 混沌剑）：对方从 BB 接白影 C、火形 B / BBB 时，替身 TryActivateAbilityByClass 返回 true，
+-- 技能照自己的时间表出伤害（白影 C 3.8 秒里 −955、−1546，第二次直接把人打倒），替身身上却还是 BB 的动作或者空着——
+-- 玩家看到"对方没出招，我一直挨打"。白影 C 7 次里 3 次、火形 BBB 15 次里 11 次这样，前一个动作都是 BB。
+-- §65 的"上一招没收先停掉"只在放不出时走，这里放得出，所以没管到。
+-- 做法：放成功 CHECK 秒后看替身的动作——
+--   换上了新动作（名字变了，或同名但刚从头播）→ 记下"招 → 动作"
+--   没换、这招还挂着、而且知道这招该播什么 → ① 停掉旧动作、取消挂着的招，重放一次；② 再过 CHECK 秒还没新动作 → 直接播那个动作
+--   不知道这招该播什么的不碰（有的招本来就没有动作），只记一行
+-- "招 → 动作"从替身放成功的招、本机玩家自己放的招里学；SEED 是 2026-11-05 日志里玩家自己放出来的（一一对应）
+ANIM = { CHECK = 0.15, FRESH = 0.4, LOGS = 30, logs = 0, map = {}, unknown = {},
+         st = { ok = 0, stuck = 0, retryOk = 0, playOk = 0, fail = 0, ended = 0 } }
+ANIM.SEED = {
+    GA_Hun_BaiYing_A_C = "Hun_BaiYing_A_Montage", GA_Hun_BaiYing_AA_C = "Hun_BaiYing_AA_Montage",
+    GA_Hun_BaiYing_AAA_C = "Hun_BaiYing_AAA_Montage", GA_Hun_BaiYing_AAAA_C = "Hun_BaiYing_AAAA_Montage",
+    GA_Hun_BaiYing_AAAAA_C = "Hun_BaiYing_AAAAA_Montage", GA_Hun_BaiYing_B_C = "Hun_BaiYing_B_Montage",
+    GA_Hun_BaiYing_BB_C = "Hun_BaiYing_BB_Montage", GA_Hun_BaiYing_BBB_C = "Hun_BaiYing_BBB_Montage",
+    GA_Hun_BaiYing_C_C = "Hun_BaiYing_C_Montage", GA_Hun_BaiYing_SWT_Power_C = "Hun_BaiYing_AAAA_Montage",
+    GA_Hun_Chaos_A_C = "Hun_YuCongBlade_Attack_A_Montage", GA_Hun_Chaos_AA_C = "Hun_YuCongBlade_Attack_AA_Montage",
+    GA_Hun_Chaos_AAA_C = "Hun_YuCongBlade_Attack_AAA_Montage", GA_Hun_Chaos_AAAA_C = "Hun_YuCongBlade_Attack_AAAA_Montage",
+    GA_Hun_Chaos_AAAAA_C = "Hun_YuCongBlade_Attack_AAAAA_Montage", GA_Hun_Chaos_C_C = "Hun_YuCongBlade_Unique_Skill_Montage",
+    GA_Hun_Chaos_B_Fire_C = "Hun_YuCongBlade_Type02_B_Montage", GA_Hun_Chaos_BB_Fire_C = "Hun_YuCongBlade_Type02_BB_Montage",
+    GA_Hun_Chaos_BBB_Fire_C = "Hun_YuCongBlade_Type02_BBB_Montage", GA_Hun_Chaos_B_Ice_C = "Hun_YuCongBlade_Type01_B_Montage",
+    GA_Hun_Chaos_B_Physics_C = "Hun_YuCongBlade_Type03_B_Montage", GA_Hun_Chaos_BB_Physics_C = "Hun_YuCongBlade_Type03_BB_Montage",
+    GA_Hun_Chaos_SwitchFormPhysic_SWT_C = "Hun_YuCongBlade_Skill_06_Montage",
+}
+
+-- 受击 / 格挡 / 破防 / 闪避不是这一招的动作，不学
+function ANIM.learn(ga, mon)
+    if not (ga and mon and mon ~= "") then return end
+    for _, k in ipairs({ "_Hit_", "Deflect", "MoTian_Dodge", "_Dead_" }) do
+        if mon:find(k, 1, true) then return end
+    end
+    ANIM.map[ga] = mon
+end
+
+function ANIM.expect(ga) return ANIM.map[ga] or ANIM.SEED[ga] end
+
+function ANIM.log(fmt, ...)
+    ANIM.logs = ANIM.logs + 1
+    if ANIM.logs <= ANIM.LOGS or ANIM.logs % 20 == 0 then out(fmt, ...) end
+end
+
+-- AIR.fire 放成功后：before = 放之前替身在播的动作名
+function ANIM.afterFire(pup, e, before, tn)
+    if not isAttackAbility(e.name) or e.name:find("_Air", 1, true) or CHG.isHold(e.name) then ANIM.pend = nil; return end
+    ANIM.pend = { pup = pup, name = e.name, id = e.id, before = before, at = tn, stage = 1 }
+end
+
+-- 每次驱动：到点看一眼（没有等着的就什么都不读）
+function ANIM.step(tn)
+    local p = ANIM.pend
+    if not p or tn - p.at < ANIM.CHECK then return end
+    if not valid(p.pup) then ANIM.pend = nil; return end
+    local an, _, name, pos = LAT.activeMontage(p.pup)
+    if an and name and (name ~= p.before or (pos and pos < ANIM.FRESH)) then
+        ANIM.pend = nil
+        if p.stage == 1 then ANIM.st.ok = ANIM.st.ok + 1; ANIM.learn(p.name, name); return end
+        ANIM.st.retryOk = ANIM.st.retryOk + 1
+        ANIM.learn(p.name, name)
+        ANIM.log("  ◇ 远端#%d %s 重放后换上了 %s", p.id, p.name, name)
+        return
+    end
+    if not (activeAbilities(p.pup) or {})[p.name] then        -- 招已经收了（短招、被打断）
+        ANIM.pend = nil
+        if p.stage == 1 then ANIM.st.ended = ANIM.st.ended + 1
+        else ANIM.st.fail = ANIM.st.fail + 1; ANIM.log("  ◇ 远端#%d %s 重放后技能没挂上，动作也没有", p.id, p.name) end
+        return
+    end
+    local want = ANIM.expect(p.name)
+    if p.stage == 1 then
+        ANIM.st.stuck = ANIM.st.stuck + 1
+        if not want then
+            ANIM.pend = nil
+            if not ANIM.unknown[p.name] then
+                ANIM.unknown[p.name] = true
+                out("◇ 远端#%d %s 放成功 %.2f 秒，替身动作还是 %s；不知道这招该播什么，不补", p.id, p.name, tn - p.at, tostring(name))
+            end
+            return
+        end
+        local cut = name and cutMontage(p.pup)
+        local gone = G.cancelMoves(p.pup)
+        local ok = activateOnPuppet(p.pup, p.name, NET.sub, "补放 远端#" .. p.id)
+        ANIM.log("◇ 远端#%d %s 放成功 %.2f 秒，替身动作还是 %s（该是 %s）：停掉 %s、取消 %s，重放 %s", p.id, p.name, tn - p.at,
+            tostring(name), want, tostring(cut), #gone > 0 and table.concat(gone, ",") or "无", ok and "成功" or "失败")
+        if ok then p.stage, p.at, p.before = 2, tn, nil; return end
+    end
+    ANIM.pend = nil       -- 重放也没换上（或重放失败）：直接播
+    local okP = playNamed(p.pup, want)
+    if okP then ANIM.st.playOk = ANIM.st.playOk + 1 else ANIM.st.fail = ANIM.st.fail + 1 end
+    ANIM.log("  ◇ 远端#%d %s 还是没动作 → 直接播 %s：%s", p.id, p.name, want, okP and "已播" or "失败")
+end
+
+function ANIM.report()
+    local s = ANIM.st
+    if s.stuck == 0 then return end
+    out("      放招没换动作 %d 次（正常 %d，招自己收了 %d）：重放补上 %d，直接播 %d，没补上 %d", s.stuck, s.ok, s.ended,
+        s.retryOk, s.playOk, s.fail)
+end
+
 -- 判定窗口跟着替身的动作（v0.27.1，§78.5）：炽刃大招出手 2–3.8 秒后才扣血，1.2 秒的窗口把它判成落空。
 -- 过了 JUDGE_WIN、替身还在播为这一招开的蒙太奇（LAT.byId 记的那个）就继续等，最多 JUDGE_MAX 秒
 LAT.JUDGE_MAX = 5.0
@@ -2693,6 +2886,7 @@ function AIR.fire(p1, pup, e, tn)
     local ok = activateOnPuppet(pup, e.name, NET.sub, "远端#" .. e.id)
     if isAttackAbility(e.name) then openJudge(p1, e.id, tn, e.name); ST.pupAtkAt = tn end
     if ok and not CHG.isHold(e.name) then LAT.afterFire(pup, e, before, tn) end     -- v0.27.0 追帧（§92 蓄力招不追：跳前摇会把蓄力段跳乱）
+    if ok then ANIM.afterFire(pup, e, before, tn) end     -- §100 放成功却没换动作 → 补
     if ok and CHG.isHold(e.name) then CHG.onFire(pup, e, tn) end        -- §92 替身按对方的松手时刻松手
     if ok and CHG.watched(e.name) then CHG.watch(pup, "替身", e.name, tn, e.id) end
     if LO.isEdgeAttack(e.name) then ST.pupEdgeAt = tn end      -- v0.23.7 影之武装伤害系数
@@ -2778,6 +2972,11 @@ local function netSend(p1, tn)
     if hm ~= NET.hrPrev and LO.isHitMontage(hm) then
         NET.hrN, NET.hrT = (NET.hrN or 0) + 1, hm
     end
+    -- §103 喝药：喝药技能 GA_Medicine_* 被 replayable 排除了（替身真激活会扣药 / 回血），对面以前只看到血条涨。
+    -- 改成发动作：喝药动作换成新的一个时次数 +1，发 med=<次数>:<动作名>，对方替身只播这个动作
+    if hm ~= NET.hrPrev and LO.isMedMontage(hm) then
+        NET.medN, NET.medT = (NET.medN or 0) + 1, hm
+    end
     if hm ~= NET.hrPrev and hm:find("C_Failed", 1, true) then ULT.watch(p1, false, "我大招失败 " .. hm, tn) end   -- v0.27.1
     ULT.flushHeld(p1, hm, tn)          -- v0.27.2 压住的大招：放出来了才发
     NET.hrPrev = hm
@@ -2819,6 +3018,7 @@ local function netSend(p1, tn)
         .. "bo=" .. NET.boCfg .. "\n"      -- v0.26.3 我的局数设置（只有主机的算数）
         .. "dm=" .. NET.dmCfg .. "\n"      -- §86 我的伤害倍率设置（只有主机的算数）
         .. "ab=" .. NET.abCfg .. "\n"      -- §87 我的"全部可格挡"设置（只有主机的算数）
+        .. "med=" .. (NET.medN or 0) .. ":" .. (NET.medT or "-") .. "\n"   -- §103 喝药动作（次数:动作名）
         .. LAT.wire(tn, NET.events)        -- v0.27.0 ts= / tse= / evt=：测往返和包龄
         .. CHG.wire(tn))                   -- §92 rel=<招式号>:<按了几秒>：蓄力招松手
 end
@@ -2850,7 +3050,7 @@ function NET.recvOne(p1, tn, t)
     if seq < NET.lastSeq then
         if seq > NET.lastSeq - 100 then return end   -- 乱序到达的旧包，丢掉
         out("远端序号回退 %d -> %d（对方重启了？），重置", NET.lastSeq, seq)
-        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.resAtk = 0, nil, 0, nil, nil, {}
+        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.resAtk = 0, nil, 0, nil, nil, nil, {}
         LAT.reset(); CHG.reset()
     end
     if NET.lastSeq == -1 or NET.lastRecvAt < tn - 5 then
@@ -2858,7 +3058,7 @@ function NET.recvOne(p1, tn, t)
         NET.rwcCur, NET.rwcOff = nil, nil       -- v0.26.1 新连接：另一把等对方切一次武器才知道
         -- v0.18.2（17:13 实测）：换了个对手 / 对方重启后序号反而更大时，上面的"序号回退"不触发，招式号还停在上一个对手的 #14，
         -- 新对手的 #1–#14 全被当成"已处理"丢掉。断了 5 秒以上再收到就算新连接，各计数清零（旧事件早超过 EV_KEEP 了）
-        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.resAtk = 0, nil, 0, nil, nil, {}
+        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.resAtk = 0, nil, 0, nil, nil, nil, {}
         LAT.reset(); CHG.reset()
     end
     NET.lastSeq, NET.lastRecvAt, NET.rx = seq, tn, NET.rx + 1
@@ -2886,6 +3086,16 @@ function NET.recvOne(p1, tn, t)
             out("◆ 对方破防（第 %d 次）→ 替身播 %s：%s", bn, bm, okB and "已播" or "失败")
         end
         NET.brkIn = bn
+    end
+    -- §103 对方喝药 → 替身只播喝药动作，不激活喝药技能（不扣药、不回血；血量照旧按 hp=）。第一次收到只记次数
+    local mn, mm = (t.med or ""):match("^(%d+):([%w_%-]+)$")   -- 还没喝过 = "0:-"
+    mn = tonumber(mn)
+    if mn then
+        if NET.medIn and mn > NET.medIn and LO.isMedMontage(mm) and not REP.on then
+            local okM = playNamed(puppet(), mm)
+            out("  对方喝药 %s → 替身 %s", mm, okM and "已播" or "播放失败（本机没有这个动作）")
+        end
+        NET.medIn = mn
     end
     -- v0.18.3 对方的受击动作 → 替身播同一个（模组自己播的不会被"掐掉本机反应"掐掉）。第一次收到只记次数
     local hn2, ht2 = (t.hr or ""):match("^(%d+):([%w_%.]+)$")
@@ -3261,7 +3471,9 @@ local function netStep()
         end
         NET.lastErr = drivePuppet(pup, LAT.target(tn), NET.vel, yaw)     -- v0.27.0 追外推后的位置
         AIR.step(p1, pup, tn)      -- v0.24.2 对方在空中 → 替身起跳；排队的空中招
+        HOV.watchPuppet(pup, tn, AIR.rair == true)   -- §99 对方在地上替身却往下掉 / 被引擎藏起 → 悬空、重新显示
         LAT.step(tn)               -- v0.27.0 追帧：等替身开始播这招的蒙太奇
+        ANIM.step(tn)              -- §100 放成功却没换动作：重放 / 直接播
         ULT.step(p1, tn)           -- v0.27.1 大招资源诊断（只在有等着的诊断时读属性）
         CHG.step(p1, pup, tn)      -- §92 蓄力探针（只在有在记的条目时读）
         -- 替身的架势在本机保持满值：破防应由对方判定，不能被我本机的刀打出来（v0.9.5 日志里有本机 BreakEscape）
@@ -3314,6 +3526,7 @@ local function netStep()
             NET.applied.hit or 0, (NET.applied.parry or 0) + (NET.applied.deflect or 0), NET.applied.block or 0,
             NET.applied.miss or 0)
         if (NET.suppressed or 0) > 0 then out("      已掐掉替身的本机受击/破防动作 %d 次", NET.suppressed) end
+        ANIM.report()
     end
     if fresh and ST.ticks % 300 == 150 then LAT.report() end      -- v0.27.0 每 10 秒一行延迟统计
 end
@@ -4175,7 +4388,7 @@ local function pieceSet(p, s, col, size, dz)
 end
 
 -- net-ui：联机面板最多 9 行，所以 3 → 9；文字物体按需要的行数逐步生成（平时还是只有 3 行 × 3 个）
-local HUD_ROWS = 15         -- v0.18.6：面板加了"输入地址 / 复制地址 / 设置"三行，9 → 12；v0.27.6 设置页 12 项（伤害倍率、全部可格挡），12 → 15
+local HUD_ROWS = 17         -- v0.18.6：面板加了"输入地址 / 复制地址 / 设置"三行，9 → 12；v0.27.6 设置页 12 项（伤害倍率、全部可格挡），12 → 15；v0.27.21 设置页加感谢名单（13 项），15 → 16；§102 加"直连不通时用服务器中转"（14 项），16 → 17
 
 local function setHud(rows)
     if rows and valid(MATCH.text) and #(MATCH.hud or {}) < math.min(#rows, HUD_ROWS) then
@@ -4816,8 +5029,13 @@ function MAPGO.besideHost(p1)
     local want = { X = NET.pos.X + math.cos(r + math.pi / 2) * 300.0, Y = NET.pos.Y + math.sin(r + math.pi / 2) * 300.0,
                    Z = NET.pos.Z + 30.0 }
     local face0 = math.deg(math.atan(NET.pos.Y - want.Y, NET.pos.X - want.X))
+    local was = try("beside from", function() return p1:K2_GetActorLocation() end)
     local pos = safePlace(p1, want, { X = NET.pos.X, Y = NET.pos.Y, Z = NET.pos.Z + 30.0 }, face0, "放到主机身边")
     if not pos then return nil end
+    -- §99 同一张大地图里跳得远：落点的地形可能还没加载（20:33 内测"往下掉了 1537"），先悬空等它
+    if was and math.sqrt((pos.X - was.X) ^ 2 + (pos.Y - was.Y) ^ 2) > HOV.FAR then
+        HOV.hold(p1, { X = pos.X, Y = pos.Y, Z = pos.Z }, "放到主机身边", now())
+    end
     local face = math.deg(math.atan(NET.pos.Y - pos.Y, NET.pos.X - pos.X))
     setYaw(p1, face)
     pcall(function() getP1PC():SetControlRotation({ Pitch = -10.0, Yaw = face, Roll = 0.0 }) end)
@@ -5025,6 +5243,7 @@ end
 
 local function lobbyStep(p1, tn, lost)
     SAFE.step()     -- v0.26.2 放下后掉出地图 → 放回原处（§79）
+    HOV.step(tn)    -- §99 悬空等地形加载（客机放到主机身边、替身瞬移到远处）
     if ST.ticks % 30 == 0 then
         local kv = fileReadKV(SESSION_FILE)
         local was = MATCH.session and MATCH.session.role
@@ -5095,7 +5314,7 @@ NETUI.BUSY = {
     host = { "正在创建房间", "CREATING THE ROOM" }, ai = { "正在开始 AI 对战", "STARTING THE AI BATTLE" },
     join = { "正在加入", "JOINING" }, stop = { "正在断开", "DISCONNECTING" }, mode = { "正在切换连接方式", "SWITCHING" },
 }
-for _, c in ipairs({ "name", "port", "upnp", "server", "secret", "lang", "ailevel", "airoom", "airoommode" }) do
+for _, c in ipairs({ "name", "port", "upnp", "relay", "server", "secret", "lang", "ailevel", "airoom", "airoommode" }) do
     NETUI.BUSY[c] = { "正在保存", "SAVING" }
 end
 local LOBBY_FILE, CMD_FILE = NET_DIR .. "/lobby.txt", NET_DIR .. "/cmd.txt"
@@ -5209,6 +5428,17 @@ local function netuiEnsure(why, tn)
     NETUI.tries = NETUI.tries + 1
     out("联机面板：联机程序没运行（%s），自动启动第 %d 次", why, NETUI.tries)
     netuiLaunch()
+end
+
+-- §99 管道断开（联机程序退出 / 崩了）4 秒后还没连回来就自动拉起，不等玩家打开面板。
+-- 2026-11-05 19:56 内测：联机窗口点 × 退出后 4 分多钟没有联机程序，直到玩家在面板上手动点"重新启动联机程序"。
+-- 每次断开算新的一轮（次数清零）；10 秒内不重复拉、连续 NETUI_AUTO_TRIES 次的限制照旧在 netuiEnsure 里
+function NETUI.watchPipe(tn)
+    if not PIPE.lostAt then return end
+    if PIPE.on then PIPE.lostAt = nil; return end
+    if os.time() - PIPE.lostAt < 4 then return end
+    PIPE.lostAt, NETUI.tries = nil, 0
+    netuiEnsure("管道断开", tn)
 end
 
 -- 当前显示的连接方式：刚在面板上换过、窗口还没跟上（2 秒内）时以面板的选择为准，连按左右才不会从旧值算
@@ -5426,7 +5656,7 @@ local function roomPages(rooms)
     return math.max(1, math.ceil(#rooms / perPage()))
 end
 
--- 面板里可选的行：{ label, act = function() } ；没有 act 的是说明行。NETUI.page = main / rooms / settings
+-- 面板里可选的行：{ label, act = function() } ；没有 act 的是说明行。NETUI.page = main / rooms / settings / thanks
 local function netuiItems(lb, tn)
     local items = {}
     if not lobbyAlive(lb) then
@@ -5439,6 +5669,13 @@ local function netuiItems(lb, tn)
     end
     local mode = netuiMode(lb, tn)
     local function page(p) return function() NETUI.page = p; NETUI.sel = 1 end end
+    -- v0.27.21 感谢名单（设置里的一页）：参与测试并反馈了 bug 的玩家
+    if NETUI.page == "thanks" then
+        items[#items + 1] = { label = T("参与测试并反馈了 bug 的玩家（B 站）：", "PLAYERS WHO TESTED AND REPORTED BUGS (BILIBILI):") }
+        for _, n in ipairs({ "成步堂芦苇", "谦逊的刘恒宇" }) do items[#items + 1] = { label = "  " .. n } end
+        items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
+        return items
+    end
     if NETUI.page == "settings" then
         local on = lb.upnpon == "1"
         items[#items + 1] = { label = T("昵称：", "NAME: ") .. clipText(lb.name or "?", 20),
@@ -5452,6 +5689,10 @@ local function netuiItems(lb, tn)
         items[#items + 1] = { label = T("大厅服务器：", "LOBBY SERVER: ") .. clipText(srv, 24),
                               act = function() editStart("server", T("输入大厅服务器地址 域名或IP[:端口]（空着回车 = 不改）", "LOBBY SERVER HOST[:PORT] (EMPTY = KEEP)"), "",
                                                          (lb.srv or "") ~= "" and lb.srv or "1.2.3.4:27020") end }
+        -- §102 允许走服务器中转（默认关）：直连不通时才用，服务器也得开 --relay；主机关着时别人不能经中转加入它的房间
+        local relayOn = lb.relayon == "1"
+        items[#items + 1] = { label = T("直连不通时用服务器中转：", "USE SERVER RELAY IF DIRECT FAILS: ") .. (relayOn and T("允许", "ON") or T("不用", "OFF")),
+                              act = function() netuiCmd("relay", "on=" .. (relayOn and "0" or "1") .. "\n") end }
         -- v0.22.0 联机密码（可选，两边填同一个；空 = 不签名）。面板只显示设没设，密码本身不回传给游戏
         items[#items + 1] = { label = T("联机密码：", "PASSWORD: ") .. (lb.secret == "1" and T("已设置", "SET") or T("未设置（不签名）", "NONE (UNSIGNED)")),
                               act = function() editStart("secret", T("输入联机密码，两边要一样（空着回车 = 不改，输入 - = 清除）", "PASSWORD, SAME ON BOTH SIDES (EMPTY = KEEP, - = CLEAR)"), "",
@@ -5511,6 +5752,7 @@ local function netuiItems(lb, tn)
         items[#items + 1] = { label = T("语言：中文", "LANGUAGE: ENGLISH"),
                               act = function() netuiCmd("lang", "lang=" .. (LANG.zh and "en" or "zh") .. "\n") end }
         items[#items + 1] = { label = T("打开电脑上的联机窗口", "OPEN THE DESKTOP WINDOW"), act = function() netuiCmd("show") end }
+        items[#items + 1] = { label = T("感谢名单…", "THANKS..."), act = page("thanks") }
         items[#items + 1] = { label = T("返回", "BACK"), act = page("main") }
         return items
     end
@@ -5699,7 +5941,8 @@ local function netuiRows(tn)
     end
     local st, col = netuiStatus(lb, tn)
     local title = T("联机   [Home] 关闭", "ONLINE   [HOME] CLOSE")
-    local name = NETUI.page == "settings" and T("联机 · 设置", "ONLINE · SETTINGS") or T("联机", "ONLINE")
+    local name = NETUI.page == "settings" and T("联机 · 设置", "ONLINE · SETTINGS")
+              or NETUI.page == "thanks" and T("联机 · 感谢名单", "ONLINE · THANKS") or T("联机", "ONLINE")
     if NETUI.page == "rooms" then
         local _, rooms = netuiTargets(lb)
         title = string.format(T("房间列表  第 %d/%d 页   [Home] 关闭", "ROOMS  PAGE %d/%d   [HOME] CLOSE"), NETUI.roomPage or 1, roomPages(rooms))
@@ -5747,7 +5990,7 @@ end
 
 -- ---- v0.20.0 鼠标面板（说明见 GUI 的定义处）
 local GUI_Z = 460            -- 比屏幕文字（450）高
-local GUI_ROWS = 14           -- v0.27.6 设置页已有 12 项，留两行余量
+local GUI_ROWS = 16           -- v0.27.6 设置页已有 12 项，留两行余量；v0.27.21 13 项（感谢名单），14 → 15；§102 14 项（服务器中转），15 → 16
 local GUI_W = 640            -- 面板最小宽度（Slate 单位）
 local BG_ROW = { R = 0.10, G = 0.10, B = 0.12, A = 0.92 }
 local BG_HOVER = { R = 0.24, G = 0.24, B = 0.28, A = 0.95 }
@@ -6221,6 +6464,7 @@ end
 
 local function matchStep(p1, tn)
     langPoll(tn)
+    NETUI.watchPipe(tn)
     PP.poll()
     holdStep(tn)
     aiSwapStep(p1, tn)
@@ -7508,12 +7752,15 @@ local function onTick()
     if not okS and errS ~= SUMMON.err then SUMMON.err = errS; out("!! 替身召唤物出错：%s", tostring(errS)) end
 
     if ST.ticks % 3 == 0 then
+        local monPrev = ST.watch.p1.montage
         watchActor("玩家1", p1, ST.watch.p1)
         -- 玩家1 当前武器 = 最近一次新激活的、能认出武器族的技能
         local abs = ST.watch.p1.abs
         if abs then
+            local monNew = ST.watch.p1.montage ~= monPrev and ST.watch.p1.montage or nil
             for n in pairs(abs) do
                 if not (ST.p1AbsPrev and ST.p1AbsPrev[n]) then
+                    if monNew and isAttackAbility(n) then ANIM.learn(n, monNew) end    -- §100 同一次看到新招 + 新动作
                     local wid = weaponOfAbility(n)
                     if wid and wid ~= ST.p1Weapon then
                         ST.p1Weapon = wid

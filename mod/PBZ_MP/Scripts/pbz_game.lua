@@ -1455,6 +1455,28 @@ local function airOf(actor)
     return s
 end
 
+-- §99 悬空：远处的地形还没加载出来（World Partition 按区域加载）时让角色不受重力停在原处，加载出来后再放回走路。
+-- 【适配】CharacterMovement:SetMovementMode(5 MOVE_Flying / 1 MOVE_Walking, 0)，Velocity 清零
+local function hover(actor, on)
+    local cm = valid(actor) and rawProp(actor, "CharacterMovement") or nil
+    if not valid(cm) then return false end
+    local ok = pcall(function() cm:SetMovementMode(on and 5 or 1, 0) end)
+    pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end)
+    return ok
+end
+
+-- §99 引擎处理掉出世界的角色（AActor::FellOutOfWorld）会把它藏起来、关碰撞；替身还在用，就重新显示。没被藏返回 false
+-- 【适配】actor.bHidden、SetActorHiddenInGame(false)、SetActorEnableCollision(true)
+local function unhide(actor)
+    if not valid(actor) then return false end
+    local h
+    pcall(function() h = actor.bHidden end)
+    if h ~= true then return false end
+    pcall(function() actor:SetActorHiddenInGame(false) end)
+    pcall(function() actor:SetActorEnableCollision(true) end)
+    return true
+end
+
 -- 【适配】Character:LaunchCharacter(速度, XY 覆盖, Z 覆盖)：移动组件下一帧把速度换成它、切到下落（AI 控制的替身 Jump() 不起作用）
 local function launch(actor, vel)
     if not valid(actor) then return false end
@@ -1679,7 +1701,7 @@ return {
     noStealthByGE = noStealthByGE, animOf = animOf, standUp = standUp, healClass = healClass, refill = refill, backpack = backpack,
     lockSelf = lockSelf, unlockSelf = unlockSelf, copyStats = copyStats, puppetDead = puppetDead, removePuppet = removePuppet, createPuppet = createPuppet,
     findMonster = findMonster, TAG_WAYS = TAG_WAYS, NO_STEALTH_TAGS = NO_STEALTH_TAGS, GE_CANDIDATES = GE_CANDIDATES, HEAL_GES = HEAL_GES, COPY_ATTRS = COPY_ATTRS,
-    montages = montages, isStoryMap = isStoryMap, travelTo = travelTo, airOf = airOf, launch = launch,
+    montages = montages, isStoryMap = isStoryMap, travelTo = travelTo, airOf = airOf, launch = launch, hover = hover, unhide = unhide,
     activeMontage = activeMontage, montageSetPos = montageSetPos, montageNotifies = montageNotifies, attrAll = attrAll,
     bossBarShow = bossBarShow, bossBarHide = bossBarHide, bossBarOf = bossBarOf, bossBarSet = bossBarSet, bossBarDiag = bossBarDiag,
     bossBarShachiShow = bossBarShachiShow,

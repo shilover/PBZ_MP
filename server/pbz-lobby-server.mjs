@@ -8,7 +8,8 @@
 //   关着时服务器只登记房间、介绍地址，客机请求中转会收到 ERR …|norelay。
 //
 // 协议（文本，一个 UDP 包一条；字段用 | 分开，服务器收到的字段里的 | \t \n 都会被替换掉）：
-//   主机 → PBZS|REG|<密钥>|<名字>|<地图>|<已满 0/1>|<局域网地址 IP:端口>       每 2 秒；10 秒没收到就删房间
+//   主机 → PBZS|REG|<密钥>|<名字>|<地图>|<已满 0/1>|<局域网地址 IP:端口>|<允许中转 0/1>   每 2 秒；10 秒没收到就删房间
+//        （最后一段旧版联机程序不发，当允许；主机发 0 时这个房间的会话一律不中转）
 //        ← PBZS|REGOK|<房间号>|<你的公网地址>
 //   主机 → PBZS|UNREG|<密钥>
 //   任何 → PBZS|LIST                     ← PBZS|ROOMS\n<房间号>\t<名字>\t<地图>\t<已满>\t<所在服务器>\n…（最多 40 个；
@@ -18,7 +19,7 @@
 //                                         → 主机 PBZS|PEER|<房间号>|<会话号>|<客机公网>|<客机局域网>
 //                                         ← 出错 PBZS|ERR|<房间号>|nofound / full
 //   客机 → PBZS|RELAY|<会话号>             ← PBZS|RELAYOK|<会话号>；同时发给主机 PBZS|RELAYON|<会话号>
-//                                         ← 没开 --relay 时 PBZS|ERR|<会话号>|norelay
+//                                         ← 没开 --relay 时 PBZS|ERR|<会话号>|norelay；主机不允许中转时 …|hostnorelay
 //   双方 → PBZR|<会话号>\n<原样的状态包>    服务器按来源转给会话的另一方（包原样转发，带着这个头）
 // 主机 / 客机的 REG、JOIN、PBZR 都从各自的"游戏 UDP 端口"发出，这样服务器看到的就是 NAT 给游戏端口分配的公网地址，
 // 告诉对方后双方往这个地址互发包（打洞）。打洞不通时客机发 RELAY，之后两边的状态包都经服务器转发。
@@ -52,7 +53,7 @@ const PUSH_CHUNK = 6;             // 每个 PUSH 包几个房间（中文名字 
 const MAX_REMOTE_PER_SOURCE = 200;
 const RELAY_RATE = 120;           // 每个会话每个方向每秒最多转发多少包（游戏 30 包/秒，留余量）
 
-/** @type {Map<string, {id:string,key:string,name:string,map:string,full:boolean,host:string,hostLocal:string,seen:number}>} */
+/** @type {Map<string, {id:string,key:string,name:string,map:string,full:boolean,host:string,hostLocal:string,noRelay?:boolean,seen:number}>} */
 const rooms = new Map();          // 房间号 → 房间
 const byKey = new Map();          // 主机密钥 → 房间号
 /** @type {Map<string, {sid:string,room:string,a:string,b:string,bLocal:string,relay:boolean,seen:number,rate:Object}>} */
@@ -110,6 +111,7 @@ function onControl(f, from) {
             room.full = f[5] === '1';
             room.host = from;                       // 主机换了公网端口（NAT 重新映射）也跟着更新
             room.hostLocal = clean(f[6], 32);
+            room.noRelay = f[7] === '0';            // 主机在设置里没允许中转（HANDOVER §102）
             room.seen = now;
             send(`PBZS|REGOK|${id}|${from}`, from);
             return;
@@ -154,6 +156,7 @@ function onControl(f, from) {
             const s = sessions.get(clean(f[2], 16));
             if (!s || (s.b !== from && s.a !== from)) { send(`PBZS|ERR|${clean(f[2], 16)}|nosession`, from); return; }
             if (!RELAY) { s.seen = now; send(`PBZS|ERR|${s.sid}|norelay`, from); return; }
+            if (rooms.get(s.room)?.noRelay) { s.seen = now; send(`PBZS|ERR|${s.sid}|hostnorelay`, from); return; }
             if (!s.relay) log(`[relay] 会话 ${s.sid} 改走中转（${s.a} ⇄ ${s.b}）`);
             s.relay = true;
             s.seen = now;

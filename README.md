@@ -28,7 +28,7 @@
 连接方式：
 | 方式 | 说明 |
 |---|---|
-| 服务器大厅 | 要有人架一台大厅服务器（`server/`，见下），双方在面板"设置…"里填同一个地址。先打洞直连；服务器开了中转时直连不通会走中转 |
+| 服务器大厅 | 要有人架一台大厅服务器（`server/`，见下），双方在面板"设置…"里填同一个地址。先打洞直连；直连不通时，服务器开了中转、并且双方都在设置里允许"直连不通时用服务器中转"（默认不用），才走中转 |
 | 局域网 | 同一个路由器下，或者用 Tailscale / ZeroTier 等虚拟局域网 |
 | 本地 AI 对战 | 不联网，和电脑控制的对手打 |
 
@@ -59,6 +59,12 @@ lobby\build.bat
 | `mod/PBZ_MP/` | 游戏内模组（UE4SS Lua） |
 | `lobby/` | 联机程序 `PBZLobby.exe` 的源码（C#） |
 | `server/` | 大厅服务器（Node.js） |
+
+### 感谢
+参与测试并反馈了 bug 的玩家（B 站）：
+
+- 成步堂芦苇
+- 谦逊的刘恒宇
 
 ### 许可证
 [GPL-3.0](LICENSE)。
@@ -95,7 +101,7 @@ Uninstall: delete `Mods\PBZ_MP` (and the `mods.txt` line if you added it).
 
 | Method | Notes |
 |---|---|
-| Lobby server | Someone has to host a lobby server (`server/`, see below). Both players enter the same address in the panel's Settings; it is empty by default. The host creates a room; the guest clicks it in the room list or joins by room code. The game first tries a direct connection. If that fails, it falls back to the server's relay when the server has relay turned on; otherwise the host has to forward the UDP port (or tick UPnP), or both players switch to Tailscale. If the server is down, the guest can use "Join by IP" with the host's `public IP:port`. |
+| Lobby server | Someone has to host a lobby server (`server/`, see below). Both players enter the same address in the panel's Settings; it is empty by default. The host creates a room; the guest clicks it in the room list or joins by room code. The game first tries a direct connection. If that fails, it falls back to the server's relay only when the server has relay turned on and both players allow "Use server relay if direct fails" in Settings (off by default); otherwise the host has to forward the UDP port (or tick UPnP), or both players switch to Tailscale. If the server is down, the guest can use "Join by IP" with the host's `public IP:port`. |
 | LAN | Same router, or a virtual LAN such as Tailscale / ZeroTier. |
 | Local AI battle | Offline, against a computer-controlled opponent (for practice). |
 
@@ -154,6 +160,12 @@ This produces `lobby\PBZLobby.exe` using the csc.exe that ships with Windows; no
 | `mod/PBZ_MP/` | In-game mod (UE4SS Lua) |
 | `lobby/` | Source of the helper program `PBZLobby.exe` (C#) |
 | `server/` | Lobby server (Node.js) |
+
+### Thanks
+Players who tested the mod and reported bugs (on Bilibili):
+
+- 成步堂芦苇
+- 谦逊的刘恒宇
 
 ### License
 [GPL-3.0](LICENSE).

@@ -95,7 +95,10 @@ namespace PbzLobby
         readonly List<IPEndPoint> cands = new List<IPEndPoint>();
         IPEndPoint peer;
         bool relay, relayOk, joined;
-        bool noRelay;      // 服务器没开 --relay（回了 ERR …|norelay）：不再进中转，提示留着，一轮轮接着试直连
+        bool noRelay;      // 服务器没开 --relay（回了 ERR …|norelay / hostnorelay）或自己关了中转：不再进中转，提示留着，一轮轮接着试直连
+        // 自己允不允许走服务器中转（设置里的"允许中转"，默认关，HANDOVER §102）。客机关着：直连不通也不请求中转；
+        // 主机关着：登记房间时告诉服务器（REG 第 7 段 0），服务器拒绝给这个房间中转；旧服务器不认这一段，主机就不理中转来的包
+        public bool AllowRelay;
         int attempt = 1;
         DateTime attemptAt, lastJoin, lastPunch, lastReg, lastRelayReq, lastFromPeer = DateTime.MinValue, lastFromServer = DateTime.MinValue, punchUntil;
 
@@ -232,7 +235,7 @@ namespace PbzLobby
                 if (nl < 0 || sid == null || Encoding.ASCII.GetString(data, 5, nl - 5) != sid) return 0;
                 if (!relay)
                 {
-                    if (!host) return 0;
+                    if (!host || !AllowRelay) return 0;
                     relay = true; peer = null; rx.Reset();
                     log(L.T("对方改走服务器中转", "Peer switched to server relay"));
                 }
@@ -257,11 +260,14 @@ namespace PbzLobby
                     break;
                 case "ERR":
                     var why = f.Length > 3 ? f[3] : "";
-                    if (why == "norelay")
+                    if (why == "norelay" || why == "hostnorelay")
                     {
-                        if (!noRelay) log(L.T("大厅服务器没开中转，接着试直连", "The lobby server has no relay; retrying direct"));
+                        bool byHost = why == "hostnorelay";
+                        if (!noRelay) log(byHost ? L.T("主机关了中转，接着试直连", "The host does not allow relay; retrying direct")
+                                                 : L.T("大厅服务器没开中转，接着试直连", "The lobby server has no relay; retrying direct"));
                         noRelay = true;
-                        error = L.T("直连不通，服务器没开中转：主机转发端口或用 Tailscale", "Direct failed, server has no relay");
+                        error = byHost ? L.T("直连不通，主机关了中转：主机转发端口或用 Tailscale", "Direct failed, the host does not allow relay")
+                                       : L.T("直连不通，服务器没开中转：主机转发端口或用 Tailscale", "Direct failed, server has no relay");
                         if (!host && relay && !relayOk) Restart(now);   // 中转等不来：回去重新加入、再打几轮洞（等中转时直连包是不收的）
                         break;
                     }
@@ -274,7 +280,7 @@ namespace PbzLobby
                     break;
                 case "RELAYON":
                     // 刚切过来时还没收到中转的包：从现在起算"多久没动静"，不然主机会马上当成对方走了
-                    if (f.Length > 2 && f[2] == sid && !relay) { relay = true; peer = null; rx.Reset(); lastFromPeer = now; log(L.T("对方改走服务器中转", "Peer switched to server relay")); }
+                    if (f.Length > 2 && f[2] == sid && !relay && AllowRelay) { relay = true; peer = null; rx.Reset(); lastFromPeer = now; log(L.T("对方改走服务器中转", "Peer switched to server relay")); }
                     break;
             }
             return 0;
@@ -321,7 +327,7 @@ namespace PbzLobby
                 lastReg = now;
                 bool full = (now - lastFromPeer).TotalSeconds < 3;
                 Raw("PBZS|REG|" + key + "|" + LobbyServer.Clean(name) + "|" + LobbyServer.Clean(MapOf()) + "|" + (full ? "1" : "0")
-                    + "|" + LobbyServer.LocalAddr(LocalPort), server);
+                    + "|" + LobbyServer.LocalAddr(LocalPort) + "|" + (AllowRelay ? "1" : "0"), server);
                 if (lastFromServer == DateTime.MinValue ? (now - attemptAt).TotalSeconds > 5 : ServerQuiet)
                     error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + server;
             }
@@ -373,6 +379,14 @@ namespace PbzLobby
                 attemptAt = now;
                 joined = false;                // 重新 JOIN 一次：服务器重发 PEER 给主机，主机再打一轮洞
                 log(L.T("直连没通，第 " + attempt + " 次重试", "No direct link yet, try " + attempt));
+                return;
+            }
+            if (!AllowRelay && !noRelay)
+            {
+                noRelay = true;
+                error = L.T("直连不通，你关了中转：主机转发端口、用 Tailscale，或在设置里允许中转", "Direct failed and relay is off in your settings");
+                log(L.T("直连 " + Tries + " 次都没通，设置里没允许中转，重新加入再试", "Direct failed " + Tries + " times, relay is off in settings; joining again"));
+                Restart(now);
                 return;
             }
             if (noRelay)

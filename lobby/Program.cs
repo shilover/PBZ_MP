@@ -767,8 +767,11 @@ namespace PbzLobby
             cmdTimer.Interval = 100;
             cmdTimer.Tick += delegate { CheckWait(); CheckBack(); PollCmd(); };
             cmdTimer.Start();
-            FormClosing += delegate
+            FormClosing += (s, e) =>
             {
+                // §99 后台模式（游戏带起的）被游戏内面板"打开电脑上的联机窗口"显示出来后，点 × 只藏起窗口。
+                // 2026-11-05 19:56 内测：点 × 整个联机程序退出，游戏那边管道断开、4 分多钟没有联机程序，直到手动重启
+                if (bg && !quitting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); return; }
                 quitting = true;          // 关闭过程中 Tick() 再进 AutoExit 时不要再 Quit
                 timer.Stop(); cmdTimer.Stop(); StopSession(); disc.Close(); lobbyList.Close(); Steam.Shutdown();
                 WriteLobby(false);
@@ -927,6 +930,7 @@ namespace PbzLobby
                     // 开了端口转发 / UPnP 时服务器连不上也能玩（原来的广域网）
                     t = sl = new ServerLink(srv, role == "host" ? null : room, role == "host" ? cfg.Port : 0, cfg.Name,
                                             Path.Combine(dir, "state_remote.txt"), Program.SimNoDirect);
+                    sl.AllowRelay = cfg.Relay;
                 }
                 if (Mode == "ai") return StartAi();
                 int port = Mode == "server" ? cfg.Port : Session.GamePort;
@@ -1010,6 +1014,7 @@ namespace PbzLobby
                     throw new InvalidOperationException(cfg.Server.Length == 0 ? L.T("先在设置里填大厅服务器地址（可自己架设）", "Set or host a lobby server first")
                                                                             : L.T("认不出大厅服务器地址：", "Can't resolve the lobby server: ") + cfg.Server);
                 t = sl = new ServerLink(srv, null, cfg.Port, cfg.Name, Path.Combine(d, "state_remote.txt"), Program.SimNoDirect);
+                sl.AllowRelay = cfg.Relay;
             }
             int port = mode == "server" ? cfg.Port : Program.LanPort;
             var ses = new Session("host", mode, t, null, port, cfg.Name, d, doBackup, cfg.Secret);
@@ -1242,6 +1247,17 @@ namespace PbzLobby
                     break;
                 case "airoommode":   // §85 等人的房间的连接方式（不能是 ai）
                     if (d.TryGetValue("mode", out v)) SetAiRoomMode(v);
+                    break;
+                case "relay":   // §102 服务器大厅：允许走服务器中转（连着的也马上生效：主机下次登记时告诉服务器）
+                    if (d.TryGetValue("on", out v))
+                    {
+                        cfg.Relay = v == "1"; cfg.Save();
+                        foreach (var x in new[] { session, waitSes })
+                        {
+                            var xl = x != null ? x.T as ServerLink : null;
+                            if (xl != null) xl.AllowRelay = cfg.Relay;
+                        }
+                    }
                     break;
                 case "upnp":
                     if (d.TryGetValue("on", out v)) { cfg.Upnp = v == "1"; upnpBox.Checked = cfg.Upnp; cfg.Save(); }
@@ -1584,6 +1600,7 @@ namespace PbzLobby
             kv("name", cfg.Name);
             kv("cfgport", cfg.Port.ToString());
             kv("upnpon", cfg.Upnp ? "1" : "0");
+            kv("relayon", cfg.Relay ? "1" : "0");
             kv("ailevel", cfg.AiLevel.ToString());
             // §85 AI 对战时同时开房等真人：开关、开房方式、房间开着没有（aiwait=1）、房间地址（服务器大厅 = 房间号）
             var w = waitSes;

@@ -29,7 +29,7 @@ namespace PbzLobby
             new[] { D + "B_C", D + "BB_C" }, new[] { D + "A_C", D + "AB_C" }, new[] { D + "B_Dash_C" }, new[] { D + "SWT_C" },
             new[] { D + "A_C", D + "AA_C" } };
         static readonly string[][] Skills = {
-            new[] { D + "JueYing_C" }, new[] { D + "JueYing_C_C" }, new[] { D + "Buff_C" }, new[] { D + "C_C" },
+            new[] { D + "JueYing_C_C" }, new[] { D + "Buff_C" }, new[] { D + "C_C" },
             new[] { D + "A_Draw_C" }, new[] { D + "B_Draw_C" }, new[] { D + "ATB_C", D + "ATBB_C", D + "ATBBB_C" },
             new[] { D + "BTA_C" }, new[] { D + "A_DashDraw_Short_C" }, new[] { D + "B_DashDraw_C" },
             new[] { D + "A_Snap_C" }, new[] { D + "B_Snap_C" } };
