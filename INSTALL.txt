@@ -1,0 +1,184 @@
+Phantom Blade Zero 1v1 PvP mod (PBZ_MP) {VERSION} - Install guide
+
+======================================================================
+[BETA]
+Not all features are finished, and play between two real PCs has not
+been tested much yet. Expect disconnects, inaccurate hits, or even game
+crashes. If something goes wrong, send the author the files listed under
+"Reporting problems" below.
+This is an unofficial, fan-made mod. It is not affiliated with S-GAME,
+Phantom Blade Zero, or Valve. Use it at your own risk and back up your
+save first.
+======================================================================
+
+
+1. Requirements
+---------------
+1) Phantom Blade Zero (Steam)
+2) UE4SS for Phantom Blade Zero - either of these works:
+   - The Nexus version (tested with 1.0.3):
+     https://www.nexusmods.com/phantombladezero/mods/5
+   - The KintaroModding build:
+     https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8
+     Download phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip
+     (the generic UE4SS_*.zip on the same page is the wrong file)
+   Extract all of it into <game folder>\platform\steam\
+   You should then have dwmapi.dll and a ue4ss\ folder there.
+   <game folder>: in your Steam library, right-click Phantom Blade Zero
+   -> Manage -> Browse local files
+3) Windows 10 / 11 (no need to install Python or .NET; what ships with
+   Windows is enough)
+
+
+2. Install
+----------
+1) Put the whole PBZ_MP folder from the zip into:
+       <game folder>\platform\steam\ue4ss\Mods\
+   You should end up with:
+       Mods\PBZ_MP\Scripts\main.lua
+       Mods\PBZ_MP\Scripts\pbz_game.lua
+       Mods\PBZ_MP\Scripts\pbz_abilities.lua
+       Mods\PBZ_MP\Scripts\pbz_places.lua
+       Mods\PBZ_MP\enabled.txt
+       Mods\PBZ_MP\PBZLobby.exe        (the online helper program)
+       Mods\PBZ_MP\net\                (empty folder)
+       Mods\PBZ_MP\rec\                (empty folder)
+2) UE4SS loads the mod because of enabled.txt. To be safe you can also
+   open Mods\mods.txt and add the line:
+       PBZ_MP : 1
+
+Updating from an older version:
+- Just overwrite. net\ and rec\ hold your online settings and
+  recordings; keep them.
+
+
+3. How to play online
+---------------------
+1) Both players start the game and load a save (different maps are
+   fine, see step 6)
+2) Press Home in game to open the online panel. A mouse cursor appears
+   and every button is clickable. Settings has a language option
+   (Chinese / English).
+   (The helper PBZLobby.exe starts in the background with the game and
+   exits a few seconds after the game closes; you don't need to touch it.)
+3) Pick the connection method at the top of the panel. Both players must
+   pick the same one:
+   - Lobby server: someone has to host a lobby server (see section 8).
+     Both players enter the same server address in the panel's
+     "Settings..." (it is empty by default). The host creates a room;
+     the guest clicks it in the room list, or uses "Join by room code...".
+     The game first tries a direct connection. If that fails, it uses the
+     server's relay only if the server has relay turned on AND both
+     players set "Use server relay if direct fails" to ON in Settings
+     (off by default). Otherwise the host has to forward the UDP port on
+     the router (or turn on UPnP), or both players switch to Tailscale.
+     If the server is down: the host forwards the UDP port (27015 by
+     default, changeable in Settings, or turn on UPnP), and the guest
+     uses "Join by IP..." with the host's public-IP:port.
+   - LAN: same router. Also pick this for virtual LANs such as
+     Tailscale / ZeroTier.
+   - Local AI: offline, against a computer-controlled opponent (practice).
+4) After creating a room, the host clicks "Copy my address / room code"
+   and sends it to the friend.
+5) The first time you host, Windows Firewall asks for permission. Click
+   "Allow".
+6) Once connected, the opponent appears and the guest is moved next to
+   the host. If you are on different maps: the guest presses F1 twice
+   (or clicks "Go to the host's map" in the panel) to travel to the
+   host's map; the game autosaves first. If the host is on a map that
+   isn't in the game's map list (e.g. a test map), you have to get there
+   by yourself.
+7) Both players press F1 to get ready -> countdown -> first to win 2
+   rounds wins.
+
+Optional: Settings has a "match password". If both players enter the
+same one, every packet is signed. If they don't match, or only one side
+set one, the panel tells you why.
+
+
+4. Keys
+-------
+  Home     Open / close the online panel (while open: Esc or "Close" also
+           closes it; PgUp/PgDn to select, End to confirm)
+  F1       Ready / unready. During a match, press twice within 3 seconds
+           to forfeit
+  F2       Save your current position as the arena center (the host's
+           counts)
+  F6       Hide the opponent, back to single player
+  F7 / F8  Record your moves / have the opponent replay them (solo
+           practice)
+  F9       Write the current state to the log (debugging)
+  F12      Spawn an opponent manually (testing)
+The mod does not use F3 / F4 / F5.
+If the third-party mod Phantom Pact is also installed: while Phantom
+Pact is connected, this mod pauses itself, and it resumes after Phantom
+Pact disconnects (so the two mods never both spawn a partner).
+
+
+5. During a match
+-----------------
+- Both players' health is locked: getting knocked down doesn't really
+  kill you, send you back to a shrine, or drop anything.
+- Assassinations and executions are disabled in duels.
+- Phantom Edge damage is scaled to 35% (their charged finishers are
+  tuned for bosses and would one-shot a full-health player otherwise).
+- Your save is backed up automatically at the start of each match, to:
+      ProjectPBZ\Saved\SaveGames\Steam\pbz-save-backups\
+
+
+6. Known issues (please watch for these)
+----------------------------------------
+- Play between two real PCs has not been tested much: how hits feel
+  under real latency, and NAT punching through a lobby server across
+  networks. Please help test these.
+- The Zhanma blade's heavy Shachi attack doesn't drain / cost health
+  against a player target.
+- Chinese text needs the game's own font; if it can't be loaded, the
+  text falls back to English.
+
+
+7. Reporting problems
+---------------------
+Note roughly when it happened and what you were doing, then send these
+files to the author (Bugs tab on the Nexus page, or GitHub Issues:
+https://github.com/shilover/PBZ_MP/issues):
+  <game folder>\platform\steam\ue4ss\Mods\PBZ_MP\mp_probe.log
+      (the mod's log; most important)
+  <game folder>\platform\steam\ue4ss\UE4SS.log
+      (the UE4SS log)
+  If the game crashed: the newest crash_<date>_<time>.dmp in
+  <game folder>\platform\steam\ue4ss\
+
+
+8. Hosting your own lobby server (optional; only for "Lobby server")
+--------------------------------------------------------------------
+The server is the server\ folder (on Nexus: the optional "Lobby Server"
+file). It is licensed under GPL-3.0 (see LICENSE).
+- You need a PC or VPS with a public IP and Node.js 18 or newer; no
+  npm install
+- Run:        node pbz-lobby-server.mjs --port 27020
+- Relay is off by default. To turn it on:
+              node pbz-lobby-server.mjs --port 27020 --relay
+  Relay lets players whose NAT blocks a direct connection play anyway,
+  but each relayed pair uses about 50 KB/s (about 180 MB per hour).
+- Open UDP 27020 inbound in your firewall (UDP, not TCP)
+- Players enter your-IP-or-domain:27020 in the online panel ->
+  Settings... -> Lobby server
+More details: server\README.md (in Chinese).
+Note: the server can see the public IP and nickname of every player who
+connects (and handles the match data if relay is on). Whoever runs a
+server is the operator of that service: follow your local laws and take
+responsibility for that data. The server writes no files, but its
+console log prints player IPs and room names; add --quiet to turn that
+off.
+
+
+9. Thanks
+---------
+Players who tested and reported bugs (Bilibili):
+  成步堂芦苇
+  谦逊的刘恒宇
+
+
+Uninstall: delete the Mods\PBZ_MP folder (and the line in mods.txt if
+you added it).

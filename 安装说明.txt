@@ -12,7 +12,9 @@
 一、需要什么
 ------------
 1. Steam 版《影之刃零》
-2. UE4SS 的"影之刃零专用版"（KintaroModding 维护，不是 UE4SS 官方主线版）
+2. UE4SS 的"影之刃零专用版"，下面两个都可以：
+   - Nexus 版（测过 1.0.3）：https://www.nexusmods.com/phantombladezero/mods/5
+   - KintaroModding 版（不是 UE4SS 官方主线版）：
    - 下载页：https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8
    - 下载附件 phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip
      （同一页上的 UE4SS_*.zip 是通用版，别下错）
@@ -30,6 +32,7 @@
        Mods\PBZ_MP\Scripts\main.lua
        Mods\PBZ_MP\Scripts\pbz_game.lua
        Mods\PBZ_MP\Scripts\pbz_abilities.lua
+       Mods\PBZ_MP\Scripts\pbz_places.lua
        Mods\PBZ_MP\enabled.txt
        Mods\PBZ_MP\PBZLobby.exe        （联机程序）
        Mods\PBZ_MP\net\                （空文件夹）
