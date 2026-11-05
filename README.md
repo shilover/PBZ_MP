@@ -4,6 +4,8 @@
 > Unofficial, fan-made. Not affiliated with S-GAME or Valve. Use at your own risk; back up your saves first.
 >
 > **状态：测试版（beta）。/ Status: beta.** 源码 / Source: <https://github.com/shilover/PBZ_MP>
+>
+> 下载 / Download: **Nexus Mods** <https://www.nexusmods.com/phantombladezero/mods/591> · [GitHub Releases](https://github.com/shilover/PBZ_MP/releases)
 
 [中文](#中文) | [English](#english)
 
