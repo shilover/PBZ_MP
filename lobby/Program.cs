@@ -1381,9 +1381,10 @@ namespace PbzLobby
                     {
                         var sl = s != null ? s.T as ServerLink : null;
                         if (cfg.Server.Length == 0) return L.T("（没填大厅服务器：设置里填，可自己架设）", "(no lobby server: set or host one)");
+                        // 登记上了只显示房间号（朋友从列表 / 房间号加入，用不着 IP）；还没登记上才给 IP 直连的地址兜底
                         if (sl != null && s.Role == "host")
-                            return (sl.RoomId.Length > 0 ? L.T("房间号 ", "Room ") + sl.RoomId : L.T("正在登记到大厅 ", "Listing on ") + cfg.Server)
-                                   + L.T("  IP 直连 ", "  direct IP ") + PublicAddr();
+                            return sl.RoomId.Length > 0 ? L.T("房间号 ", "Room ") + sl.RoomId
+                                   : L.T("正在登记到大厅 ", "Listing on ") + cfg.Server + L.T("  IP 直连 ", "  direct IP ") + PublicAddr();
                         return L.T("大厅 ", "Lobby ") + cfg.Server;
                     }
                 case "ai": return L.T("本机 AI 对手（不联网）", "Local AI opponent (offline)");

@@ -39,6 +39,7 @@ save first.
        Mods\PBZ_MP\Scripts\pbz_game.lua
        Mods\PBZ_MP\Scripts\pbz_abilities.lua
        Mods\PBZ_MP\Scripts\pbz_places.lua
+       Mods\PBZ_MP\Scripts\pbz_balance.lua     (per-move PvP damage factors, editable)
        Mods\PBZ_MP\enabled.txt
        Mods\PBZ_MP\PBZLobby.exe        (the online helper program)
        Mods\PBZ_MP\net\                (empty folder)

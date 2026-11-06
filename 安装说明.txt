@@ -33,6 +33,7 @@
        Mods\PBZ_MP\Scripts\pbz_game.lua
        Mods\PBZ_MP\Scripts\pbz_abilities.lua
        Mods\PBZ_MP\Scripts\pbz_places.lua
+       Mods\PBZ_MP\Scripts\pbz_balance.lua      （每招 PvP 伤害系数，可以手改）
        Mods\PBZ_MP\enabled.txt
        Mods\PBZ_MP\PBZLobby.exe        （联机程序）
        Mods\PBZ_MP\net\                （空文件夹）

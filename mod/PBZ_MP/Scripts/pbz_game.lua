@@ -620,6 +620,31 @@ local function cancelMoves(actor)
     return done
 end
 
+-- §105.3 房间设置"红蓝光反击：关"：只取消名字让 want(name) 返回 true 的、正在跑的技能实例。返回取消掉的名字表。
+-- 写法同 cancelMoves：只调对象方法 K2_CancelAbility、不传结构体
+-- 【适配】ASC.ActivatableAbilities.Items 里 ActiveCount > 0 且类名符合的技能：各实例 K2_CancelAbility()
+local function cancelAbilities(actor, want)
+    local asc = ascOf(actor)
+    local items = asc and rawProp(rawProp(asc, "ActivatableAbilities"), "Items")
+    if not items then return {} end
+    local done = {}
+    eachArr(items, function(_, spec)
+        local n = rawProp(spec, "ActiveCount")
+        if not (type(n) == "number" and n > 0) then return end
+        local ab = rawProp(spec, "Ability")
+        if not valid(ab) then return end
+        local okC, cls = pcall(function() return ab:GetClass() end)
+        local name = okC and shortName(full(cls)) or "?"
+        if not want(name) then return end
+        for _, key in ipairs({ "NonReplicatedInstances", "ReplicatedInstances" }) do
+            eachArr(rawProp(spec, key), function(_, inst)
+                if valid(inst) and pcall(function() inst:K2_CancelAbility() end) then done[#done + 1] = name end
+            end)
+        end
+    end)
+    return done
+end
+
 -- ============================================================ 替身摆位 / 朝向 / 刹车（CharacterMovement）
 
 -- 【适配】两个位置之间的朝向角（度）
@@ -1695,7 +1720,7 @@ return {
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
     puppet = puppet, gstat = gstat, now = now, attrSetOf = attrSetOf, attrOf = attrOf, hpOf = hpOf,
     setAttr = setAttr, ascOf = ascOf, factionComp = factionComp, factionActors = factionActors, factionValue = factionValue, factionName = factionName, anyToStr = anyToStr,
-    montageOf = montageOf, montageByName = montageByName, playOn = playOn, tagNames = tagNames, tagsOf = tagsOf, activeAbilities = activeAbilities, cancelMoves = cancelMoves,
+    montageOf = montageOf, montageByName = montageByName, playOn = playOn, tagNames = tagNames, tagsOf = tagsOf, activeAbilities = activeAbilities, cancelMoves = cancelMoves, cancelAbilities = cancelAbilities,
     yawTo = yawTo, setYaw = setYaw, facePlayer = facePlayer, placeInFront = placeInFront, setBraking = setBraking, equipWeapon = equipWeapon,
     mapName = mapName, retract = retract, cutMontage = cutMontage, lockingTarget = lockingTarget, setLockTarget = setLockTarget, yawOf = yawOf, stateComp = stateComp, abilitiesOf = abilitiesOf, tagReport = tagReport, geLockHealthClass = geLockHealthClass,
     noStealthByGE = noStealthByGE, animOf = animOf, standUp = standUp, healClass = healClass, refill = refill, backpack = backpack,

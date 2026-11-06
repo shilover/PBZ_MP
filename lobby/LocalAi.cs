@@ -21,6 +21,7 @@ namespace PbzLobby
         const string WC = "/PBZCombatAsset/ActorData/Players/Hun/Weapon/Double/Weapon_Hun_JueYing.Weapon_Hun_JueYing";
         const double Dist = 400, Walk = 500, JumpDist = 3000, Hz = 30;
         const double ResDmg = 400, ResDelay = 0.4;                        // 你砍中它一刀扣 400；回报晚 0.4 秒（刀落下才判定）
+        const double TouchWait = 1.5, TouchDelay = 0.1;                   // §107 等你的刀碰到它最多 1.5 秒，没碰到 = 落空；碰到后 0.1 秒回报
         static readonly double[] DmSteps = { 50, 75, 100, 150, 200, 300 };   // §86 伤害倍率档位（同 main.lua NET.DM_STEPS）
         const double AiAir = 0.15, HopVz = 750, HopG = 1800, HopLead = 0.25;
 
@@ -117,6 +118,14 @@ namespace PbzLobby
         }
 
         static string F1(double v) { return Kv.F(v, "0.0"); }
+
+        // 你的一刀碰到 AI 时的结果：按难度权重 中招 / 精防 / 普防；它举着架势时只有精防 / 普防
+        string Roll(Lv lv, double tnow)
+        {
+            if (tnow < guardUntil) return rnd.NextDouble() < lv.GuardParry ? "parry" : "block";
+            int w = rnd.Next(lv.Hit + lv.Parry + lv.Block);
+            return w < lv.Hit ? "hit" : w < lv.Hit + lv.Parry ? "parry" : "block";
+        }
 
         public static bool IsAttack(string n)
         {
@@ -312,15 +321,24 @@ namespace PbzLobby
             foreach (var e in events)
                 if (e.T <= tnow) ev.Append(ev.Length > 0 ? "," : "").Append(e.Id).Append(':').Append(e.Name);
 
-            // 你的每一刀：按难度的权重随机回报 中招 / 精防 / 普防（举着架势时只有精防 / 普防），晚 ResDelay 秒
+            // 你的每一刀：按难度的权重随机回报 中招 / 精防 / 普防（举着架势时只有精防 / 普防），晚 ResDelay 秒。
+            // §107 模组发了 tc=（你哪几招在游戏里真的碰到了 AI 的身体）：只有碰到的招才掷结果，TouchWait 秒内没碰到 = 落空；
+            // 旧版模组没有 tc= → 照旧每招都掷（以前对着空气砍 AI 也掉血就是这个）
+            bool touchInfo = me.ContainsKey("tc");
+            var touched = new HashSet<int>();
+            foreach (var tid in Get(me, "tc").Split(',')) { int v; if (int.TryParse(tid, out v)) touched.Add(v); }
             foreach (var part in Get(me, "ev").Split(','))
             {
                 int i = part.IndexOf(':'), atk;
                 if (i <= 0 || !int.TryParse(part.Substring(0, i), out atk) || answered.ContainsKey(atk) || !IsAttack(part.Substring(i + 1))) continue;
-                string k;
-                if (tnow < guardUntil) k = rnd.NextDouble() < lv.GuardParry ? "parry" : "block";
-                else { int w = rnd.Next(lv.Hit + lv.Parry + lv.Block); k = w < lv.Hit ? "hit" : w < lv.Hit + lv.Parry ? "parry" : "block"; }
-                answered[atk] = new Ans { Rid = ++resId, Seen = tnow, Kind = k };
+                answered[atk] = new Ans { Rid = ++resId, Seen = tnow, Kind = touchInfo ? null : Roll(lv, tnow) };
+            }
+            foreach (var kv in answered)
+            {
+                var a = kv.Value;
+                if (a.Kind != null) continue;
+                if (touched.Contains(kv.Key)) { a.Kind = Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay; }
+                else if (tnow - a.Seen >= TouchWait) { a.Kind = "miss"; a.Seen = tnow - ResDelay; }
             }
             // 要比 main.lua 的 EV_KEEP（1.5 秒）长，否则还在 ev 里的招式过期后会被当成新招再报一次中招
             var old = new List<int>();
@@ -332,7 +350,7 @@ namespace PbzLobby
             foreach (var kv in answered)
             {
                 var a = kv.Value;
-                if (tnow - a.Seen < ResDelay) continue;
+                if (a.Kind == null || tnow - a.Seen < ResDelay) continue;
                 res.Append(res.Length > 0 ? "," : "").Append(a.Rid).Append(':').Append(kv.Key).Append(':').Append(a.Kind).Append(':')
                    .Append(a.Kind == "hit" ? Kv.F(dmg, "0") : "0");
                 if (counted.Add(a.Rid))
