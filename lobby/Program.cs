@@ -257,6 +257,10 @@ namespace PbzLobby
         public long RxSeen, Loops, SendLoops;   // Run / SendLoop 各转了几轮（命令行日志里算"轮询 X 次/秒"）
         public volatile string LocalMap = "?";
         public volatile string RemoteMap = "?";
+        // §110 武林盟主：自己的排位 pid（发包时加 rk=，对方据此上报"和谁打的"）；null = 不是排位房间。
+        // LocalMt / LocalQuit = 本机游戏状态包里的 mt= / quit=（主机看自己的 mt= 判开局 / 打完，客机看自己的 quit= 判弃权）
+        public volatile string RankPid, LocalMt, LocalQuit;
+        public MatchStats Stats;     // §110.11 排位房间：本机每个状态包的武器 / 影之武装 / 放招记进去
         public Action<string> Log = delegate { };
         readonly HashSet<string> backedUp = new HashSet<string>();
         public readonly Wire Wire;            // v0.22.0 包签名（Reliable.cs）
@@ -419,13 +423,22 @@ namespace PbzLobby
                         lastSeq = seq;
                         string m;
                         if (loc.TryGetValue("map", out m)) LocalMap = m;
+                        if (loc.TryGetValue("mt", out m)) LocalMt = m;
+                        if (loc.TryGetValue("quit", out m)) LocalQuit = m;
+                        var st = Stats;
+                        if (st != null)
+                        {
+                            string wc, wcs, ev;
+                            loc.TryGetValue("wc", out wc); loc.TryGetValue("wcs", out wcs); loc.TryGetValue("ev", out ev);
+                            st.Local(wc, wcs, ev);
+                        }
                         MaybeBackup(loc);
                         var sb = new StringBuilder();
                         foreach (var raw in text.Split('\n'))
                         {
                             var line = raw.TrimEnd('\r');
                             if (line.Length == 0 || line.StartsWith("st=") || line.StartsWith("nm=")
-                                || line.StartsWith("pv=") || line.StartsWith("av=")) continue;
+                                || line.StartsWith("pv=") || line.StartsWith("av=") || line.StartsWith("rk=")) continue;
                             sb.Append(line).Append('\n');
                         }
                         // v0.22.0：协议版本 / 程序版本，对方据此提示"版本不一致"（旧版没有 pv=）
@@ -433,6 +446,8 @@ namespace PbzLobby
                         sb.Append("st=").Append(Kv.F(Link.UnixNow(), "0.0000")).Append('\n');
                         // v0.18.7：带上自己的昵称（用户 2026-11-04 要求连上后面板显示对方昵称；直连方式以前只显示 IP）
                         sb.Append("nm=").Append(Name.Replace("\r", " ").Replace("\n", " ")).Append('\n');
+                        var rk = RankPid;
+                        if (rk != null) sb.Append("rk=").Append(rk).Append('\n');
                         SendText(sb.ToString());
                     }
                 }
@@ -613,6 +628,21 @@ namespace PbzLobby
         readonly ComboBox aiRoomModeBox = new ComboBox();
         readonly Discovery disc = new Discovery();
         readonly LobbyList lobbyList = new LobbyList();
+        RankClient rank;     // §110 武林盟主（排位）：密钥、上报、排行榜（Ranked.cs）
+        RankClient Rank { get { return rank ?? (rank = new RankClient(dir) { Log = m => { lastLog = DateTime.Now.ToString("HH:mm:ss ") + m; } }); } }
+
+        // 面板 / 窗口里列出的连接方式：大厅服务器没开排位时不列"武林盟主"（用户 2026-11-06"没开就隐藏标签"）；
+        // 还在问的时候（-1）只有正选着它才列，免得一开窗口标签闪一下
+        string[] ShownModes
+        {
+            get
+            {
+                int sup = Rank.Support;
+                if (sup == 1 || (sup == -1 && Mode == "ranked")) return Modes.All;
+                return Array.FindAll(Modes.All, x => x != "ranked");
+            }
+        }
+        int shownSupport = -2;     // 上次按哪个 Support 填的下拉框（变了重填）
         readonly TextBox nameBox = new TextBox(), ipBox = new TextBox(), portBox = new TextBox(), srvBox = new TextBox(), secretBox = new TextBox();
         readonly ListBox roomList = new ListBox();
         readonly Label status = new Label(), logLabel = new Label(), roleBig = new Label(), roleSub = new Label();
@@ -663,7 +693,7 @@ namespace PbzLobby
             lblMode.SetBounds(14, y + 3, 130, 20); Add(lblMode);
             modeBox.DropDownStyle = ComboBoxStyle.DropDownList;
             modeBox.SetBounds(150, y, 250, 24);
-            modeBox.SelectedIndexChanged += delegate { if (!loadingMode) SetMode(Modes.All[Math.Max(0, modeBox.SelectedIndex)]); };
+            modeBox.SelectedIndexChanged += delegate { if (!loadingMode) SetMode(ShownModes[Math.Max(0, modeBox.SelectedIndex)]); };
             Add(modeBox);
             lblPort.SetBounds(410, y + 3, 40, 20); Add(lblPort);
             portBox.SetBounds(450, y, 56, 24); portBox.Text = cfg.Port.ToString(); Controls.Add(portBox);
@@ -796,8 +826,10 @@ namespace PbzLobby
             upnpBox.Text = "UPnP";
             loadingMode = true;
             modeBox.Items.Clear();
-            foreach (var m in Modes.All) modeBox.Items.Add(Modes.Name(m));
-            modeBox.SelectedIndex = Array.IndexOf(Modes.All, Mode);
+            var shown = ShownModes;
+            shownSupport = Rank.Support;
+            foreach (var m in shown) modeBox.Items.Add(Modes.Name(m));
+            modeBox.SelectedIndex = Array.IndexOf(shown, Mode);
             aiBox.Items.Clear();
             for (int i = 0; i < LocalAi.Levels.Length; i++) aiBox.Items.Add(L.T("难度：", "Level: ") + LocalAi.LevelName(i));
             aiBox.SelectedIndex = cfg.AiLevel;
@@ -834,6 +866,7 @@ namespace PbzLobby
         void SetMode(string m)
         {
             m = Modes.Valid(m);
+            if (m == "ranked" && Rank.Support == 0) { Warn(L.T("这台大厅服务器没开武林盟主排位", "This lobby server has no ranked mode")); ApplyLang(); return; }
             if (session != null && m != Mode) { Warn(L.T("联机中不能换连接方式，先断开", "Disconnect before changing the connection")); ApplyLang(); return; }
             cfg.Mode = m;
             cfg.Save();
@@ -850,20 +883,22 @@ namespace PbzLobby
             if (text.Length == 0)
             {
                 Warn(Mode == "steam" ? L.T("先选一个开房的好友，或填主机的 SteamID64", "Pick a friend who is hosting, or enter the host's SteamID64")
-                     : Mode == "server" ? L.T("先选一个房间，或填房间号", "Pick a room, or enter the room code")
+                     : Modes.IsServer(Mode) ? L.T("先选一个房间，或填房间号", "Pick a room, or enter the room code")
                      : Mode == "steamlobby" ? L.T("先选一个大厅", "Pick a lobby first")
                      : L.T("先填主机 IP", "Enter the host IP first"));
                 return;
             }
             // 服务器大厅里填的是 IP / 域名（带 . 或 :）= 输入 IP 直连（原来的广域网）
-            if (Mode == "server" && (text.IndexOf('.') >= 0 || text.IndexOf(':') >= 0) && !text.StartsWith("room:"))
+            if (Modes.IsServer(Mode) && (text.IndexOf('.') >= 0 || text.IndexOf(':') >= 0) && !text.StartsWith("room:"))
             {
+                // §110 排位要经服务器（服务器靠会话认两边是谁），不能 IP 直连
+                if (Mode == "ranked") { Warn(L.T("武林盟主只能从房间列表 / 房间号加入，不能 IP 直连", "Ranked rooms are joined from the list or by room code, not by IP")); return; }
                 var dep = Addr.Parse(text, cfg.Port);
                 if (dep == null) { Warn(L.T("认不出这个地址：", "Can't resolve this address: ") + text); return; }
                 if (StartSession("client", dep, 0)) cfg.Remember(Mode, dep.ToString());
                 return;
             }
-            if (Mode == "server")
+            if (Modes.IsServer(Mode))
             {
                 // 房间号（6 位）或列表里的 room:<房间号>[@<所在服务器 IP:端口>]（别的服务器互通过来的房间，要去那台加入，§50）；
                 // 房间是临时的，不记进最近列表
@@ -914,7 +949,7 @@ namespace PbzLobby
                 {
                     if (!Steam.Init()) { Warn(Steam.Error); return false; }
                 }
-                else if (Mode == "server" && !(role == "client" && peer != null))     // 客机输入 IP 直连 = 普通 UDP（下面 t = null）
+                else if (Modes.IsServer(Mode) && !(role == "client" && peer != null))     // 客机输入 IP 直连 = 普通 UDP（下面 t = null）
                 {
                     // 客机加入别的服务器的房间（room = 房间号@那台服务器）：去那台 JOIN、打洞、中转
                     int at = room != null ? room.IndexOf('@') : -1;
@@ -931,15 +966,24 @@ namespace PbzLobby
                     t = sl = new ServerLink(srv, role == "host" ? null : room, role == "host" ? cfg.Port : 0, cfg.Name,
                                             Path.Combine(dir, "state_remote.txt"), Program.SimNoDirect);
                     sl.AllowRelay = cfg.Relay;
+                    sl.ServerName = at >= 0 ? "" : cfg.Server;     // 互通过来的房间去的是别的服务器，只显示 IP
+                    if (Mode == "ranked") sl.RankPid = Rank.Pid;     // §110 排位房间：登记 / 加入带上 pid
                 }
                 if (Mode == "ai") return StartAi();
-                int port = Mode == "server" ? cfg.Port : Session.GamePort;
+                int port = Modes.IsServer(Mode) ? cfg.Port : Session.GamePort;
                 var ses = new Session(role, Mode, t, peer, port, cfg.Name, dir, doBackup, cfg.Secret);
+                if (sl != null && Mode == "ranked")
+                {
+                    ses.RankPid = Rank.Pid;
+                    ses.Stats = Rank.Stats;
+                    var rs = Rank.Stats;
+                    sl.PeerPacket = d => { string r; if (d.TryGetValue("res", out r)) rs.Peer(r); };     // 对方报我的招打没打中
+                }
                 if (sl != null) sl.MapOf = () => ses.LocalMap;
                 session = ses;
                 session.Log = m => { lastLog = DateTime.Now.ToString("HH:mm:ss ") + m; };
                 session.Start();
-                if (Mode == "server" && role == "host" && cfg.Upnp) Upnp.MapAsync(port);
+                if (Modes.IsServer(Mode) && role == "host" && cfg.Upnp) Upnp.MapAsync(port);
                 if (Mode == "steamlobby" && role == "host") SteamLobby.Host(cfg.Name);
             }
             catch (SocketException ex)
@@ -1015,6 +1059,7 @@ namespace PbzLobby
                                                                             : L.T("认不出大厅服务器地址：", "Can't resolve the lobby server: ") + cfg.Server);
                 t = sl = new ServerLink(srv, null, cfg.Port, cfg.Name, Path.Combine(d, "state_remote.txt"), Program.SimNoDirect);
                 sl.AllowRelay = cfg.Relay;
+                sl.ServerName = cfg.Server;
             }
             int port = mode == "server" ? cfg.Port : Program.LanPort;
             var ses = new Session("host", mode, t, null, port, cfg.Name, d, doBackup, cfg.Secret);
@@ -1282,8 +1327,34 @@ namespace PbzLobby
                         catch (Exception ex) { Warn(L.T("复制失败：", "Copy failed: ") + ex.Message); }
                     }
                     break;
+                case "ranktop":   // §110 排行榜第几页
+                    {
+                        int pg;
+                        Rank.RequestTop(d.TryGetValue("page", out v) && int.TryParse(v.Trim(), out pg) ? pg : 1);
+                    }
+                    break;
+                case "rankstat":   // §110.11 统计页：kind=w 武器 / e 影之武装 / m 招式，page=N
+                    {
+                        int pg;
+                        string kind;
+                        d.TryGetValue("kind", out kind);
+                        Rank.RequestStats(kind ?? "w", d.TryGetValue("page", out v) && int.TryParse(v.Trim(), out pg) ? pg : 1);
+                    }
+                    break;
+                case "rankexport":   // §110 把排位密钥复制到剪贴板（换电脑用）
+                    try { Clipboard.SetText(Rank.ExportKey()); lastLog = DateTime.Now.ToString("HH:mm:ss ") + L.T("排位密钥已复制到剪贴板，别发给别人", "Ranked key copied; keep it private"); }
+                    catch (Exception ex) { Warn(L.T("复制失败：", "Copy failed: ") + ex.Message); }
+                    break;
+                case "rankimport":   // §110 从剪贴板导入排位密钥
+                    {
+                        string clip = "", why;
+                        try { if (Clipboard.ContainsText()) clip = Clipboard.GetText(); } catch (Exception) { }
+                        if (Rank.ImportKey(clip, out why)) lastLog = DateTime.Now.ToString("HH:mm:ss ") + L.T("排位密钥已导入", "Ranked key imported");
+                        else Warn(why);
+                    }
+                    break;
                 case "refresh":   // §91 游戏内面板打开房间列表页：马上重新问一次房间
-                    if (Mode == "server") lobbyList.Refresh();
+                    if (Modes.IsServer(Mode)) lobbyList.Refresh();
                     else if (Mode == "steamlobby") SteamLobby.Refresh();
                     break;
                 case "show":
@@ -1307,15 +1378,19 @@ namespace PbzLobby
                 foreach (var f in Steam.FriendsInGame())
                     add("friend", f[1] + (f[2] == "1" ? L.T("（在开房）", " (hosting)") : L.T("（在玩，没开房）", " (playing, not hosting)")), "steam:" + f[0]);
             }
-            else if (Mode == "server")
+            else if (Modes.IsServer(Mode))
             {
                 var mine = s != null ? s.T as ServerLink : null;
                 foreach (var r in lobbyList.Poll(cfg.Server))
                 {
                     if (mine != null && mine.RoomId == r[0] && (r.Length < 5 || r[4].Trim().Length == 0)) continue;     // 不列自己开的房间
+                    // §110 第 6 列 = 排位房间（旧服务器没有这列 = 不是）：服务器大厅只列普通房间，武林盟主只列排位房间；第 7 列 = 称号
+                    bool rk = r.Length > 5 && r[5] == "1";
+                    if (rk != (Mode == "ranked")) continue;
+                    var title = rk && r.Length > 6 && r[6].Trim().Length > 0 ? "【" + r[6].Trim() + "】" : "";
                     // 第 5 列 = 所在服务器（空 = 就是我们连的这台；否则是互通过来的别的服务器，§50）
                     var home = r.Length > 4 ? r[4].Trim() : "";
-                    add(r[3] == "1" ? "full" : "room", (home.Length > 0 ? L.T("[互通] ", "[LINKED] ") : "") + r[1] + L.T("  地图 ", "  map ") + r[2]
+                    add(r[3] == "1" ? "full" : "room", (home.Length > 0 ? L.T("[互通] ", "[LINKED] ") : "") + title + r[1] + L.T("  地图 ", "  map ") + r[2]
                                 + (r[3] == "1" ? L.T("  已满", "  full") : "") + L.T("  房间号 ", "  code ") + r[0],
                         "room:" + r[0] + (home.Length > 0 ? "@" + home : ""));
                 }
@@ -1342,10 +1417,10 @@ namespace PbzLobby
             if (Mode == "ai") return;     // 本地 AI 没有可加入的目标
             string clip = "";
             try { if (Clipboard.ContainsText()) clip = Clipboard.GetText().Trim(); } catch (Exception) { }
-            if (Mode == "server")
+            if (Modes.IsServer(Mode))
             {
                 if (LooksLikeRoom(clip)) add("clip", L.T("剪贴板：房间号 ", "Clipboard: room ") + clip, "room:" + clip.ToUpperInvariant());
-                else if (Addr.LooksLikeIp(clip)) add("clip", L.T("剪贴板：IP 直连 ", "Clipboard: direct IP ") + clip, clip);
+                else if (Addr.LooksLikeIp(clip) && Mode == "server") add("clip", L.T("剪贴板：IP 直连 ", "Clipboard: direct IP ") + clip, clip);
             }
             else if (Modes.IsSteam(Mode) ? Addr.SteamId(clip) != 0 : Addr.LooksLikeIp(clip))
                 add("clip", L.T("剪贴板：", "Clipboard: ") + clip, Modes.IsSteam(Mode) ? "steam:" + Addr.SteamId(clip) : clip);
@@ -1378,6 +1453,7 @@ namespace PbzLobby
                     if (!Steam.Ready) return L.T("（Steam 没连上）", "(Steam not connected)");
                     return SteamLobby.Hosting ? (SteamLobby.Mine != 0 ? L.T("Steam 大厅已公开：", "Steam lobby open: ") + cfg.Name : SteamLobby.Status) : Steam.MyName;
                 case "server":
+                case "ranked":
                     {
                         var sl = s != null ? s.T as ServerLink : null;
                         if (cfg.Server.Length == 0) return L.T("（没填大厅服务器：设置里填，可自己架设）", "(no lobby server: set or host one)");
@@ -1410,6 +1486,7 @@ namespace PbzLobby
                 case "steamlobby": return Steam.Ready ? Steam.MyId.ToString() : "";
                 // 房间号；还没登记上（大厅服务器连不上）时复制 公网IP:端口，朋友用"输入 IP 直连"
                 case "server": { var sl = s != null ? s.T as ServerLink : null; return sl == null ? "" : sl.RoomId.Length > 0 ? sl.RoomId : PublicAddr(); }
+                case "ranked": { var sl = s != null ? s.T as ServerLink : null; return sl == null ? "" : sl.RoomId; }     // §110 排位不能 IP 直连
                 case "ai": return "";
                 // 局域网：有虚拟网卡（Tailscale / ZeroTier）时复制它——要"发给朋友"的多半不在同一个路由器下，
                 // 同一个路由器下的朋友在房间列表里直接能看到房间，用不着地址
@@ -1448,6 +1525,12 @@ namespace PbzLobby
                                  "\nIf the server is down: the host forwards UDP " + cfg.Port + " (or ticks UPnP); the friend enters public-IP:port to join directly.")
                            + (Upnp.Status.Length > 0 ? "\n" + Upnp.Status : "")
                            + (lobbyList.Error.Length > 0 ? "\n" + lobbyList.Error : "");
+                case "ranked":
+                    return L.T("武林盟主（排位）：房间登记在大厅服务器上，和服务器大厅一样建房 / 加入，但只列排位房间。打完两边各报结果，对上才记分（Elo，每天同一对人记 3 场）；规则由服务器定：3 局 2 胜、伤害 150%、禁血瓶、开武器平衡。",
+                               "Ranked: rooms on the lobby server, host / join like the lobby server but only ranked rooms are listed. Both sides report the result; it counts only if they agree (Elo, 3 rated matches per pair per day). The server sets the rules.")
+                           + (Rank.Me.Length > 0 ? "\n" + L.T("我的分数 ", "My rating ") + Rank.Me.Split('|')[0] : "")
+                           + (Rank.Error.Length > 0 ? "\n" + Rank.Error : "")
+                           + (lobbyList.Error.Length > 0 ? "\n" + lobbyList.Error : "");
                 case "ai":
                     return L.T("和电脑里的 AI 打（拿双刃，照抄你的攻击属性、最大血量和影之武装），不联网、不用别人。点\"开始 AI 对战\"后 AI 走到你身边，按 F1 开打。",
                                "Fight a computer opponent (dual blades; copies your attack stats, max health and Phantom Edge). Offline. Click \"Start AI battle\", then press F1 to fight.")
@@ -1468,6 +1551,19 @@ namespace PbzLobby
             var gp = GamePipe.For(dir);      // §83 走管道时 state_local.txt 不再更新
             bool gameOn = (gp != null && gp.Connected) || File.Exists(fLocal) && (DateTime.Now - File.GetLastWriteTime(fLocal)).TotalSeconds < 3;
             var w = waitSes;
+            // §110 排位：在武林盟主方式下（或正连着排位房间）往来；不在时也每 30 秒问一下服务器开没开排位（决定列不列这个标签）
+            Rank.Poll(cfg.Server, cfg.Name, Mode == "ranked" || (s != null && s.Mode == "ranked"), s);
+            if (Rank.Support != shownSupport && !modeBox.DroppedDown)
+            {
+                if (Mode == "ranked" && Rank.Support == 0 && s == null)
+                {
+                    lastLog = DateTime.Now.ToString("HH:mm:ss ") + L.T("这台大厅服务器没开武林盟主排位，换回服务器大厅", "This lobby server has no ranked mode; back to the lobby server");
+                    cfg.Mode = "server"; cfg.Save();
+                }
+                ApplyLang();     // 重填连接方式下拉框（里面会再调 Tick，shownSupport 已经更新，不会再进来）
+                if (!IsHandleCreated) Tick();
+                return;
+            }
             if (Modes.IsSteam(Mode) || (w != null && Modes.IsSteam(waitMode))) Steam.Pump();
             if (Mode == "steamlobby" && s != null && s.Role == "host") SteamLobby.Update(cfg.Name, s.LocalMap, s.Connected);
             if (w != null && s != null)
@@ -1478,8 +1574,8 @@ namespace PbzLobby
             BuildCands();
             ipsBox.Text = MyAddr() + Environment.NewLine + AddrHint().Replace("\n", Environment.NewLine);
             lblJoin.Text = Modes.IsSteam(Mode) ? L.T("加入：SteamID64", "Join: SteamID64")
-                         : Mode == "server" ? L.T("加入：房间号", "Join: room code") : L.T("加入：主机 IP[:端口]", "Join: host IP[:port]");
-            bool srvMode = Mode == "server";
+                         : Modes.IsServer(Mode) ? L.T("加入：房间号", "Join: room code") : L.T("加入：主机 IP[:端口]", "Join: host IP[:port]");
+            bool srvMode = Modes.IsServer(Mode);
             bool aiMode = Mode == "ai";
             srvBox.Visible = srvMode;
             aiBox.Visible = aiMode;
@@ -1527,7 +1623,7 @@ namespace PbzLobby
             // 主机 / 客机互斥：联机中只能"断开"，其余入口灰掉；没联机时"断开"灰掉
             bool busy = s != null;
             hostBtn.Enabled = joinBtn.Enabled = ipBox.Enabled = nameBox.Enabled = roomList.Enabled = modeBox.Enabled = secretBox.Enabled = !busy;
-            portBox.Enabled = upnpBox.Enabled = !busy && Mode == "server";
+            portBox.Enabled = upnpBox.Enabled = !busy && Modes.IsServer(Mode);
             srvBox.Enabled = !busy;
             stopBtn.Enabled = busy;
             if (s == null)
@@ -1556,7 +1652,7 @@ namespace PbzLobby
                     roomList.Items.Add(Steam.Ready ? L.T("（没有好友在玩影之刃零并开着房）", "(No friend is playing and hosting)") : "(" + Steam.Error + ")");
                 else if (Mode == "steamlobby")
                     roomList.Items.Add(Steam.Ready ? L.T("（Steam 大厅里没有别人开的房）", "(No rooms in the Steam lobby list)") : "(" + Steam.Error + ")");
-                else if (Mode == "server" && lobbyList.Error.Length > 0)
+                else if (Modes.IsServer(Mode) && lobbyList.Error.Length > 0)
                     roomList.Items.Add("(" + lobbyList.Error + ")");
                 else
                     roomList.Items.Add(s != null && s.Role == "host"
@@ -1594,7 +1690,10 @@ namespace PbzLobby
             kv("connected", s != null && s.Connected ? "1" : "0");
             kv("peer", s == null ? "" : s.T.PeerStr);
             // 对方昵称优先；还没收到（或对方是旧版）时 Steam 用 Steam 名字，直连为空（面板退回显示地址）
-            kv("peername", s == null ? "" : (!string.IsNullOrEmpty(s.T.PeerNick) ? s.T.PeerNick : s.T.PeerName));
+            var pn = s == null ? "" : (!string.IsNullOrEmpty(s.T.PeerNick) ? s.T.PeerNick : s.T.PeerName);
+            var psl = s != null && s.Mode == "ranked" ? s.T as ServerLink : null;
+            var ptitle = psl != null ? Rank.TitleOf(psl.PeerRk) : "";       // §110 对方是武林盟主：昵称前加称号（称号只由服务器给）
+            kv("peername", ptitle.Length > 0 && pn.Length > 0 ? "【" + ptitle + "】" + pn : pn);
             kv("ping", s != null && s.T.PingMs >= 0 ? Kv.F(s.T.PingMs, "0") : "-1");
             kv("port", s == null ? "0" : s.T.LocalPort.ToString());
             kv("myaddr", MyAddr());
@@ -1614,22 +1713,23 @@ namespace PbzLobby
             kv("rej", s != null ? s.Wire.Rejected.ToString() : "0");
             kv("hint", s != null ? s.Wire.Hint(true) : "");     // 短句（面板一行放得下）；窗口里是长句
             kv("app", Proto.App);
-            kv("modes", string.Join(",", Modes.All));      // §98 面板只显示联机程序有的方式（发布版没有 Steam 两种）
+            kv("modes", string.Join(",", ShownModes));      // §98 面板只显示联机程序有的方式（发布版没有 Steam 两种）
             // 服务器大厅：srv = 设置里的地址；route = 线路（direct 直连 / relay 中转 / punch1..3 第几次直连 / wait 主机等人）；
             // room = 自己开的房间号；srverr = 服务器那边的问题（没回应 / 没这个房间），面板没联机时也要能看到
             var sl = s != null ? s.T as ServerLink : null;
             kv("srv", cfg.Server);
             kv("route", sl != null ? sl.Route : "");
             kv("room", sl != null ? sl.RoomId : "");
-            kv("srverr", Mode != "server" ? "" : sl != null ? sl.Error : lobbyList.Error);
+            kv("srverr", !Modes.IsServer(Mode) ? "" : sl != null ? sl.Error : lobbyList.Error);
             kv("steam", Steam.Ready ? "ok" : (Mode == "steam" ? Steam.Error : "off"));
             kv("upnp", Upnp.Status);
             kv("err", (DateTime.UtcNow - lastErrAt).TotalSeconds < 10 ? lastErr : "");
             kv("msg", lastLog);
             kv("ack", ack ?? "");
             // §91 房间列表还在取第一份：面板显示"正在获取房间…"（局域网 / Steam 好友是现成的，不用等）
-            kv("listing", Mode == "server" ? (lobbyList.Listing ? "1" : "0") : Mode == "steamlobby" ? (Steam.Ready && SteamLobby.Listing ? "1" : "0") : "0");
+            kv("listing", Modes.IsServer(Mode) ? (lobbyList.Listing ? "1" : "0") : Mode == "steamlobby" ? (Steam.Ready && SteamLobby.Listing ? "1" : "0") : "0");
             kv("shown", Visible ? "1" : "0");
+            Rank.WriteLobby(sb, Mode == "ranked");     // §110 rk / rkme / rkrules / rktop / rkt1..
             // v0.19.1：8 → 40（跟大厅服务器一次给的上限一样），游戏内面板的"房间列表"页自己分页
             int n = Math.Min(cands.Count, 40);
             kv("n", n.ToString());

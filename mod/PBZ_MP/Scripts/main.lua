@@ -21,7 +21,7 @@
 
 local UEHelpers = require("UEHelpers")
 
-local VERSION = "0.27.26"
+local VERSION = "0.28.1"
 local TAG = "[PBZ_MP] "
 -- v0.14.0：所有文件都放在模组自己的目录（…/Mods/PBZ_MP/），不再写死本机的游戏路径，别人的电脑上也能用。
 -- 从本脚本的路径推出模组目录（脚本在 PBZ_MP/Scripts/main.lua）；拿不到时退回 UE4SS 的工作目录（游戏 exe 所在的 platform/steam）下的相对路径
@@ -858,6 +858,7 @@ end
 -- v0.23.0：武器组件 / 影之武装 / 技能路径表 / 给技能 / GE 这几个 LO 函数搬到 pbz_game.lua（游戏适配层）
 LO.slot, LO.slotShachi, LO.heldConfig, LO.armed, LO.config = G.LO.slot, G.LO.slotShachi, G.LO.heldConfig, G.LO.armed, G.LO.config
 LO.index, LO.give, LO.geClass, LO.applyGE, LO.uiCompOf = G.LO.index, G.LO.give, G.LO.geClass, G.LO.applyGE, G.LO.uiCompOf
+LO.outfitOf, LO.applyOutfit, LO.appcProbe, LO.outfitOk = G.LO.outfitOf, G.LO.applyOutfit, G.LO.appcProbe, G.LO.outfitOk
 
 function LO.short(path) return path and (path:match("([^.]+)$") or path) or "-" end
 
@@ -915,7 +916,60 @@ function LO.dressOff(pup, cwc)
     ST.abMapKey, NET.sub = nil, {}
 end
 
+-- §109 皮肤同步。发送方 of=<皮肤行名>:<肤色>:<帽子藏了 1/0>（读不到的写 -），每 3 秒读一次；
+-- 接收方给替身"只改样子"地换上（LO.applyOutfit，签名对上才调），同一个"替身 × 皮肤 × 肤色 × 斗笠"只换一次、3 秒后再补一次
+-- （替身蓝图生成后可能按本机存档把外观再刷回去）；换完 1 秒后核对本机玩家的皮肤没被连带改
+function LO.encodeOutfit(p1)
+    local o = LO.outfitOf(p1)
+    if not o then return nil end
+    local hat = o.hat == true and "1" or o.hat == false and "0" or "-"
+    return string.format("%s:%s:%s", LO.outfitOk(o.outfit) and o.outfit or "-", o.skin and tostring(o.skin) or "-", hat)
+end
+
+-- of= 字段 → { outfit, skin, hat }；不合法的部分是 nil，整个没有 = nil（旧版对方 / 本地 AI：替身不动）
+function LO.decodeOutfit(s)
+    if type(s) ~= "string" or s == "" then return nil end
+    local a, b, c = s:match("^([%w_%-]+):([%d%-]+):([01%-])$")
+    if not a then return nil end
+    local r = { outfit = LO.outfitOk(a) and a or nil, skin = tonumber(b), hat = nil }
+    if c == "1" then r.hat = true elseif c == "0" then r.hat = false end
+    if r.skin and (r.skin < 0 or r.skin > 3) then r.skin = nil end
+    if not (r.outfit or r.skin) then return nil end
+    return r
+end
+
+function LO.dressOutfit(pup, p1)
+    local want = NET.rof
+    local st = LO.stOutfit
+    if not want then return end
+    if not LO.appcProbed then
+        LO.appcProbed = true
+        out("替身外观组件：%s", LO.appcProbe(pup))
+    end
+    local key = pathOf(pup) .. "|" .. tostring(want.outfit) .. "|" .. tostring(want.skin) .. "|" .. tostring(want.hat)
+    if key ~= st.key or (st.again and ST.ticks >= st.again) then
+        local first = key ~= st.key
+        st.key, st.again = key, first and ST.ticks + 90 or nil
+        local mine = LO.outfitOf(p1)
+        local ok, msg = LO.applyOutfit(pup, want.outfit, want.skin, want.hat)
+        out("替身皮肤%s → %s 肤色 %s 斗笠%s：%s（%s）", first and "" or "（补一次）", tostring(want.outfit), tostring(want.skin),
+            want.hat == true and "藏" or "显示",
+            ok and "已换" or "没换成", msg)
+        st.checkMine = { before = mine and mine.outfit, at = ST.ticks + 30 }
+    end
+    if st.checkMine and ST.ticks >= st.checkMine.at then
+        local now = LO.outfitOf(p1)
+        now = now and now.outfit
+        out("  换皮肤后本机玩家：%s → %s %s", tostring(st.checkMine.before), tostring(now),
+            now == st.checkMine.before and "（没变 ✓）" or "（!! 变了：替身换皮肤连带改了玩家）")
+        st.checkMine = nil
+    end
+end
+
 function LO.dress(pup, p1)
+    LO.stOutfit = LO.stOutfit or {}
+    local okO, errO = pcall(LO.dressOutfit, pup, p1)       -- §109 皮肤，出错不影响下面的武器
+    if not okO and errO ~= LO.outfitErr then LO.outfitErr = errO; out("!! 替身换皮肤出错：%s", tostring(errO)) end
     local cwc = rawProp(pup, "Character Weapons Component")
     if not valid(cwc) then return end
     LO.stMain, LO.stShachi = LO.stMain or {}, LO.stShachi or {}
@@ -1039,6 +1093,13 @@ function LO.isHitMontage(m)
         if m:find(k, 1, true) then return true end
     end
     return false
+end
+
+-- §111 技能里面按键换的动作：紫冥剑按住重击召唤（GA_Hun_ZiMingJian_New_DB_C）按住时每按一下召唤一件武器，
+-- Summon_Loop → Summon_JinGua_03 / Summon_Gun_03 / Summon_TieChi_04 … → Summon_End 都在同一个技能里，没有新的 ev=；
+-- 替身没人按键，只播 Start 就收招。起手 Start 是替身放技能自己播的，不发
+function LO.isSubMontage(m)
+    return m ~= nil and m:find("Hun_ZiMing_Summon_", 1, true) == 1 and not m:find("_Start", 1, true)
 end
 
 -- §103 喝药动作：AM_Hun_Medicine_LongBlade / _TangBlade / _DoubleBlade……（按手上武器不同，2026-11-05 日志里见过这三个）
@@ -1415,6 +1476,8 @@ function NET.boSet(n)
 end
 function NET.boNext(n) return n >= 9 and 3 or n + 2 end     -- 3 → 5 → 7 → 9 → 3
 function NET.bestOf()
+    local rk = NET.rkRules()                 -- §110 武林盟主：服务器定的
+    if rk then return rk.bo end
     if (MATCH.session and MATCH.session.role) == "client" then return NET.boValid(NET.rbo) and NET.rbo or 3 end
     return NET.boCfg
 end
@@ -1454,6 +1517,8 @@ function NET.dmNext(n)       -- 50 → 75 → 100 → 150 → 200 → 300 → 50
     return 100
 end
 function NET.dmgPct()        -- 房间设置：主机 / 没联机 = 自己的，客机 = 主机的
+    local rk = NET.rkRules()                 -- §110 武林盟主：服务器定的
+    if rk then return rk.dm end
     if (MATCH.session and MATCH.session.role) == "client" then return NET.dmValid(NET.rdm) and NET.rdm or 100 end
     return NET.dmCfg
 end
@@ -1483,6 +1548,8 @@ function NET.abSet(n)
     fileWrite(NET.AB_FILE, table.concat(lines, "\n") .. "\n")
 end
 function NET.allBlock()
+    local rk = NET.rkRules()                 -- §110 武林盟主：服务器定的
+    if rk then return rk.ab == 1 end
     if (MATCH.session and MATCH.session.role) == "client" then return NET.rab == 1 end
     return NET.abCfg == 1
 end
@@ -1511,6 +1578,8 @@ function NET.flagSet(k, n)
     fileWrite(NET.AB_FILE, table.concat(lines, "\n") .. "\n")
 end
 function NET.flag(k)         -- 房间设置：主机 / 没联机 = 自己的，客机 = 主机的
+    local rk = NET.rkRules()                 -- §110 武林盟主：服务器定的
+    if rk and rk[k] ~= nil then return rk[k] == 1 end
     if (MATCH.session and MATCH.session.role) == "client" then
         local r = NET.rflag[k]
         if r == nil then r = NET.FLAG_DEF[k] end
@@ -1527,6 +1596,37 @@ function NET.flagsNow()      -- 开局时定下
     for _, k in ipairs(NET.FLAG_KEYS) do f[k] = NET.flag(k) end
     return f
 end
+-- §110 武林盟主（排位）固定规则：联机程序在 lobby.txt 里给 rk=1（当前连接方式是 ranked）和 rkrules=bo=3;dm=150;med=0;bal=1;ctr=1;ab=0
+-- （服务器下发）。这时上面的 NET.bestOf / dmgPct / allBlock / flag 一律按 rkrules 返回，主机、客机一样，不看本机 rules.txt / 主机状态包；
+-- 开局 / 跟随时定下 MATCH.* 的地方调的就是它们，不用改。规则还没拿到（rk=1 但 rkrules 空）时不拿本机设置冒充：主机不让开局
+-- （F1 / startMatchNow），那时各取值函数照旧。rkrules 里缺的键按原版默认，坏值不认（也按默认）。
+-- lobby.txt 在 NETUI 段才读得到（netuiRead），这里先放个空的，那边换掉
+NET.RK_DEF = { bo = 3, dm = 100, ab = 0, ctr = 1, bal = 0, med = 1 }
+NET.rkLobby = function() return nil end
+NET.rkCache = {}
+function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }；空 / 一个认识的键都没有 → nil
+    if not s or s == "" then return nil end
+    if NET.rkCache.s == s then return NET.rkCache.r end
+    local r, any = {}, false
+    for k, v in pairs(NET.RK_DEF) do r[k] = v end
+    for k, v in s:gmatch("(%w+)=(%-?%d+)") do
+        local n, ok = tonumber(v), false
+        if k == "bo" then ok = n >= 1 and n <= 99 and n % 2 == 1
+        elseif k == "dm" then ok = n >= 10 and n <= 1000
+        elseif NET.RK_DEF[k] ~= nil then ok = n == 0 or n == 1 end
+        if ok then r[k], any = n, true end
+    end
+    if not any then r = nil end
+    NET.rkCache = { s = s, r = r }
+    return r
+end
+function NET.rk()            -- 返回 是不是排位方式, 规则表（还没拿到 = nil）
+    local lb = NET.rkLobby()
+    if not (lb and lb.rk == "1") then return false, nil end
+    return true, NET.rkParse(lb.rkrules)
+end
+function NET.rkRules() local on, r = NET.rk(); return on and r or nil end
+function NET.rkWaiting() local on, r = NET.rk(); return on and r == nil end
 
 -- ============================================================ M3：判定结果回传
 -- 防守方判定（交接文档 §2 方案 C）：对方每出一招，本机开一个 JUDGE_WIN 秒的窗口看结果：
@@ -3356,6 +3456,10 @@ local function netSend(p1, tn)
         NET.medN, NET.medT = (NET.medN or 0) + 1, hm
     end
     NOMED.frame(p1, tn)
+    -- §111 技能里面按键换的动作（紫冥剑召唤）：换成新的一个时次数 +1，发 sub=<次数>:<动作名>，对方替身照播
+    if hm ~= NET.hrPrev and LO.isSubMontage(hm) then
+        NET.subN, NET.subT = (NET.subN or 0) + 1, hm
+    end
     if hm ~= NET.hrPrev and hm:find("C_Failed", 1, true) then ULT.watch(p1, false, "我大招失败 " .. hm, tn) end   -- v0.27.1
     ULT.flushHeld(p1, hm, tn)          -- v0.27.2 压住的大招：放出来了才发
     NET.hrPrev = hm
@@ -3383,6 +3487,8 @@ local function netSend(p1, tn)
     end
     -- v0.17.2：生效的天赋 / 饰品被动（每 3 秒重算）
     if not NET.pasStr or ST.ticks % 90 == 0 then NET.pasStr = LO.encodePas(p1) end
+    -- §109 皮肤（每 3 秒读一次；只在菜单里能换）
+    if NET.ofStr == nil or ST.ticks % 90 == 45 then NET.ofStr = LO.encodeOutfit(p1) or "" end
     NET.seq = NET.seq + 1
     fileWrite(F_LOCAL, string.format(
         "v=2\nseq=%d\nmap=%s\nx=%.1f\ny=%.1f\nz=%.1f\nyaw=%.1f\nvx=%.1f\nvy=%.1f\nw=%s\nev=%s\nhp=%.1f\nhpm=%.1f\nres=%s\n"
@@ -3401,8 +3507,10 @@ local function netSend(p1, tn)
         .. "bal=" .. NET.flagCfg.bal .. "\n"   -- §106.5 我的"武器平衡"设置（只有主机的算数）
         .. "medok=" .. NET.flagCfg.med .. "\n"   -- §108 我的"血瓶"设置（只有主机的算数；med= 已经是喝药动作）
         .. "med=" .. (NET.medN or 0) .. ":" .. (NET.medT or "-") .. "\n"   -- §103 喝药动作（次数:动作名）
+        .. "sub=" .. (NET.subN or 0) .. ":" .. (NET.subT or "-") .. "\n"   -- §111 技能里面换的动作（紫冥剑召唤；次数:动作名）
         .. "gd=" .. (BLK.on and 1 or 0) .. "\n"                            -- §104 我在不在格挡（对方据此预测替身的反应）
         .. "tc=" .. TOUCH.wire(tn) .. "\n"                                 -- §107 我哪几招在本机碰到了替身（本地 AI 据此回报）
+        .. (NET.ofStr ~= "" and ("of=" .. NET.ofStr .. "\n") or "")        -- §109 我的皮肤（行名:肤色:帽子）
         .. LAT.wire(tn, NET.events)        -- v0.27.0 ts= / tse= / evt=：测往返和包龄
         .. CHG.wire(tn))                   -- §92 rel=<招式号>:<按了几秒>：蓄力招松手
 end
@@ -3434,7 +3542,7 @@ function NET.recvOne(p1, tn, t)
     if seq < NET.lastSeq then
         if seq > NET.lastSeq - 100 then return end   -- 乱序到达的旧包，丢掉
         out("远端序号回退 %d -> %d（对方重启了？），重置", NET.lastSeq, seq)
-        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.resAtk = 0, nil, 0, nil, nil, nil, {}
+        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.subIn, NET.resAtk = 0, nil, 0, nil, nil, nil, nil, {}
         LAT.reset(); CHG.reset(); PRED.reset()
     end
     if NET.lastSeq == -1 or NET.lastRecvAt < tn - 5 then
@@ -3442,7 +3550,7 @@ function NET.recvOne(p1, tn, t)
         NET.rwcCur, NET.rwcOff = nil, nil       -- v0.26.1 新连接：另一把等对方切一次武器才知道
         -- v0.18.2（17:13 实测）：换了个对手 / 对方重启后序号反而更大时，上面的"序号回退"不触发，招式号还停在上一个对手的 #14，
         -- 新对手的 #1–#14 全被当成"已处理"丢掉。断了 5 秒以上再收到就算新连接，各计数清零（旧事件早超过 EV_KEEP 了）
-        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.resAtk = 0, nil, 0, nil, nil, nil, {}
+        NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.subIn, NET.resAtk = 0, nil, 0, nil, nil, nil, nil, {}
         LAT.reset(); CHG.reset(); PRED.reset()      -- §104 换了对手：防住率从先验重新学
     end
     NET.lastSeq, NET.lastRecvAt, NET.rx = seq, tn, NET.rx + 1
@@ -3483,6 +3591,25 @@ function NET.recvOne(p1, tn, t)
         end
         NET.medIn = mn
     end
+    -- §111 对方技能里面换的动作（紫冥剑召唤武器）→ 替身照播（动作自己带召唤 / 伤害的通知）。第一次收到只记次数。
+    -- 动作是替身放 DB 时才加载的，表里没有就重扫一次；播过的记进这一招的 f.mon，判定窗口接着等（CHG.keepJudge）
+    local sn, sm = (t.sub or ""):match("^(%d+):([%w_%-]+)$")
+    sn = tonumber(sn)
+    if sn then
+        if NET.subIn and sn > NET.subIn and LO.isSubMontage(sm) and not REP.on then
+            local pupS = puppet()
+            montageByName(sm, true)
+            local okS = playNamed(pupS, sm)
+            if okS then
+                local fid
+                for id, f in pairs(CHG.fired) do if f.name == "GA_Hun_ZiMingJian_New_DB_C" and (not fid or id > fid) then fid = id end end
+                if fid then CHG.fired[fid].mon[sm] = true end
+            end
+            out("  对方技能内动作 %s%s → 替身 %s", sm, sn > NET.subIn + 1 and string.format("（中间漏了 %d 个）", sn - NET.subIn - 1) or "",
+                okS and "已播" or "播放失败（本机没有这个动作）")
+        end
+        NET.subIn = sn
+    end
     -- v0.18.3 对方的受击动作 → 替身播同一个（模组自己播的不会被"掐掉本机反应"掐掉）。第一次收到只记次数
     local hn2, ht2 = (t.hr or ""):match("^(%d+):([%w_%.]+)$")
     hn2 = tonumber(hn2)
@@ -3509,6 +3636,7 @@ function NET.recvOne(p1, tn, t)
     if t.arm == "1" then NET.rarm = true elseif t.arm == "0" then NET.rarm = false else NET.rarm = nil end
     NET.rwcs = (t.wcs and t.wcs ~= "") and t.wcs or nil -- v0.17.4 对方当前的影之武装
     NET.rpas = t.pas                                    -- v0.17.2 对方的天赋 / 饰品被动；没有这个字段（旧版本）= nil，不动替身
+    NET.rof = LO.decodeOutfit(t.of)                     -- §109 对方的皮肤；没有这个字段（旧版本 / 本地 AI）= nil，不动替身
 
     local myMap = mapName(p1)
     if t.map and t.map ~= myMap and NET.mapWarned ~= t.map then
@@ -5186,6 +5314,8 @@ local function matchRows(tn)
         if MATCH.flags and MATCH.flags.bal then rules[#rules + 1] = T("武器平衡", "WEAPON BALANCE") end                     -- §106.5
         if MATCH.flags and MATCH.flags.med == false then rules[#rules + 1] = T("禁用血瓶", "NO POTIONS") end                -- §108
         if #rules > 0 then rows[#rows + 1] = { c = table.concat(rules, " · "), col = COL_ORANGE } end
+        local rkRow = NET.rkScoreRow()     -- §110 武林盟主：我的积分 / 名次
+        if rkRow then rows[#rows + 1] = rkRow end
         rows[#rows + 1] = { c = tostring(math.max(1, math.ceil(CD_SEC - el))), col = COL_WHITE, size = 2.2 }
         return rows
     elseif s == "fight" then
@@ -5201,6 +5331,42 @@ local function matchRows(tn)
         return { { c = won and T("胜利", "VICTORY") or T("败北", "DEFEAT"), col = won and COL_GREEN or COL_RED, size = 2.4 }, scoreRow() }
     end
     return nil
+end
+
+-- §110 用户 2026-11-06"对局的过程看不到我的积分变化么"：倒计时里显示我的积分；打完联机程序收到服务器的结算（rkres=）后
+-- 屏幕上提示一次。rkme=<分数>|<名次>|<胜>|<负>|<称号>|<赛季>；rkres=<序号>|<胜 1 / 负 0 / 作废 ->|<变化>|<分数>|<名次>|<ok / cap / void>
+function NET.rkScoreRow()
+    local lb = NET.rkLobby()
+    if not (lb and lb.rk == "1") then return nil end
+    local sc, rank, _, _, title = (lb.rkme or ""):match("^(%-?%d+)|(%d*)|(%d*)|(%d*)|([^|]*)")
+    if not sc then return nil end
+    local s = string.format(T("武林盟主 · 我的积分 %s", "RANKED · RATING %s"), sc)
+    if (tonumber(rank) or 0) > 0 then s = s .. string.format(T("（第 %s 名）", " (#%s)"), rank) end
+    if title and title ~= "" then s = "【" .. title .. "】" .. s end
+    return { c = s, col = COL_LABEL, size = 0.75 }
+end
+NET.rkResSeen = nil       -- 上次看到的 rkres=（第一次读到的只记下、不提示：那是之前打的）
+function NET.rkResultRows()
+    local lb = NET.rkLobby()
+    local r = lb and lb.rkres or ""
+    if NET.rkResSeen == nil then NET.rkResSeen = r; return nil end
+    if r == NET.rkResSeen or r == "" then return nil end
+    NET.rkResSeen = r
+    local _, win, d, sc, rank, code = r:match("^(%d+)|([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)")
+    if not code then return nil end
+    out("武林盟主结算：%s %s，现在 %s（第 %s 名）", code, d, sc, rank)
+    local tail = (tonumber(rank) or 0) > 0 and string.format(T("现在 %s · 第 %s 名", "NOW %s · #%s"), sc, rank)
+                 or string.format(T("现在 %s", "NOW %s"), sc)
+    if code == "void" then
+        return { { c = T("本局作废", "MATCH VOID"), col = COL_ORANGE, size = 1.6 },
+                 { c = T("两边报的结果对不上，不计分", "THE REPORTS DISAGREED - NOT RATED"), col = COL_LABEL } }
+    elseif code == "cap" then
+        return { { c = T("本局不计分", "NOT RATED"), col = COL_GRAY, size = 1.6 },
+                 { c = T("今天和这位对手已经记了 3 场", "ALREADY 3 RATED MATCHES WITH THIS OPPONENT TODAY"), col = COL_LABEL },
+                 { c = tail, col = COL_LABEL, size = 0.75 } }
+    end
+    return { { c = string.format(T("武林盟主积分 %s", "RATING %s"), d), col = win == "1" and COL_GREEN or COL_RED, size = 1.8 },
+             { c = tail, col = COL_LABEL } }
 end
 
 -- 对局非正常结束时的一次性提示，显示 TOAST_SEC 秒
@@ -5231,6 +5397,10 @@ local TOAST_OF = {
         return { { c = nm and string.format(T("%s 已离开房间", "%s LEFT THE ROOM"), nm) or T("对方已离开房间", "THE PLAYER LEFT THE ROOM"),
                    col = COL_ORANGE, size = 1.6 },
                  { c = T("AI 对战已重新开始，按 F1 准备开打", "AI BATTLE RESTARTED - PRESS F1 TO FIGHT"), col = COL_LABEL } } end,
+    -- §110 武林盟主：服务器的固定规则还没到，主机不开局（不拿本机房间设置冒充排位规则）
+    ["排位规则未到"] = function()
+        return { { c = T("正在从服务器获取排位规则", "WAITING FOR THE RANKED RULES"), col = COL_ORANGE, size = 1.4 },
+                 { c = T("拿到之前不能开局，稍等再按 F1", "CAN'T START YET - PRESS F1 AGAIN IN A MOMENT"), col = COL_GRAY } } end,
 }
 
 local function wireUpdate()
@@ -5251,6 +5421,9 @@ local function enter(p1, s, tn, why)
     syncFaction(true)
     if s == "cd" then
         MATCH.dead, MATCH.win, MATCH.pupFell, MATCH.hold = 0, "-", 0, {}
+        -- 2026-11-06 用户"每次都是 2 场连战，2 场 3 局 2 胜之后才回到需要按 F1 确认的状态"：准备在开局时就用掉（两边都清），
+        -- 以前客机要等看到主机回自由活动才清，主机一回自由活动就看到客机还没清掉的 rdy=1 → 马上又开一局
+        if MATCH.round == 1 then MATCH.ready = false end
         NET.streak = {}
         standUp(p1); standUp(puppet())
         local pos, yaw = spawnPoint()
@@ -5319,6 +5492,12 @@ local function startMatchNow()
         out("!! 你现在是真死状态（血量 0），不能开局：等游戏复活你，或者重启游戏")
         return
     end
+    if NET.rkWaiting() then         -- §110 武林盟主：规则还没从服务器拿到，不开局（F1 那里也拦，这里兜底：准备后规则才丢的情况）
+        out("!! 武林盟主：还没拿到服务器的排位规则，不能开局")
+        MATCH.ready = false
+        MATCH.toast = { rows = TOAST_OF["排位规则未到"](), till = tn + TOAST_SEC }
+        return
+    end
     local loc = try("arena loc", function() return p1:K2_GetActorLocation() end)
     local rot = try("arena rot", function() return p1:K2_GetActorRotation() end)
     if not (loc and rot) then return end
@@ -5328,6 +5507,7 @@ local function startMatchNow()
     MATCH.ab = NET.allBlock()     -- §87 全部可格挡，同样开局时定下
     MATCH.flags = NET.flagsNow()  -- §105.3 / §106.5 红蓝光反击、武器平衡，同样开局时定下
     MATCH.id = (MATCH.id or 0) + 1
+    if NET.rkRules() then out("武林盟主：用服务器定的固定规则（%s）", tostring(NET.rkCache.s)) end
     if MATCH.dmPct ~= 100 then out("伤害倍率 %d%%（这一局）", MATCH.dmPct) end
     out("红蓝光反击：%s；武器平衡：%s；血瓶：%s（这一局）", MATCH.flags.ctr and "开" or "关", MATCH.flags.bal and "开" or "关",
         MATCH.flags.med and "开" or "关")
@@ -5577,6 +5757,11 @@ local function matchStart()
         out("!! 你现在是真死状态（血量 0），不能准备：等游戏复活你，或者重启游戏")
         return
     end
+    if not MATCH.ready and sessionRole() ~= "client" and NET.rkWaiting() then    -- §110 武林盟主：主机等服务器的规则到了才能开局
+        out("!! 武林盟主：还没拿到服务器的排位规则，不能准备开局")
+        MATCH.toast = { rows = TOAST_OF["排位规则未到"](), till = tn + TOAST_SEC }
+        return
+    end
     MATCH.ready = not MATCH.ready
     out("== %s（对方：%s）==", MATCH.ready and "我已准备" or "取消准备", (NET.rrdy or 0) == 1 and "已准备" or "未准备")
     textActor(p1)
@@ -5608,10 +5793,12 @@ local function followHost(p1, tn)
         MATCH.dmPct = NET.dmgPct()    -- §86 主机的伤害倍率（dm=），这一局就用它
         MATCH.ab = NET.allBlock()     -- §87 主机的"全部可格挡"（ab=），我这边防守时按它软格挡
         MATCH.flags = NET.flagsNow()  -- §105.3 / §106.5 主机的红蓝光反击（ctr=）、武器平衡（bal=）
+        if NET.rkRules() then out("武林盟主：用服务器定的固定规则（%s），不看主机的房间设置", tostring(NET.rkCache.s)) end
         out("== 对方发起了对局 #%d（先赢 %d 回合），跟随 ==", id, MATCH.toWin)
-        if MATCH.dmPct ~= 100 then out("伤害倍率 %d%%（主机设置，这一局）", MATCH.dmPct) end
-        out("红蓝光反击：%s；武器平衡：%s；血瓶：%s（主机设置，这一局）", MATCH.flags.ctr and "开" or "关", MATCH.flags.bal and "开" or "关",
-            MATCH.flags.med and "开" or "关")
+        local src = NET.rkRules() and "武林盟主固定规则" or "主机设置"     -- §110 排位时规则是服务器定的
+        if MATCH.dmPct ~= 100 then out("伤害倍率 %d%%（%s，这一局）", MATCH.dmPct, src) end
+        out("红蓝光反击：%s；武器平衡：%s；血瓶：%s（%s，这一局）", MATCH.flags.ctr and "开" or "关", MATCH.flags.bal and "开" or "关",
+            MATCH.flags.med and "开" or "关", src)
         textActor(p1)
     end
     local ax, ay, az, ayaw = (NET.rarena or ""):match("^([%-%d%.]+):([%-%d%.]+):([%-%d%.]+):([%-%d%.]+)$")
@@ -5637,6 +5824,7 @@ REL.on.rend = function(rest)      -- 主机：第几回合谁赢、比分（客�
     local id, rd, w, hs, cs = rest:match("^(%d+) (%d+) (%S) (%d+) (%d+)$")
     if id then out("  主机回报：对局 #%s 第 %s 回合 %s，比分 主机 %s : %s 客机", id, rd, w == "d" and "平局" or (w == "h" and "主机赢" or "客机赢"), hs, cs) end
 end
+REL.on.chat = function(rest) CHAT.recv(rest) end      -- §112 房内聊天（CHAT 在联机面板段）
 REL.on.mend = function(rest)      -- 主机：对局打完了、最终比分
     local id, hs, cs = rest:match("^(%d+) (%d+) (%d+)$")
     id = tonumber(id)
@@ -5726,6 +5914,9 @@ local LOBBY_FILE, CMD_FILE = NET_DIR .. "/lobby.txt", NET_DIR .. "/cmd.txt"
 -- v0.20.2：虚拟局域网并进局域网（局域网顺带找 Tailscale 节点、显示虚拟网卡地址；联机程序把旧的 vlan 当 lan）
 -- v0.20.3：广域网并进服务器大厅（"输入 IP 直连…"；联机程序把旧的 wan 当 server）
 local NET_MODES = { "steamlobby", "steam", "server", "lan", "ai" }   -- 顺序同联机程序的 Modes.All（End 按这个顺序换；v0.20.4 用户定：Steam 大厅、Steam 好友、服务器大厅、局域网；§75 本地 AI 在局域网后面）
+-- §110 武林盟主（ranked）排在服务器大厅后面。只有报 modes= 的新版联机程序才有它，所以不进上面那个"旧版联机程序"的兜底列表；
+-- 鼠标面板的标签页按这个全集建（联机程序没报的方式藏起，见 guiTick）
+NETUI.TABS = { "steamlobby", "steam", "server", "ranked", "lan", "ai" }
 -- §98 实际能用的方式以联机程序报的 lobby.txt modes= 为准（发布版不带 Steam 方式）；旧版联机程序没这一项时用 NET_MODES
 NETUI.modes = function()
     local s = NETUI.lobby and NETUI.lobby.modes or ""
@@ -5741,6 +5932,8 @@ NETUI.hasMode = function(m)
     for _, x in ipairs(NETUI.modes()) do if x == m then return true end end
     return false
 end
+-- §110 武林盟主（ranked）底下走的就是服务器大厅那一套：房间列表、建房、房间号、复制、线路都和 server 一样（只是没有 IP 直连）
+NETUI.viaServer = function(m) return m == "server" or m == "ranked" end
 -- v0.19.1：房间多了放到单独的"房间列表"页（用户 2026-11-04："房间多了这个列表会不会很难操作"）。
 -- 以前主页最多列 3 个、联机程序最多给 8 个，多出来的根本看不到。现在：主页只放剪贴板 / 最近（快捷加入，最多 NETUI_QUICK 个）
 -- 和一行"房间列表（N 个）…"；房间列表页每页 NETUI_PER_PAGE 个，在页首 / 页尾再往上 / 往下自动翻页
@@ -5751,6 +5944,7 @@ local GUI_PER_PAGE = 8       -- v0.20.1 鼠标面板的房间列表页不受屏�
 local function netModeName(m)
     if m == "steam" then return T("Steam 好友", "STEAM FRIENDS")
     elseif m == "server" then return T("服务器大厅", "LOBBY SERVER")
+    elseif m == "ranked" then return T("武林盟主", "RANKED")
     elseif m == "steamlobby" then return T("Steam 大厅", "STEAM LOBBY")
     elseif m == "ai" then return T("本地 AI", "LOCAL AI") end
     return T("局域网", "LAN")
@@ -5789,6 +5983,8 @@ local function netuiRead(tn, force)
     if kv or not NETUI.lobby then NETUI.lobby = kv end
     return NETUI.lobby
 end
+-- §110 排位固定规则（NET.rk，M2 段）从这里拿 lobby.txt 的 rk= / rkrules=：照 netuiRead 的节流（面板关着 1 秒读一次），不额外读盘
+NET.rkLobby = function() return netuiRead(now()) end
 
 local function netuiCmd(cmd, extra)
     NETUI.cmdN = NETUI.cmdN + 1
@@ -5926,9 +6122,12 @@ end
 local function editEnd(why)
     if not NETUI.edit then return end
     out("联机面板：输入框关闭（%s）", why)
+    local kind = NETUI.edit.kind
     NETUI.edit = nil
     if NETUI.box and valid(NETUI.box.eb) then pcall(function() NETUI.box.eb:SetVisibility(1) end) end
     inputMode(false)
+    -- §112 按 Delete 开的聊天：发完 / 取消就把顺带打开的面板关上（netuiSetOpen 是后面定义的 local，这里只能经 CHAT 表调）
+    if kind == "chat" and CHAT and CHAT.autoClose then CHAT.autoClose = nil; CHAT.close(why) end
 end
 
 -- kind = join / name / port。没有 UMG 时只能退回打开电脑上的联机窗口。
@@ -5954,6 +6153,7 @@ local function editCommit()
     local s = (e.text or ""):gsub("[\r\n|]", " "):gsub("^%s+", ""):gsub("%s+$", "")
     editEnd("回车")
     if s == "" then return end
+    if e.kind == "chat" then CHAT.send(s); return end      -- §112（CHAT.add 自己记日志）
     out("联机面板：输入「%s」→ %s", e.kind == "secret" and "***" or s, e.kind)   -- 密码不进日志
     if e.kind == "join" then NETUI.sel = 1; netuiCmd("join", "target=" .. s .. "\n")
     elseif e.kind == "name" then netuiCmd("name", "name=" .. s .. "\n")
@@ -6033,6 +6233,7 @@ local function noRoomsText(mode)
     return mode == "steam" and T("（没有好友在开房）", "(NO FRIEND IS HOSTING)")
         or mode == "steamlobby" and T("（Steam 大厅里没有房间）", "(NO STEAM LOBBIES)")
         or mode == "server" and T("（大厅里没有房间）", "(NO ROOMS ON THE SERVER)")
+        or mode == "ranked" and T("（还没有人开武林盟主房间）", "(NO RANKED ROOMS)")
         or T("（没发现房间）", "(NO ROOMS FOUND)")
 end
 
@@ -6061,6 +6262,216 @@ local function roomPages(rooms)
     return math.max(1, math.ceil(#rooms / perPage()))
 end
 
+-- ---- §110 武林盟主：排行榜页（NETUI.page = "rank"）和排位账号页（"rankkey"）。数据全是联机程序写的 lobby.txt：
+--   rkme=<分数>|<名次>|<胜>|<负>|<称号>|<赛季>（名次 0 = 还没打过计分局）、rktop=<赛季>|<页>|<总页数>、rkn=<本页行数>、
+--   rkt1..rkt10=<名次>|<昵称>|<分数>|<胜>|<负>|<称号>、rknote=上一局结果一句话、rkerr=错误提示（这几行的 | 是字段分隔）。
+-- 打开 / 翻页时发 cmd=ranktop page=N（不等回话：数据到了列表自己换上，5 秒内页码对不上显示"正在获取"）
+NETUI.RANK_WAIT = 5.0
+function NETUI.rankMe(lb)
+    local sc, rk, w, l, title, season = (lb.rkme or ""):match("^(%-?%d+)|(%d+)|(%d+)|(%d+)|([^|]*)|([^|]*)$")
+    if not sc then return nil end
+    return { score = tonumber(sc), rank = tonumber(rk), w = tonumber(w), l = tonumber(l), title = title, season = season }
+end
+function NETUI.rankTop(lb)       -- 赛季, 页, 总页数（还没有 = nil）
+    local season, pg, pages = (lb.rktop or ""):match("^([^|]*)|(%d+)|(%d+)$")
+    if not season then return nil end
+    return season, tonumber(pg), math.max(1, tonumber(pages))
+end
+function NETUI.rankRows(lb)
+    local rows = {}
+    for i = 1, math.min(tonumber(lb.rkn) or 0, 10) do
+        -- 昵称里万一带 |：昵称取中间贪心那段，后面四段从右往左认
+        local rk, nick, sc, w, l, title = (lb["rkt" .. i] or ""):match("^(%d+)|(.*)|(%-?%d+)|(%d+)|(%d+)|([^|]*)$")
+        if rk then
+            -- 用户 2026-11-06"排行榜里能额外显示这个玩家使用率最高的武器么"：rkw<i> 和 rkt<i> 一一对应（空 = 还没有统计）
+            rows[#rows + 1] = { rank = tonumber(rk), nick = nick, score = tonumber(sc), w = tonumber(w), l = tonumber(l), title = title,
+                                wpn = lb["rkw" .. i] or "" }
+        end
+    end
+    return rows
+end
+function NETUI.rankLine(r)
+    return (r.title ~= "" and ("【" .. r.title .. "】") or "") .. clipText(r.nick, 16)
+        .. string.format(T("  %d 分  %d 胜 %d 负", "  %d PTS  %dW %dL"), r.score, r.w, r.l)
+        .. ((r.wpn or "") ~= "" and ("  · " .. clipText(r.wpn, 8)) or "")
+end
+function NETUI.openRank(pg)
+    pg = math.max(1, pg or 1)
+    NETUI.page, NETUI.rankWant = "rank", { pg = pg, at = now() }
+    netuiCmd("ranktop", "page=" .. pg .. "\n")
+end
+-- 我的排位信息一行（主页 / 排行榜页都用）
+function NETUI.rankMeItem(lb)
+    local me = NETUI.rankMe(lb)
+    if not me then return { label = T("还没连上排位服务器", "NOT CONNECTED TO THE RANKED SERVER YET"), col = COL_ORANGE } end
+    local pos = me.rank > 0 and string.format(T("第 %d 名", "#%d"), me.rank) or T("还没打过计分局", "NO RANKED MATCH YET")
+    return { label = (me.title ~= "" and ("【" .. me.title .. "】") or "")
+                 .. string.format(T("我：%d 分  %s  %d 胜 %d 负  赛季 %s", "ME: %d PTS  %s  %dW %dL  SEASON %s"), me.score, pos, me.w, me.l, me.season),
+             col = me.title ~= "" and COL_LABEL or COL_WHITE }
+end
+-- 规则没到 / 上一局结果 / 错误：说明行（主页、排行榜页）
+function NETUI.rankInfo(lb, items)
+    if (lb.rkrules or "") == "" then
+        items[#items + 1] = { label = T("（正在从服务器获取排位规则…拿到前不能开局）", "(GETTING THE RANKED RULES FROM THE SERVER...)"), col = COL_ORANGE }
+    end
+    if (lb.rknote or "") ~= "" then items[#items + 1] = { label = clipText(lb.rknote, 40), col = COL_GREEN } end
+    if (lb.rkerr or "") ~= "" then items[#items + 1] = { label = clipText(lb.rkerr, 40), col = COL_RED } end
+end
+-- 排行榜页的行。文字面板（屏幕文字最多 HUD_ROWS 行）两个人挤一行，鼠标面板一人一行
+function NETUI.rankItems(lb, tn, items, toPage)
+    items[#items + 1] = NETUI.rankMeItem(lb)
+    NETUI.rankInfo(lb, items)
+    local want = NETUI.rankWant or { pg = 1, at = -100 }
+    if tn < want.at then want.at = tn end
+    local season, pg, pages = NETUI.rankTop(lb)
+    local rows = season and NETUI.rankRows(lb) or {}
+    local myRank = (NETUI.rankMe(lb) or {}).rank
+    if not season or (pg ~= want.pg and tn - want.at < NETUI.RANK_WAIT) then
+        items[#items + 1] = { label = T("（正在获取排行榜…）", "(LOADING THE LEADERBOARD...)") }
+    elseif #rows == 0 then
+        items[#items + 1] = { label = T("（这个赛季还没有人上榜）", "(NOBODY ON THE BOARD THIS SEASON YET)") }
+    else
+        local gui = GUI.on and not GUI.failed
+        local i = 1
+        while i <= #rows do
+            local r, r2 = rows[i], (not gui) and rows[i + 1] or nil
+            local line = string.format("%2d. ", r.rank) .. NETUI.rankLine(r)
+            if r2 then line = line .. "    " .. string.format("%2d. ", r2.rank) .. NETUI.rankLine(r2) end
+            local titled = r.title ~= "" or (r2 and r2.title ~= "")
+            local mine = myRank and myRank > 0 and (r.rank == myRank or (r2 and r2.rank == myRank))
+            items[#items + 1] = { label = line, col = titled and COL_LABEL or mine and COL_GREEN or COL_WHITE }
+            i = i + (r2 and 2 or 1)
+        end
+    end
+    pg, pages = pg or want.pg, pages or 1
+    NETUI.rankShown = { season = season, pg = pg, pages = pages }
+    items[#items + 1] = { label = T("排位账号（导出 / 导入密钥）…", "RANKED ACCOUNT (EXPORT / IMPORT KEY)..."), act = toPage("rankkey") }
+    if pg < pages then
+        items[#items + 1] = { label = T("下一页", "NEXT PAGE"), nav = "next", act = function() NETUI.openRank(pg + 1); NETUI.sel = 1 end }
+    end
+    if pg > 1 then
+        items[#items + 1] = { label = T("上一页", "PREVIOUS PAGE"), nav = "prev", act = function() NETUI.openRank(pg - 1); NETUI.sel = 1 end }
+    end
+    items[#items + 1] = { label = T("返回", "BACK"), nav = "back", act = toPage("main") }
+end
+-- 排位账号页：本机随机密钥 = 排位身份（net/rank_key.txt，联机程序管）。导入会换成剪贴板里的账号，要 3 秒内点两次
+function NETUI.rankKeyItems(lb, tn, items, toPage)
+    items[#items + 1] = { label = T("排位身份是本机的一串随机密钥（不用 Steam）。换电脑：这边导出，那边导入", "YOUR RANKED ID IS A RANDOM KEY ON THIS PC. EXPORT HERE, IMPORT ON THE NEW PC") }
+    items[#items + 1] = { label = T("密钥等于账号，别发给别人", "THE KEY IS YOUR ACCOUNT - DON'T SHARE IT"), col = COL_ORANGE }
+    items[#items + 1] = { label = T("导出密钥（复制到剪贴板）", "EXPORT KEY (COPY TO CLIPBOARD)"),
+                          act = function()
+                              netuiCmd("rankexport")
+                              netuiFlash(T("排位密钥已复制到剪贴板", "RANKED KEY COPIED TO THE CLIPBOARD"))
+                          end }
+    local armed = NETUI.rkImportArm and tn - NETUI.rkImportArm <= 3 and tn >= NETUI.rkImportArm
+    items[#items + 1] = { label = armed and T("再点一次：确定用剪贴板里的密钥（换账号）", "CLICK AGAIN TO SWITCH TO THE KEY IN THE CLIPBOARD")
+                                      or T("从剪贴板导入密钥…", "IMPORT KEY FROM CLIPBOARD..."),
+                          act = function()
+                              local t = now()
+                              if not (NETUI.rkImportArm and t - NETUI.rkImportArm <= 3 and t >= NETUI.rkImportArm) then
+                                  NETUI.rkImportArm = t
+                                  netuiFlash(T("会换成剪贴板里的账号，3 秒内再点一次确定", "THIS SWITCHES ACCOUNTS - CLICK AGAIN WITHIN 3 S"), COL_ORANGE)
+                                  return
+                              end
+                              NETUI.rkImportArm = nil
+                              netuiCmd("rankimport")
+                              netuiFlash(T("已让联机程序从剪贴板导入密钥", "IMPORTING THE KEY FROM THE CLIPBOARD"))
+                          end }
+    if (lb.rkerr or "") ~= "" then items[#items + 1] = { label = clipText(lb.rkerr, 40), col = COL_RED } end
+    items[#items + 1] = { label = T("返回", "BACK"), act = function() NETUI.openRank((NETUI.rankShown or {}).pg or 1) end }
+end
+-- §110 武林盟主：武器与招式统计页（NETUI.page = "rankstat"）。数据是联机程序写的 lobby.txt（只在 rk=1 时有）：
+--   rkstat=<种类>|<赛季>|<页>|<总页数>|<本赛季计入的人次>（种类 w 武器 / e 影之武装 / m 招式；还没拿到 = 空）、rksn=<本页行数>、
+--   rks1..rks10：w / e = <名字>|<用了几人次>|<使用率%>|<胜率%>；m = <招式名>|<放出次数>|<命中率%>|<被格挡%>|<平均伤害>（| 是字段分隔）。
+-- 打开 / 换种类 / 翻页时发 cmd=rankstat kind=<w|e|m> page=N（同排行榜页：不等回话，5 秒内种类 / 页对不上显示"正在获取统计"）
+NETUI.STAT_KINDS = { "w", "e", "m" }
+NETUI.STAT_NAME = { w = { "武器", "WEAPONS" }, e = { "影之武装", "PHANTOM EDGES" }, m = { "招式", "MOVES" } }
+function NETUI.statTop(lb)       -- { kind, season, pg, pages, n }（还没有 = nil）
+    local k, season, pg, pages, n = (lb.rkstat or ""):match("^([wem])|([^|]*)|(%d+)|(%d+)|(%d+)$")
+    if not k then return nil end
+    return { kind = k, season = season, pg = tonumber(pg), pages = math.max(1, tonumber(pages)), n = tonumber(n) }
+end
+function NETUI.statRows(lb, kind)
+    local rows = {}
+    for i = 1, math.min(tonumber(lb.rksn) or 0, 10) do
+        local s = lb["rks" .. i] or ""
+        -- 名字里万一带 |：名字取前面贪心那段，后面的数字段从右往左认
+        if kind == "m" then
+            local name, cnt, hit, blk, dmg = s:match("^(.*)|(%d+)|([^|]*)|([^|]*)|([^|]*)$")
+            if name then rows[#rows + 1] = { name = name, cnt = tonumber(cnt), hit = tonumber(hit), blk = tonumber(blk), dmg = tonumber(dmg) } end
+        else
+            local name, cnt, use, win = s:match("^(.*)|(%d+)|([^|]*)|([^|]*)$")
+            if name then rows[#rows + 1] = { name = name, cnt = tonumber(cnt), use = tonumber(use), win = tonumber(win) } end
+        end
+    end
+    return rows
+end
+-- 百分比 / 均伤：整数不带小数，否则一位小数；没给 = "-"
+function NETUI.statNum(v)
+    if not v then return "-" end
+    return v == math.floor(v) and string.format("%d", v) or string.format("%.1f", v)
+end
+-- 一条统计：{ label, col }。武器 / 影之武装按胜率上色（≥ 50 绿、< 50 红），招式白
+function NETUI.statLine(r, kind)
+    local f = NETUI.statNum
+    if kind == "m" then
+        return { label = clipText(r.name, 18) .. string.format(T("  放出 %d  命中 %s%%  被格挡 %s%%  均伤 %s", "  USED %d  HIT %s%%  BLOCKED %s%%  AVG DMG %s"),
+                                                             r.cnt, f(r.hit), f(r.blk), f(r.dmg)), col = COL_WHITE }
+    end
+    return { label = clipText(r.name, 14) .. string.format(T("  使用率 %s%%  胜率 %s%%（%d 人次）", "  USE %s%%  WIN %s%% (%d)"), f(r.use), f(r.win), r.cnt),
+             col = not r.win and COL_WHITE or r.win >= 50 and COL_GREEN or COL_RED }
+end
+function NETUI.openStat(kind, pg)
+    kind = NETUI.STAT_NAME[kind or ""] and kind or (NETUI.statWant or {}).kind or "w"
+    pg = math.max(1, pg or 1)
+    NETUI.page, NETUI.statWant = "rankstat", { kind = kind, pg = pg, at = now() }
+    netuiCmd("rankstat", "kind=" .. kind .. "\npage=" .. pg .. "\n")
+end
+-- 统计页的行。第一行是种类（鼠标面板画成一排标签页 it.tabs，文字面板 End 换下一种）；文字面板屏幕文字最多 HUD_ROWS 行：
+-- 赛季 / 人次那句并进种类行，一页 10 条一条一行
+function NETUI.statItems(lb, tn, items, toPage)
+    local gui = GUI.on and not GUI.failed
+    local want = NETUI.statWant or { kind = "w", pg = 1, at = -100 }
+    if tn < want.at then want.at = tn end
+    local top = NETUI.statTop(lb)
+    local waiting = not top or ((top.kind ~= want.kind or top.pg ~= want.pg) and tn - want.at < NETUI.RANK_WAIT)
+    local shown = not waiting and top or nil
+    local kind = shown and shown.kind or want.kind
+    local tabs, names = {}, {}
+    for i, k in ipairs(NETUI.STAT_KINDS) do
+        local nm = T(NETUI.STAT_NAME[k][1], NETUI.STAT_NAME[k][2])
+        tabs[i] = { label = nm, cur = k == kind, act = function() NETUI.openStat(k, 1); NETUI.sel = 1 end }
+        names[i] = k == kind and ("[" .. nm .. "]") or nm
+    end
+    local head = shown and string.format(T("赛季 %s · 计入 %d 人次", "SEASON %s · %d ENTRIES"), shown.season, shown.n) or nil
+    local nextKind = NETUI.STAT_KINDS[({ w = 1, e = 2, m = 3 })[kind] % 3 + 1]
+    items[#items + 1] = { label = T("种类：", "SHOW: ") .. table.concat(names, " ") .. ((not gui and head) and ("  · " .. head) or ""),
+                          tabs = tabs, act = function() NETUI.openStat(nextKind, 1) end }
+    if gui and head then items[#items + 1] = { label = head, col = COL_LABEL } end
+    local lines = 0
+    if not shown then
+        items[#items + 1] = { label = T("（正在获取统计…）", "(LOADING THE STATS...)") }; lines = 1
+    else
+        local rows = NETUI.statRows(lb, kind)
+        if #rows == 0 then items[#items + 1] = { label = T("（这个赛季还没有数据）", "(NO DATA THIS SEASON YET)") }; lines = 1 end
+        for _, r in ipairs(rows) do items[#items + 1] = NETUI.statLine(r, kind); lines = lines + 1 end
+    end
+    local pg, pages = shown and shown.pg or want.pg, shown and shown.pages or 1
+    NETUI.statShown = { kind = kind, season = shown and shown.season, pg = pg, pages = pages }
+    -- rkerr：鼠标面板总显示；文字面板放得下才显示（种类行 + 数据 + 翻页 / 返回，满 10 条时省掉）
+    local navN = 1 + (pg < pages and 1 or 0) + (pg > 1 and 1 or 0)
+    if (lb.rkerr or "") ~= "" and (gui or 1 + lines + navN + 1 <= HUD_ROWS - 3) then
+        items[#items + 1] = { label = clipText(lb.rkerr, 40), col = COL_RED }
+    end
+    if pg < pages then
+        items[#items + 1] = { label = T("下一页", "NEXT PAGE"), nav = "next", act = function() NETUI.openStat(kind, pg + 1); NETUI.sel = 1 end }
+    end
+    if pg > 1 then
+        items[#items + 1] = { label = T("上一页", "PREVIOUS PAGE"), nav = "prev", act = function() NETUI.openStat(kind, pg - 1); NETUI.sel = 1 end }
+    end
+    items[#items + 1] = { label = T("返回", "BACK"), nav = "back", act = toPage("main") }
+end
+
 -- 面板里可选的行：{ label, act = function() } ；没有 act 的是说明行。NETUI.page = main / rooms / settings / thanks
 local function netuiItems(lb, tn)
     local items = {}
@@ -6081,6 +6492,12 @@ local function netuiItems(lb, tn)
         items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
         return items
     end
+    -- §110 武林盟主的排行榜页 / 排位账号页 / 统计页：换走了 ranked 方式（又没在排位房间里）就回主页
+    local ranked = mode == "ranked" or lb.rk == "1"
+    if (NETUI.page == "rank" or NETUI.page == "rankkey" or NETUI.page == "rankstat") and not ranked then NETUI.page = "main" end
+    if NETUI.page == "rank" then NETUI.rankItems(lb, tn, items, page); return items end
+    if NETUI.page == "rankstat" then NETUI.statItems(lb, tn, items, page); return items end
+    if NETUI.page == "rankkey" then NETUI.rankKeyItems(lb, tn, items, page); return items end
     -- 房间设置页（用户 2026-11-06"单独出个页面放房间设置"）：主机 / 没联机时点了换值，客机只看主机定的；都是下一局生效
     if NETUI.page == "room" then
         -- v0.25.0 对手血条档位（房间设置，HANDOVER §73）：主机 / 没联机时点一下换下一档；客机只看主机定的
@@ -6098,6 +6515,26 @@ local function netuiItems(lb, tn)
         end
         -- v0.26.3 局数（房间设置）：主机 / 没联机时点一下 3 → 5 → 7 → 9 → 3；客机只看主机定的
         local function boLabel(n) return string.format(T("局数：%d 局 %d 胜", "MATCH: BEST OF %d"), n, NET.toWin(n)) end
+        -- §110 武林盟主：局数 / 伤害倍率 / 全部可格挡 / 红蓝光反击 / 武器平衡 / 血瓶 都是服务器定的固定规则（主机客机一样），只显示、点了不改
+        if lb.rk == "1" then
+            local rk = NET.rkRules()
+            local fixed = function() netuiFlash(T("武林盟主的规则由服务器固定，不能改", "RANKED RULES ARE FIXED BY THE SERVER"), COL_ORANGE) end
+            if not rk then
+                items[#items + 1] = { label = T("（正在从服务器获取排位规则…拿到前不能开局）", "(GETTING THE RANKED RULES FROM THE SERVER...)"), col = COL_ORANGE }
+            else
+                items[#items + 1] = { label = T("武林盟主固定规则（服务器定）：", "RANKED RULES (SET BY THE SERVER):"), col = COL_LABEL }
+                local function onOff(on) return on and T("开", "ON") or T("关", "OFF") end
+                items[#items + 1] = { label = boLabel(rk.bo), act = fixed }
+                items[#items + 1] = { label = string.format(T("伤害倍率：%d%%", "DAMAGE: %d%%"), rk.dm), act = fixed }
+                items[#items + 1] = { label = T("全部可格挡：", "ALL MOVES BLOCKABLE: ") .. onOff(rk.ab == 1), act = fixed }
+                for _, k in ipairs(NET.FLAG_KEYS) do
+                    local nm = NET.FLAG_NAME[k]
+                    items[#items + 1] = { label = T(nm[1] .. "：", nm[2] .. ": ") .. onOff(rk[k] == 1), act = fixed }
+                end
+            end
+            items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
+            return items
+        end
         if lb.role == "client" then
             items[#items + 1] = { label = boLabel(NET.bestOf()) .. T("（主机设置）", " (HOST'S SETTING)"),
                                   act = function() netuiFlash(T("局数由主机设置", "THE HOST DECIDES THE MATCH LENGTH")) end }
@@ -6199,8 +6636,13 @@ local function netuiItems(lb, tn)
                               act = function()
                                   local i, ms = 1, NETUI.modes()
                                   for k, m in ipairs(ms) do if m == roomMode then i = k end end
+                                  -- 跳过 ai 和 ranked（§110：排位房间不跟 AI 对战混着开）
                                   local nx = ms[i % #ms + 1]
-                                  if nx == "ai" then nx = ms[1] end
+                                  for _ = 1, #ms do
+                                      if nx ~= "ai" and nx ~= "ranked" then break end
+                                      i = i % #ms + 1
+                                      nx = ms[i % #ms + 1]
+                                  end
                                   netuiCmd("airoommode", "mode=" .. nx .. "\n")
                               end }
     end
@@ -6227,7 +6669,7 @@ local function netuiItems(lb, tn)
         items[#items + 1] = { label = T("设置…", "SETTINGS..."), act = page("settings") }
         return items
     end
-    local copy = { label = mode == "server" and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制我的地址（发给朋友）", "COPY MY ADDRESS"),
+    local copy = { label = NETUI.viaServer(mode) and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制我的地址（发给朋友）", "COPY MY ADDRESS"),
                    act = function() netuiCmd("copy"); netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end }
     local quick, rooms = netuiTargets(lb)
     if NETUI.page == "rooms" then
@@ -6254,6 +6696,7 @@ local function netuiItems(lb, tn)
         items[#items + 1] = { label = T("连接方式：", "VIA: ") .. "< " .. netModeName(mode) .. " >", mode = true,
                               act = function() NETUI.step(1) end }
         local hostLabel = mode == "server" and T("创建服务器（登记到大厅）", "CREATE A SERVER ROOM")
+                       or mode == "ranked" and T("创建武林盟主房间（排位）", "CREATE A RANKED ROOM")
                        or mode == "steamlobby" and T("创建 Steam 大厅（当主机）", "CREATE A STEAM LOBBY")
                        or T("创建房间（当主机）", "HOST A ROOM")
         items[#items + 1] = { label = hostLabel, act = function() netuiCmd("host") end }
@@ -6266,12 +6709,14 @@ local function netuiItems(lb, tn)
                                      or string.format(T("房间列表（%d 个，可加入 %d）…", "ROOM LIST (%d, %d OPEN)..."), #rooms, open),
                               act = NETUI.openRooms }
         local steam = mode == "steam" or mode == "steamlobby"
-        if mode == "server" then
+        if NETUI.viaServer(mode) then
             items[#items + 1] = { label = T("输入房间号加入…", "JOIN BY ROOM CODE..."),
                                   act = function() editStart("join", T("输入房间号（6 位）", "ENTER THE ROOM CODE"), "", "ABC234") end }
-            -- 原来的广域网：主机开了端口转发 / UPnP 时直接连，服务器连不上也能用
-            items[#items + 1] = { label = T("输入 IP 直连…", "JOIN BY IP..."),
-                                  act = function() editStart("join", T("输入主机的 公网IP:端口（服务器连不上时用）", "HOST PUBLIC-IP:PORT (IF THE SERVER IS DOWN)"), "", "1.2.3.4:27015") end }
+            -- 原来的广域网：主机开了端口转发 / UPnP 时直接连，服务器连不上也能用（§110 武林盟主不支持：结果要经服务器记分）
+            if mode == "server" then
+                items[#items + 1] = { label = T("输入 IP 直连…", "JOIN BY IP..."),
+                                      act = function() editStart("join", T("输入主机的 公网IP:端口（服务器连不上时用）", "HOST PUBLIC-IP:PORT (IF THE SERVER IS DOWN)"), "", "1.2.3.4:27015") end }
+            end
         else
             items[#items + 1] = { label = steam and T("输入 SteamID64 加入…", "JOIN BY STEAMID64...") or T("输入地址加入…", "JOIN BY ADDRESS..."),
                                   act = function()
@@ -6281,13 +6726,26 @@ local function netuiItems(lb, tn)
         end
         -- v0.20.1：没建房时一律不显示"复制地址 / 房间号"（用户："我没创建房间，复制功能应该是不能用的"）。
         -- v0.19.1 只对服务器大厅这样做，其他方式当时觉得建房前就有地址可复制
+        if mode == "ranked" then        -- §110 排行榜 / 武器与招式统计 + 规则没到 / 上一局结果 / 错误
+            items[#items + 1] = { label = T("排行榜…", "LEADERBOARD..."), act = function() NETUI.sel = 1; NETUI.openRank(1) end }
+            items[#items + 1] = { label = T("武器与招式统计…", "WEAPON & MOVE STATS..."), act = function() NETUI.sel = 1; NETUI.openStat(nil, 1) end }
+            NETUI.rankInfo(lb, items)
+        end
     else
         if MAPGO.check() == "ok" then     -- v0.24.1 客机、地图不同、主机地图在地图表里
             items[#items + 1] = { label = T("前往主机所在地图（会自动存档）", "GO TO THE HOST'S MAP (AUTO-SAVES)"),
                                   act = function() MAPGO.go(getP1(), true) end }
         end
+        if CHAT.can(lb) then       -- §112
+            items[#items + 1] = { label = T("聊天…（Delete）", "CHAT... (DELETE)"), act = function() CHAT.open(true) end }
+        end
         items[#items + 1] = { label = T("断开", "DISCONNECT"), act = function() netuiCmd("stop") end }
         if lb.role == "host" then items[#items + 1] = copy end      -- 客机复制自己的地址没用
+        if lb.rk == "1" then            -- §110 排位房间里也能看排行榜 / 统计
+            items[#items + 1] = { label = T("排行榜…", "LEADERBOARD..."), act = function() NETUI.sel = 1; NETUI.openRank(1) end }
+            items[#items + 1] = { label = T("武器与招式统计…", "WEAPON & MOVE STATS..."), act = function() NETUI.sel = 1; NETUI.openStat(nil, 1) end }
+            NETUI.rankInfo(lb, items)
+        end
     end
     items[#items + 1] = { label = T("设置…", "SETTINGS..."), act = page("settings") }
     return items
@@ -6313,14 +6771,14 @@ local function netuiStatus(lb, tn)
     if NETUI.flash and os.time() < NETUI.flash.till then return NETUI.flash.text, NETUI.flash.col or COL_GREEN end
     if (lb.mode == "steam" or lb.mode == "steamlobby") and lb.steam ~= "ok" then return clipText(lb.steam, 34), COL_RED end
     -- 服务器大厅：服务器没回应 / 没这个房间 / 没填地址
-    if lb.mode == "server" and (lb.srverr or "") ~= "" and lb.connected ~= "1" then return clipText(lb.srverr, 34), COL_RED end
+    if NETUI.viaServer(lb.mode) and (lb.srverr or "") ~= "" and lb.connected ~= "1" then return clipText(lb.srverr, 34), COL_RED end
     local role, conn = lb.role or "none", lb.connected == "1"
     if role == "none" then
         if lb.mode == "ai" then return T("未开始  和本机 AI 对战，不联网", "NOT STARTED  OFFLINE, AGAINST THE COMPUTER"), COL_GRAY end
         return T("未联机", "OFFLINE") .. "  " .. clipText(lb.myaddr, 40), COL_GRAY
     end
     local who = (lb.peername or "") ~= "" and lb.peername or (lb.peer or "")
-    local route = lb.mode == "server" and netRouteName(lb.route) or nil
+    local route = NETUI.viaServer(lb.mode) and netRouteName(lb.route) or nil
     if conn then
         local ping = LAT.rttMs() or tonumber(lb.ping) or -1     -- v0.27.0 优先用模组自己量的往返（含两边节拍和文件邮箱）
         return T("已连接 ", "CONNECTED ") .. clipText(who, 18) .. (ping >= 0 and string.format("  %dms", ping) or "")
@@ -6371,7 +6829,18 @@ local function netuiRows(tn)
     local title = T("联机   [Home] 关闭", "ONLINE   [HOME] CLOSE")
     local name = NETUI.page == "settings" and T("联机 · 设置", "ONLINE · SETTINGS")
               or NETUI.page == "room" and T("联机 · 房间设置", "ONLINE · ROOM RULES")
-              or NETUI.page == "thanks" and T("联机 · 感谢名单", "ONLINE · THANKS") or T("联机", "ONLINE")
+              or NETUI.page == "thanks" and T("联机 · 感谢名单", "ONLINE · THANKS")
+              or NETUI.page == "rankkey" and T("联机 · 排位账号", "ONLINE · RANKED ACCOUNT") or T("联机", "ONLINE")
+    if NETUI.page == "rank" then        -- §110 排行榜：页码在翻页栏（鼠标面板）/ 标题行（文字面板）
+        local sh = NETUI.rankShown or {}
+        name = sh.season and string.format(T("武林盟主排行榜  赛季 %s", "RANKED LEADERBOARD  SEASON %s"), sh.season) or T("武林盟主排行榜", "RANKED LEADERBOARD")
+        title = string.format(T("排行榜  第 %d/%d 页   [Home] 关闭", "LEADERBOARD  PAGE %d/%d   [HOME] CLOSE"), sh.pg or 1, sh.pages or 1)
+    end
+    if NETUI.page == "rankstat" then    -- §110 统计页：同排行榜页
+        local sh = NETUI.statShown or {}
+        name = sh.season and string.format(T("武林盟主 · 武器与招式统计  赛季 %s", "RANKED STATS  SEASON %s"), sh.season) or T("武林盟主 · 武器与招式统计", "RANKED STATS")
+        title = string.format(T("统计  第 %d/%d 页   [Home] 关闭", "STATS  PAGE %d/%d   [HOME] CLOSE"), sh.pg or 1, sh.pages or 1)
+    end
     if NETUI.page == "rooms" then
         local _, rooms = netuiTargets(lb)
         title = string.format(T("房间列表  第 %d/%d 页   [Home] 关闭", "ROOMS  PAGE %d/%d   [HOME] CLOSE"), NETUI.roomPage or 1, roomPages(rooms))
@@ -6383,12 +6852,21 @@ local function netuiRows(tn)
     NETUI.view = { title = name, status = st, col = col, items = items, mode = lobbyAlive(lb) and netuiMode(lb, tn) or nil,
                    rooms = NETUI.page == "rooms" and lobbyAlive(lb), roomPage = NETUI.roomPage or 1, busy = NETUI.busy ~= nil }
     if NETUI.view.rooms then NETUI.view.pages = roomPages(select(2, netuiTargets(lb))) end
+    -- §110 排行榜页也用底下的翻页栏（rank = true；页码来自 lobby.txt 的 rktop）
+    if NETUI.page == "rank" and lobbyAlive(lb) then
+        local sh = NETUI.rankShown or {}
+        NETUI.view.rank, NETUI.view.roomPage, NETUI.view.pages = true, sh.pg or 1, sh.pages or 1
+    end
+    if NETUI.page == "rankstat" and lobbyAlive(lb) then     -- 统计页同上（stat = true；页码来自 rkstat）
+        local sh = NETUI.statShown or {}
+        NETUI.view.stat, NETUI.view.roomPage, NETUI.view.pages = true, sh.pg or 1, sh.pages or 1
+    end
     local rows = { { c = title, col = COL_LABEL, size = 0.8 },
                    { c = st, col = col, size = 0.7 } }
     NETUI.selTarget = items[NETUI.sel] and items[NETUI.sel].target or nil
     for i, it in ipairs(items) do
         local sel = i == NETUI.sel and it.act
-        rows[#rows + 1] = { c = sel and ("> " .. it.label .. " <") or it.label, col = sel and COL_WHITE or COL_GRAY, size = 0.7 }
+        rows[#rows + 1] = { c = sel and ("> " .. it.label .. " <") or it.label, col = sel and COL_WHITE or it.col or COL_GRAY, size = 0.7 }
     end
     rows[#rows + 1] = { c = T("PgUp/PgDn 选择   End 确定 / 换方式", "PGUP/PGDN SELECT   END OK / CHANGE VIA"),
                         col = COL_LABEL, size = 0.55 }
@@ -6543,7 +7021,7 @@ local function guiBuild()
         GUI.tabBox = { b = guiNew("HorizontalBox") }
         add(GUI.tabBox.b, 12)
         GUI.tabs = {}
-        for i, m in ipairs(NET_MODES) do
+        for i, m in ipairs(NETUI.TABS) do
             local t = guiButton(18, 2)
             t.mode = m
             local ts = GUI.tabBox.b:AddChildToHorizontalBox(t.b)
@@ -6633,9 +7111,132 @@ local function netuiSetOpen(open, why)
     if GUI.on then inputMode(false) end             -- 放出 / 收回鼠标
 end
 
+-- ---- §112 房内聊天（用户 2026-11-06："给 pvpmod 搞个聊天室"，选了先做房内的：只有连上的两个人）。
+-- 发：Delete 键（Insert 被 BPModLoaderMod 占，F 键全满）或面板"聊天…"→ 游戏内输入框 → 回车发。走可靠事件通道
+-- REL.send("chat", 文字)，丢了会重发、按顺序到；对方 REL.on.chat 收。对方是旧版（不认 chat）时只记一行"不认识，忽略"。
+-- 显示：屏幕左下角最近 CHAT.LINES 条，每条 CHAT.SHOW_SEC 秒后藏起来；面板开着 / 在打字时一直显示最近几条。
+-- 字挂在屏幕文字那层（HUD.w）上：游戏暂停时跟着藏，换地图后 HUD 重建、这里跟着重建。
+-- 全局表（主代码块的 local 已满 200 个）
+CHAT = { log = {}, HIST = 30, LINES = 6, SHOW_SEC = 15, MAX_BYTES = 150, X = 0.015, Y = 0.80, SIZE = 0.55,
+         COL_ME = { R = 150, G = 205, B = 255, A = 255 }, COL_SYS = { R = 255, G = 140, B = 40, A = 255 } }
+
+-- 一行文字：去掉控制字符和首尾空白；超过 MAX_BYTES 字节按 UTF-8 字边界截断（中文一个字 3 字节）
+function CHAT.clean(s)
+    s = tostring(s or ""):gsub("%c", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if #s <= CHAT.MAX_BYTES then return s end
+    local n = CHAT.MAX_BYTES
+    while n > 0 do
+        local b = s:byte(n + 1)
+        if not b or b < 0x80 or b >= 0xC0 then break end     -- 下一个字节不是续字节：在这里切是完整的字
+        n = n - 1
+    end
+    return s:sub(1, n)
+end
+
+-- kind = me / peer / sys
+function CHAT.add(who, text, kind)
+    CHAT.log[#CHAT.log + 1] = { who = who, text = text, kind = kind, at = os.time() }
+    while #CHAT.log > CHAT.HIST do table.remove(CHAT.log, 1) end
+    out("【聊天】%s%s", who and (who .. "：") or "", text)
+end
+
+-- 能发：联机程序活着、连上了真人（本地 AI 不算）
+function CHAT.can(lb)
+    return lb and lobbyAlive(lb) and lb.connected == "1" and lb.mode ~= "ai"
+end
+
+function CHAT.send(s)
+    s = CHAT.clean(s)
+    if s == "" then return end
+    if not CHAT.can(netuiRead(now())) then
+        CHAT.add(nil, T("没连上对方，消息没发出去", "NOT CONNECTED, MESSAGE NOT SENT"), "sys")
+        return
+    end
+    REL.send("chat", s)
+    CHAT.add(T("我", "ME"), s, "me")
+end
+
+-- 对方发来的一句（REL.on.chat 在 REL.on.mend 旁边，转到这里）
+function CHAT.recv(rest)
+    local s = CHAT.clean(rest)
+    if s == "" then return end
+    local lb = netuiRead(now()) or {}
+    local who = (lb.peername or "") ~= "" and lb.peername or T("对方", "PEER")
+    CHAT.add(clipText(who, 16), s, "peer")
+end
+
+-- Delete 键 / 面板按钮。面板关着时先打开，发完 / 取消后再关上（CHAT.autoClose，见 editEnd）。
+-- 输入框在下一轮 CHAT.step 才开：刚打开的鼠标面板这一轮才建好，建的时候会关掉已经开着的输入框（guiRoot）
+function CHAT.open(fromPanel)
+    if NETUI.edit then return end            -- 在输入框里按 Delete 是删字
+    local okP, paused = pcall(function() return gstat():IsGamePaused(getP1PC()) end)
+    if okP and paused == true then return end
+    if not CHAT.can(netuiRead(now())) then
+        CHAT.add(nil, T("没连上对方，不能聊天", "NOT CONNECTED, CHAT IS OFF"), "sys")
+        return
+    end
+    if not NETUI.open then netuiSetOpen(true, "聊天"); CHAT.autoClose = true
+    elseif not fromPanel then CHAT.autoClose = nil end
+    CHAT.pending = true
+end
+
+function CHAT.close(why)
+    netuiSetOpen(false, "聊天" .. tostring(why or ""))
+end
+
+function CHAT.piece(cv)
+    local tb = StaticConstructObject(StaticFindObject("/Script/UMG.TextBlock"), HUD.w.WidgetTree)
+    local sl = cv:AddChildToCanvas(tb)
+    sl:SetAnchors({ Minimum = { X = CHAT.X, Y = CHAT.Y }, Maximum = { X = CHAT.X, Y = CHAT.Y } })
+    sl:SetAlignment({ X = 0.0, Y = 1.0 })
+    sl:SetAutoSize(true)
+    tb:SetVisibility(1)
+    return { tb = tb, sl = sl }
+end
+
+-- 每帧（驱动循环，M4.step 之后）
+function CHAT.step(tn)
+    if CHAT.pending then
+        CHAT.pending = nil
+        if NETUI.open and not NETUI.edit then
+            -- 游戏关了输入法（2026-11-06 实测：点了输入框也切不到中文），中文只能在别处打好再粘贴
+            editStart("chat", T("说点什么（发给对方；中文请在别处打好后 Ctrl+V 粘贴）", "SAY SOMETHING TO YOUR OPPONENT"), "",
+                      T("回车发送，Esc 取消", "ENTER TO SEND, ESC TO CANCEL"))
+        end
+    end
+    if HUD.failed then return end
+    local all = NETUI.open or (NETUI.edit and NETUI.edit.kind == "chat")
+    local t, show = os.time(), {}
+    for i = math.max(1, #CHAT.log - CHAT.LINES + 1), #CHAT.log do
+        local m = CHAT.log[i]
+        if all or t - m.at < CHAT.SHOW_SEC then show[#show + 1] = m end
+    end
+    if #show == 0 then
+        if CHAT.w ~= HUD.w or not CHAT.p then return end
+        if HUD.gen ~= ST.mapLoads or not valid(HUD.w) then return end     -- §93 旧地图的控件不碰
+        for _, p in ipairs(CHAT.p) do umgSet(p, nil) end
+        return
+    end
+    local cv = umgRoot()
+    if not cv then return end
+    if CHAT.w ~= HUD.w then CHAT.w, CHAT.p = HUD.w, {} end
+    local lineH = HUD_PX * CHAT.SIZE * 1.3
+    for i = 1, CHAT.LINES do
+        local m = show[i]
+        if m and not CHAT.p[i] then CHAT.p[i] = CHAT.piece(cv) end
+        local p = CHAT.p[i]
+        if p then
+            local s = m and ((m.who and (m.who .. "：") or "") .. m.text) or nil
+            local col = m and (m.kind == "me" and CHAT.COL_ME or m.kind == "sys" and CHAT.COL_SYS or COL_WHITE) or COL_WHITE
+            umgSet(p, s, col, CHAT.SIZE, -(#show - i) * lineH)
+        end
+    end
+end
+
 local GUI_TAB = {
     steam = { "Steam 好友", "STEAM" }, lan = { "局域网", "LAN" },
     server = { "服务器大厅", "SERVER" }, steamlobby = { "Steam 大厅", "STEAM LOBBY" }, ai = { "本地 AI", "LOCAL AI" },
+    ranked = { "武林盟主", "RANKED" },      -- §110
 }
 
 -- v0.26.4 用户 2026-11-05："开着 mod 的 UI，切出游戏再回来鼠标就丢了，要按 Home 关了再开"。
@@ -6697,12 +7298,17 @@ local function guiTick(v)
     guiLabel(GUI.status, v.status or "", v.col or COL_GRAY)
     guiLabel(GUI.hint, v.rooms and T("点房间直接加入；房间每 2 秒自动刷新   Esc / Home 关闭",
                                      "CLICK A ROOM TO JOIN; REFRESHES EVERY 2 S   ESC / HOME CLOSES")
+                               or v.rank and T("每页 10 人，按分数排；分数在每局结束后更新   Esc / Home 关闭",
+                                               "10 PER PAGE, BY SCORE; UPDATED AFTER EACH MATCH   ESC / HOME CLOSES")
+                               or v.stat and T("本赛季武林盟主的计分局；每局结束后更新   Esc / Home 关闭",
+                                               "RANKED MATCHES THIS SEASON; UPDATED AFTER EACH MATCH   ESC / HOME CLOSES")
                                or T("鼠标点选；也可以 PgUp/PgDn 选、End 确定   Esc / Home 关闭",
                                     "CLICK TO CHOOSE; OR PGUP/PGDN + END   ESC / HOME CLOSES"), COL_LABEL)
     local items = v.items or {}
-    -- 房间列表页：上一页 / 下一页 / 返回 放进底下的翻页栏，不占行；没有的那个按钮变灰、点不了
-    guiVis(GUI.navBox, v.rooms and 4 or 1)
-    if v.rooms then
+    -- 房间列表页 / §110 排行榜页 / 统计页：上一页 / 下一页 / 返回 放进底下的翻页栏，不占行；没有的那个按钮变灰、点不了
+    local paged = v.rooms or v.rank or v.stat
+    guiVis(GUI.navBox, paged and 4 or 1)
+    if paged then
         local nav = {}
         for i, it in ipairs(items) do if it.nav then nav[it.nav] = { it = it, i = i } end end
         guiLabel(GUI.pageNo, string.format(T("第 %d / %d 页", "PAGE %d / %d"), v.roomPage or 1, v.pages or 1), COL_WHITE)
@@ -6723,10 +7329,27 @@ local function guiTick(v)
             end
         end
     end
-    -- 连接方式那一行画成一排标签页
-    local modeAt
-    for i, it in ipairs(items) do if it.mode then modeAt = i end end
-    guiVis(GUI.tabBox, modeAt and 4 or 1)
+    -- 连接方式那一行画成一排标签页；§110 统计页的种类行（it.tabs）借同一排标签页画（两者不在同一页）
+    local modeAt, tabsAt
+    for i, it in ipairs(items) do if it.mode then modeAt = i elseif it.tabs then tabsAt = i end end
+    guiVis(GUI.tabBox, (modeAt or tabsAt) and 4 or 1)
+    if tabsAt and not modeAt then
+        local kt = items[tabsAt].tabs
+        for i, t in ipairs(GUI.tabs) do
+            local k = kt[i]
+            if not k then guiVis(t, 1)
+            else
+                guiVis(t, 0)
+                guiLabel(t, k.label, k.cur and COL_WHITE or COL_GRAY)
+                guiBg(t, (k.cur and BG_SEL) or (v.busy and BG_OFF) or (t.down and BG_DOWN) or (t.hov and BG_HOVER) or BG_ROW)
+                if guiClicked(t) and not k.cur and not v.busy then
+                    out("联机面板：点统计种类「%s」", k.label)
+                    k.act()
+                    return
+                end
+            end
+        end
+    end
     if modeAt then
         for _, t in ipairs(GUI.tabs) do
             if not NETUI.hasMode(t.mode) then guiVis(t, 1)     -- §98 联机程序没有这种方式（发布版的 Steam 两种）：标签藏起
@@ -6746,7 +7369,7 @@ local function guiTick(v)
     end
     for i, r in ipairs(GUI.rows) do
         local it = items[i]
-        if not it or it.mode or it.nav then
+        if not it or it.mode or it.nav or it.tabs then
             guiVis(r, 1)
         else
             guiVis(r, it.act and 0 or 3)
@@ -6762,7 +7385,7 @@ local function guiTick(v)
                     return
                 end
             else
-                guiLabel(r, it.label, COL_GRAY)
+                guiLabel(r, it.label, it.col or COL_GRAY)     -- §110 说明行可以带颜色（排行榜的盟主行、错误提示）
                 guiBg(r, it.off and BG_OFF or BG_NONE)
             end
         end
@@ -6844,6 +7467,8 @@ end
 
 -- 对局外的提示：先放一次性提示（弃权 / 掉线），再是地图不一致，再是准备面板（用户定：两行，NOT READY 红、READY 绿）
 local function idleRows(tn)
+    local rk = NET.rkResultRows()     -- §110 武林盟主结算：一般在"胜利 / 败北"画面那几秒里到，回到自由活动时显示
+    if rk then MATCH.toast = { rows = rk, till = tn + 6.0 } end
     if MATCH.toast then
         if tn < MATCH.toast.till then return MATCH.toast.rows end
         MATCH.toast = nil
@@ -8179,6 +8804,8 @@ local function onTick()
     M4.zhanmaCheck()
     local okS, errS = pcall(SUMMON.step, p1, puppet(), now())
     if not okS and errS ~= SUMMON.err then SUMMON.err = errS; out("!! 替身召唤物出错：%s", tostring(errS)) end
+    local okC, errC = pcall(CHAT.step, now())     -- §112 聊天
+    if not okC and errC ~= CHAT.err then CHAT.err = errC; out("!! 聊天出错：%s", tostring(errC)) end
 
     if ST.ticks % 3 == 0 then
         local monPrev = ST.watch.p1.montage
@@ -8571,6 +9198,8 @@ end, "移除替身")
 -- v0.18.4：去掉方向键和回车——17:09 实测面板开着按 ↑↓ 角色会转身（yaw 159.7 → −20.3），方向键是游戏的移动键；
 -- 回车没测过，同样可能被游戏用。PgUp / PgDn / End 实测不影响角色（HANDOVER §42）
 bind(Key.HOME, function() M4.netui("toggle") end, "联机面板")
+-- §112 聊天：Delete（输入框里按 Delete 是删字，CHAT.open 自己跳过）
+bind(Key.DEL, function() CHAT.open(false) end, "聊天")
 -- v0.18.6：回车 / Esc 只在游戏内输入框打开时有用（确定 / 取消），平时直接忽略
 for _, kb in ipairs({ { "PAGE_UP", "up" }, { "PAGE_DOWN", "down" }, { "END", "ok" }, { "RETURN", "enter" }, { "ESCAPE", "esc" } }) do
     bind(Key[kb[1]], function() M4.netui(kb[2]) end, "联机面板 " .. kb[2], true)

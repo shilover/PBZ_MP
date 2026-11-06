@@ -8,16 +8,17 @@
 //   关着时服务器只登记房间、介绍地址，客机请求中转会收到 ERR …|norelay。
 //
 // 协议（文本，一个 UDP 包一条；字段用 | 分开，服务器收到的字段里的 | \t \n 都会被替换掉）：
-//   主机 → PBZS|REG|<密钥>|<名字>|<地图>|<已满 0/1>|<局域网地址 IP:端口>|<允许中转 0/1>   每 2 秒；10 秒没收到就删房间
-//        （最后一段旧版联机程序不发，当允许；主机发 0 时这个房间的会话一律不中转）
+//   主机 → PBZS|REG|<密钥>|<名字>|<地图>|<已满 0/1>|<局域网地址 IP:端口>|<允许中转 0/1>[|<排位 0/1>|<主机 pid>]   每 2 秒；10 秒没收到就删房间
+//        （第 7 段旧版联机程序不发，当允许；主机发 0 时这个房间的会话一律不中转。第 8、9 段 = 武林盟主排位房间，HANDOVER §110：
+//         服务器没开 --ranked → ERR|-|noranked，主机 pid 没登记 → ERR|-|unknown，都不登记）
 //        ← PBZS|REGOK|<房间号>|<你的公网地址>
 //   主机 → PBZS|UNREG|<密钥>
-//   任何 → PBZS|LIST                     ← PBZS|ROOMS\n<房间号>\t<名字>\t<地图>\t<已满>\t<所在服务器>\n…（最多 40 个；
-//                                           所在服务器为空 = 就是这台，否则是别的服务器的 IP:端口，加入要去那台）
+//   任何 → PBZS|LIST                     ← PBZS|ROOMS\n<房间号>\t<名字>\t<地图>\t<已满>\t<所在服务器>\t<排位 0/1>\t<称号>\n…（最多 40 个；
+//                                           所在服务器为空 = 就是这台，否则是别的服务器的 IP:端口，加入要去那台；盟主开的房间排最前）
 //   任何 → PBZS|PING                     ← PBZS|PONG|<你的公网地址>
-//   客机 → PBZS|JOIN|<房间号>|<局域网地址>  → 客机 PBZS|PEER|<房间号>|<会话号>|<主机公网>|<主机局域网>
+//   客机 → PBZS|JOIN|<房间号>|<局域网地址>[|<客机 pid>]  → 客机 PBZS|PEER|<房间号>|<会话号>|<主机公网>|<主机局域网>
 //                                         → 主机 PBZS|PEER|<房间号>|<会话号>|<客机公网>|<客机局域网>
-//                                         ← 出错 PBZS|ERR|<房间号>|nofound / full
+//                                         ← 出错 PBZS|ERR|<房间号>|nofound / full / ranked（排位房间，客机没带登记过的 pid）
 //   客机 → PBZS|RELAY|<会话号>             ← PBZS|RELAYOK|<会话号>；同时发给主机 PBZS|RELAYON|<会话号>
 //                                         ← 没开 --relay 时 PBZS|ERR|<会话号>|norelay；主机不允许中转时 …|hostnorelay
 //   双方 → PBZR|<会话号>\n<原样的状态包>    服务器按来源转给会话的另一方（包原样转发，带着这个头）
@@ -30,6 +31,11 @@
 //      ← PBZS|PUSHOK|<A 的公网地址>                       A 由此知道 B 眼里的自己是谁
 //   → B  PBZS|LIST，像客户端一样拿 B 的列表（B 自己的 + 别人推给 B 的），跳过所在服务器是 A 自己的，存下来 10 秒
 // 两边的玩家都能看到对方的房间；加入别的服务器的房间时，客机直接去那台服务器 JOIN（主机的 NAT 口子只开给它自己那台）。
+// 排位房间不推（排位只在本服务器内算）。
+//
+// --ranked <数据文件>：开武林盟主排位（账号、上报、Elo、排行榜；协议见 pbz-ranked.mjs 文件头，HANDOVER §110）。
+// --web <目录>：再把排行榜 + 武器 / 招式统计写成静态网页（index.html + ranked.json，每分钟有变化才写，§110.11）。
+// pbz-ranked.mjs 只在给了 --ranked 时才加载：没有这个文件、不加 --ranked，服务器照常跑（排位不公开源码，不随发布包分发）。
 import dgram from 'node:dgram';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
@@ -42,7 +48,8 @@ const PORT = Number(arg('--port', process.env.PORT || 27020));
 const HOST = arg('--host', process.env.HOST || '0.0.0.0');
 const QUIET = process.argv.includes('--quiet');
 const RELAY = process.argv.includes('--relay') || process.env.RELAY === '1';
-const UPSTREAMS = process.argv.flatMap((a, i) => (a === '--upstream' && process.argv[i + 1] ? [process.argv[i + 1]] : []));
+const RANKED_FILE = arg('--ranked', process.env.RANKED || '');
+const UPSTREAMS =process.argv.flatMap((a, i) => (a === '--upstream' && process.argv[i + 1] ? [process.argv[i + 1]] : []));
 
 const ROOM_TTL = 10_000;          // 主机 10 秒没心跳就删房间
 const SESSION_TTL = 30_000;       // 会话 30 秒没包就删
@@ -76,6 +83,16 @@ const newId = (len) => {
 };
 
 const sock = dgram.createSocket('udp4');
+let ranked = null;
+if (RANKED_FILE) {
+    try {
+        const { createRanked } = await import('./pbz-ranked.mjs');
+        ranked = createRanked({ file: RANKED_FILE, log, send, webDir: arg('--web', process.env.RANKED_WEB || '') });
+    } catch (e) {
+        console.error(`[server] 给了 --ranked 但加载不了 pbz-ranked.mjs（要和本文件放在同一个目录）：${e.message}`);
+        process.exit(1);
+    }
+}
 
 function send(text, to) {
     const [host, port] = splitEp(to);
@@ -96,6 +113,9 @@ function onControl(f, from) {
         case 'REG': {
             const key = clean(f[2], 64);
             if (key.length < 8) return;
+            const rk = f[8] === '1', pid = clean(f[9], 16);
+            if (rk && !ranked) { send('PBZS|ERR|-|noranked', from); return; }
+            if (rk && !ranked.known(pid)) { send('PBZS|ERR|-|unknown', from); return; }
             let id = byKey.get(key);
             let room = id && rooms.get(id);
             if (!room) {
@@ -112,6 +132,8 @@ function onControl(f, from) {
             room.host = from;                       // 主机换了公网端口（NAT 重新映射）也跟着更新
             room.hostLocal = clean(f[6], 32);
             room.noRelay = f[7] === '0';            // 主机在设置里没允许中转（HANDOVER §102）
+            room.ranked = rk;                       // §110 武林盟主排位房间
+            room.pid = rk ? pid : '';
             room.seen = now;
             send(`PBZS|REGOK|${id}|${from}`, from);
             return;
@@ -122,11 +144,12 @@ function onControl(f, from) {
             return;
         }
         case 'LIST': {
-            // 自己的房间排前面，再是别的服务器的；各自未满的在前
-            const order = (x, y) => Number(x.full) - Number(y.full) || y.seen - x.seen;
-            const own = [...rooms.values()].sort(order).map((r) => ({ ...r, home: '' }));
+            // 自己的房间排前面，再是别的服务器的；各自未满的在前；§110 武林盟主开的房间排最前
+            const title = (r) => (r.ranked && ranked ? ranked.titleOf(r.pid) : '');
+            const order = (x, y) => Number(!x.title) - Number(!y.title) || Number(x.full) - Number(y.full) || y.seen - x.seen;
+            const own = [...rooms.values()].map((r) => ({ ...r, home: '', title: title(r) })).sort(order);
             const list = own.concat([...remote.values()].sort(order)).slice(0, MAX_LIST);
-            send('PBZS|ROOMS\n' + list.map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}\t${r.home}`).join('\n'), from);
+            send('PBZS|ROOMS\n' + list.map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}\t${r.home}\t${r.ranked ? 1 : 0}\t${r.title || ''}`).join('\n'), from);
             return;
         }
         case 'PUSHOK': {
@@ -138,6 +161,8 @@ function onControl(f, from) {
             const id = clean(f[2], 16).toUpperCase();
             const room = rooms.get(id);
             if (!room) { send(`PBZS|ERR|${id}|nofound`, from); return; }
+            const cpid = clean(f[4], 16);
+            if (room.ranked && !(ranked && ranked.known(cpid) && cpid !== room.pid)) { send(`PBZS|ERR|${id}|ranked`, from); return; }
             // 同一个客机端点重发 JOIN（每次直连重试都会发）沿用原会话号
             let s = [...sessions.values()].find((x) => x.room === id && x.b === from && x.a === room.host);
             if (!s) {
@@ -148,6 +173,7 @@ function onControl(f, from) {
             }
             s.bLocal = clean(f[3], 32);
             s.seen = now;
+            if (room.ranked) ranked.session(s.sid, room.pid, cpid);
             send(`PBZS|PEER|${id}|${s.sid}|${room.host}|${room.hostLocal}`, from);
             send(`PBZS|PEER|${id}|${s.sid}|${from}|${s.bLocal}`, room.host);
             return;
@@ -165,6 +191,7 @@ function onControl(f, from) {
             return;
         }
         default:
+            if (ranked && f[1]?.[0] === 'R' && ranked.onControl(f, from)) return;
             stats.dropped++;
     }
 }
@@ -245,7 +272,7 @@ function upstreamTick() {
             });
         }
         if (!u.ep) continue;
-        const own = [...rooms.values()];
+        const own = [...rooms.values()].filter((r) => !r.ranked);
         if (own.length === 0) send('PBZS|PUSH', u.ep);      // 没房间也推一次空的：拿 PUSHOK 知道自己的公网地址
         for (let i = 0; i < own.length; i += PUSH_CHUNK) {
             send('PBZS|PUSH\n' + own.slice(i, i + PUSH_CHUNK).map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}`).join('\n'), u.ep);
@@ -277,6 +304,7 @@ setInterval(() => {
     for (const r of rooms.values()) if (now - r.seen > ROOM_TTL) dropRoom(r.id, '心跳超时');
     for (const s of sessions.values()) if (now - s.seen > SESSION_TTL) { sessions.delete(s.sid); log(`[session] 会话 ${s.sid} 超时删除`); }
     for (const [k, r] of remote) if (now - r.seen > ROOM_TTL) remote.delete(k);
+    if (ranked) ranked.tick();
 }, 2000).unref();
 
 if (upstreams.size > 0) {
@@ -291,7 +319,8 @@ setInterval(() => {
 sock.bind(PORT, HOST, () => {
     console.log(`[server] PBZ_MP 大厅服务器已启动：UDP ${HOST}:${sock.address().port}`
         + (RELAY ? '；中转开' : '；中转关（--relay 打开）')
+        + (ranked ? `；武林盟主排位开（${RANKED_FILE}）` : '')
         + (upstreams.size ? `；互通上游 ${[...upstreams.keys()].join(', ')}` : ''));
 });
 
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { sock.close(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { if (ranked) ranked.flush(); sock.close(); process.exit(0); });

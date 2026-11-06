@@ -34,6 +34,17 @@ namespace PbzLobby
             return new IPEndPoint(ip, port);
         }
 
+        // 提示里显示的服务器：设置里填的是域名就显示域名（括号里带解析出的 IP），填的是 IP 就只显示 IP（用户 2026-11-06 截图：填的域名，报错却只有 IP）
+        public static string Show(string text, IPEndPoint ep)
+        {
+            text = (text ?? "").Trim();
+            if (ep == null) return text;
+            int c = text.LastIndexOf(':');
+            IPAddress ip;
+            if (text.Length == 0 || IPAddress.TryParse(c > 0 ? text.Substring(0, c) : text, out ip)) return ep.ToString();
+            return text + "（" + ep + "）";
+        }
+
         public static string Clean(string s) { return (s ?? "").Replace("|", " ").Replace("\t", " ").Replace("\r", " ").Replace("\n", " "); }
     }
 
@@ -84,6 +95,7 @@ namespace PbzLobby
         readonly bool host;
         public readonly bool SimNoDirect;        // 测试用（--sim-no-direct）：丢掉所有不是服务器发来的包 = 模拟打洞不通
         public Func<string> MapOf = () => "?";
+        public string ServerName = "";     // 设置里填的服务器地址（提示里显示用，LobbyServer.Show）
         readonly RxState rx = new RxState();
         long tx;
         Action<string> log = delegate { };
@@ -99,6 +111,11 @@ namespace PbzLobby
         // 自己允不允许走服务器中转（设置里的"允许中转"，默认关，HANDOVER §102）。客机关着：直连不通也不请求中转；
         // 主机关着：登记房间时告诉服务器（REG 第 7 段 0），服务器拒绝给这个房间中转；旧服务器不认这一段，主机就不理中转来的包
         public bool AllowRelay;
+        // §110 武林盟主：排位房间（主机 REG 第 8、9 段 / 客机 JOIN 第 4 段带上自己的 pid）。null = 普通服务器大厅
+        public string RankPid;
+        // §110 对方状态包里的 rk=（对方 pid）、mt=（主机的对局状态，客机看这个）、quit=（客机弃权的局号，主机看这个）
+        public volatile string PeerRk, PeerMt, PeerQuit;
+        public Action<Dictionary<string, string>> PeerPacket;     // §110.11 每个新的对方状态包（排位统计看 res=）
         int attempt = 1;
         DateTime attemptAt, lastJoin, lastPunch, lastReg, lastRelayReq, lastFromPeer = DateTime.MinValue, lastFromServer = DateTime.MinValue, punchUntil;
 
@@ -118,6 +135,7 @@ namespace PbzLobby
         }
 
         public string RoomId { get { return roomId; } }
+        public string Sid { get { return sid; } }       // §110 服务器给的会话号（排位上报用）
         public bool Relay { get { return relay; } }
         public string Error { get { return error; } }
         public int LocalPort { get { return ((IPEndPoint)udp.Client.LocalEndPoint).Port; } }
@@ -220,9 +238,24 @@ namespace PbzLobby
                 if (rx.Take(text)) { got++; outq.Push(text); }
             }
             outq.Flush();   // 每轮写一个（RemoteOut，HANDOVER §72.10）
-            if (got > 0) rx.PeerNick = Kv.NickOf(rx.Newest) ?? rx.PeerNick;
+            if (got > 0) TakeNewest();
             if (host) HostTick(now); else ClientTick(now);
             return got;
+        }
+
+        // 最新的对方状态包：昵称；§110 排位房间再取 rk= / mt= / quit=
+        void TakeNewest()
+        {
+            var s = rx.Newest;
+            rx.PeerNick = Kv.NickOf(s) ?? rx.PeerNick;
+            if (RankPid == null || s == null) return;
+            var d = Kv.Parse(s);
+            string v;
+            if (d.TryGetValue("rk", out v)) PeerRk = v;
+            if (d.TryGetValue("mt", out v)) PeerMt = v;
+            if (d.TryGetValue("quit", out v)) PeerQuit = v;
+            var cb = PeerPacket;
+            if (cb != null) cb(d);
         }
 
         int FromServer(byte[] data, DateTime now)
@@ -244,6 +277,7 @@ namespace PbzLobby
                 lastFromPeer = now;
                 if (wire.Control(body) || !rx.Take(body)) return 0;
                 outq.Push(body);   // 中转来的也要排队写（§72.10 漏了这条路，中转时对方状态一帧都写不出去）
+                TakeNewest();
                 return 1;
             }
             var f = Kv.Utf8.GetString(data).Split('|');
@@ -273,6 +307,10 @@ namespace PbzLobby
                     }
                     error = why == "nofound" ? L.T("大厅里没有这个房间（" + roomId + "）", "No such room on the lobby server (" + roomId + ")")
                           : why == "full" ? L.T("房间已满", "The room is full")
+                          // §110 排位房间
+                          : why == "noranked" ? L.T("这台大厅服务器没开武林盟主排位", "This lobby server has no ranked mode")
+                          : why == "unknown" ? L.T("排位账号还没登记上，稍等几秒", "Ranked account not registered yet, wait a few seconds")
+                          : why == "ranked" ? L.T("这是武林盟主排位房间：用\"武林盟主\"方式加入", "This is a ranked room: join it from Ranked")
                           : L.T("大厅服务器报错：", "Lobby server error: ") + why;
                     break;
                 case "RELAYOK":
@@ -327,9 +365,10 @@ namespace PbzLobby
                 lastReg = now;
                 bool full = (now - lastFromPeer).TotalSeconds < 3;
                 Raw("PBZS|REG|" + key + "|" + LobbyServer.Clean(name) + "|" + LobbyServer.Clean(MapOf()) + "|" + (full ? "1" : "0")
-                    + "|" + LobbyServer.LocalAddr(LocalPort) + "|" + (AllowRelay ? "1" : "0"), server);
+                    + "|" + LobbyServer.LocalAddr(LocalPort) + "|" + (AllowRelay ? "1" : "0")
+                    + (RankPid != null ? "|1|" + RankPid : ""), server);
                 if (lastFromServer == DateTime.MinValue ? (now - attemptAt).TotalSeconds > 5 : ServerQuiet)
-                    error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + server;
+                    error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + LobbyServer.Show(ServerName, server);
             }
             // 收到客机的包之后也接着打：带 ack=1 告诉客机"你的包我收到了"（客机靠它确认双向通）
             if (!relay && now < punchUntil) Punch(now, "PBZPUNCH\nsid=" + sid + "\n" + (peer != null ? "ack=1\n" : ""));
@@ -362,14 +401,14 @@ namespace PbzLobby
             if (!joined && (now - lastJoin).TotalSeconds > 0.5)
             {
                 lastJoin = now;
-                Raw("PBZS|JOIN|" + roomId + "|" + LobbyServer.LocalAddr(LocalPort), server);
+                Raw("PBZS|JOIN|" + roomId + "|" + LobbyServer.LocalAddr(LocalPort) + (RankPid != null ? "|" + RankPid : ""), server);
             }
             Punch(now, "PBZHELLO\nsid=" + sid + "\n");
             if ((now - attemptAt).TotalSeconds < TryWindow) return;
             if (sid == null)
             {
                 // 连服务器都没回：没法中转，一直重试 JOIN
-                if (error.Length == 0 || ServerQuiet) error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + server;
+                if (error.Length == 0 || ServerQuiet) error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + LobbyServer.Show(ServerName, server);
                 attemptAt = now;
                 return;
             }
@@ -492,7 +531,7 @@ namespace PbzLobby
             // 刚开始问的 4 秒内不报；之后 6 秒没回答 = 服务器没开 / 地址填错 / 被防火墙挡
             if ((now - startedAt).TotalSeconds > 4 && (now - lastAnswer).TotalSeconds > 6)
             {
-                Error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + server;
+                Error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + LobbyServer.Show(serverText, server);
                 rooms = new List<string[]>();
             }
             return rooms;

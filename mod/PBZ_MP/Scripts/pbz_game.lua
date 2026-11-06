@@ -367,9 +367,15 @@ local function montageOf(actor)
     return ""
 end
 
+local montageScanAt = -100
+-- rescan：表里没有时重扫一次（最多 2 秒一次）。§111 紫冥剑召唤动作是替身第一次放 DB 才加载的，建表时还不在内存里
 -- 【适配】FindAllOf("AnimMontage") 建一次 名字→资产 表（缓存失效就重建）
-local function montageByName(name)
+local function montageByName(name, rescan)
+    if rescan and montageMap ~= nil and name ~= "" and montageMap[name] == nil and now() - montageScanAt >= 2 then
+        montageMap = nil
+    end
     if montageMap == nil then
+        montageScanAt = now()
         montageMap = {}
         local all = FindAllOf("AnimMontage")
         if all then
@@ -775,6 +781,198 @@ function LO.config(path)
     if not valid(cfg) then return nil end
     local ok, yes = pcall(function() return cfg:IsA(StaticFindObject("/Script/PBZCombatAsset.PBZ_WeaponConfigBase")) end)
     return (ok and yes) and cfg or nil
+end
+
+-- ============================================================ 外观（皮肤）：UPBZAppearanceComponent（§109）
+-- PBZ.exe 字符串：System/Player/PBZAppearanceComponent.cpp，蓝图子类 BP_AppearanceComp；函数 GetEffectiveOutfit /
+-- GetEffectiveSkinColor / IsEffectiveHatHidden / ApplyOutfitVisual / BP_ApplySkinColor / EquipOutfit / SetSkinColor …
+-- 存档 __Advanced__ 槽 PBZAppearanceComponent.Hun.CurrentOutfit = "Hun_OutFit_FengXue"（DT_PBZAppearanceTable 的行名）。
+-- 参数签名不知道（盲调崩过，§17 / §90）：先反射列参数，对得上才调用。EquipOutfit / SetSkinColor 会写存档和全局缓存
+-- （Cached* 字段），不用；只用"只改样子"的 ApplyOutfitVisual / BP_ApplySkinColor
+LO.APPC_CLASSES = { "BP_AppearanceComp_C", "PBZAppearanceComponent" }
+LO.appc = {}
+-- 按角色缓存，找不到 5 秒内不再 FindAllOf
+-- 【适配】FindAllOf(BP_AppearanceComp_C / PBZAppearanceComponent) + GetOwner 挑出这个角色（或它控制器）的外观组件
+function LO.appearanceComp(actor)
+    if not valid(actor) then return nil end
+    local key = pathOf(actor)
+    local c = LO.appc[key]
+    if c and c.comp and valid(c.comp) then return c.comp end
+    if c and not c.comp and os.clock() - c.at < 5.0 then return nil end
+    c = { at = os.clock() }
+    local ctl = rawProp(actor, "Controller")
+    for _, cn in ipairs(LO.APPC_CLASSES) do
+        for _, x in pairs(FindAllOf(cn) or {}) do
+            if not c.comp and valid(x) then
+                local ok, o = pcall(function() return x:GetOwner() end)
+                if ok and (sameObj(o, actor) or (valid(ctl) and sameObj(o, ctl))) then c.comp = x end
+            end
+        end
+    end
+    LO.appc[key] = c
+    return c.comp
+end
+
+-- 外观组件的原生类路径（往父类找第一个 /Script/ 的），函数对象 = 它 .. ":" .. 函数名
+-- 【适配】UObject:GetClass / UStruct:GetSuperStruct 往上找 "Class /Script/…" 的类
+function LO.appcNative(comp)
+    local ok, cls = pcall(function() return comp:GetClass() end)
+    for _ = 1, 8 do
+        if not (ok and valid(cls)) then return nil end
+        local p = full(cls):match("^Class (/Script/.+)$")
+        if p then return p end
+        ok, cls = pcall(function() return cls:GetSuperStruct() end)
+    end
+    return nil
+end
+
+-- 函数签名：{ {参数名, 属性类型}, ... }（含 ReturnValue），没有这个函数 = nil。按"类:函数"缓存
+LO.sigCache = {}
+-- 【适配】StaticFindObject(<原生类>:<函数>) + UFunction:ForEachProperty（参数名 + FProperty 类型名），只反射不调用
+function LO.funcSig(comp, fname)
+    local native = LO.appcNative(comp)
+    if not native then return nil end
+    local key = native .. ":" .. fname
+    local c = LO.sigCache[key]
+    if c ~= nil then return c or nil end
+    local f = StaticFindObject(key)
+    if not valid(f) then LO.sigCache[key] = false; return nil end
+    local sig = {}
+    pcall(function()
+        f:ForEachProperty(function(p)
+            local t = "?"
+            pcall(function() t = fnameStr(p:GetClass():GetFName()) end)
+            sig[#sig + 1] = { fnameStr(p:GetFName()), t }
+        end)
+    end)
+    LO.sigCache[key] = sig
+    return sig
+end
+
+-- 【适配】签名的文字（日志用）
+function LO.sigText(sig)
+    if not sig then return "（没有这个函数）" end
+    local a = {}
+    for _, p in ipairs(sig) do a[#a + 1] = p[1] .. ":" .. p[2] end
+    return "(" .. table.concat(a, ", ") .. ")"
+end
+
+-- 【适配】签名去掉返回值后的参数类型列表
+function LO.sigInputs(sig)
+    local r = {}
+    for _, p in ipairs(sig or {}) do
+        if p[1] ~= "ReturnValue" then r[#r + 1] = p[2] end
+    end
+    return r
+end
+
+-- 【适配】皮肤行名白名单：只接受 Hun_OutFit_* 这种（DT_PBZAppearanceTable 的行名）
+function LO.outfitOk(id) return type(id) == "string" and #id <= 64 and id:match("^Hun_OutFit_[%w_]+$") ~= nil end
+
+-- 【适配】FName / 字符串 → 名字；空 / None / 读不出来 = nil
+local function nameOrNil(x)
+    if x == nil then return nil end
+    local s = fnameStr(x)
+    if s == "" or s == "None" or s == "nil" or s:find("^table:") or s:find("^userdata") then return nil end
+    return s
+end
+
+-- 读一个角色现在显示的皮肤：{ outfit = 行名, skin = 肤色(EPBZSkinColor 0~3), hat = 帽子藏没藏 }；没有外观组件 = nil
+-- 签名是无参才调，不行退回读属性 CurrentOutfit / CurrentSkinColor
+-- 【适配】外观组件 GetEffectiveOutfit() / GetEffectiveSkinColor() / IsEffectiveHatHidden()
+function LO.outfitOf(actor)
+    local comp = LO.appearanceComp(actor)
+    if not valid(comp) then return nil end
+    local function call0(fn)
+        local sig = LO.funcSig(comp, fn)
+        if not sig or #LO.sigInputs(sig) ~= 0 then return nil end
+        local ok, r = pcall(function() return comp[fn](comp) end)
+        if ok then return r end
+        return nil
+    end
+    local r = {}
+    local o = call0("GetEffectiveOutfit")
+    r.outfit = nameOrNil(o) or (type(o) == "table" and nameOrNil(o.RowName)) or nameOrNil(rawProp(comp, "CurrentOutfit"))
+    local s = call0("GetEffectiveSkinColor")
+    if type(s) ~= "number" then s = rawProp(comp, "CurrentSkinColor") end
+    r.skin = type(s) == "number" and math.floor(s) or nil
+    local h = call0("IsEffectiveHatHidden")
+    if type(h) == "boolean" then r.hat = h end
+    return r
+end
+
+-- 只改样子地给角色换皮肤。2026-11-06 10:34 实测签名（替身的 BP_AppearanceComp）：
+--   ApplyOutfitVisual(OutfitID:Name, bShowHat:Bool, SkinColor:Enum, bForceApplyMeshes:Bool)、BP_ApplySkinColor(SkinColor:Enum)
+-- 按参数名填：Name = 行名；名字带 Hat 的 Bool = 显示斗笠（hat = 斗笠藏了，不知道就显示）；带 Force 的 Bool = true；
+-- 带 Skin 的 Enum / Byte = 肤色（不知道给 0）；别的 Bool 给 false；还有别的类型 = 签名对不上，不调。
+-- 没给皮肤（只有肤色）或 ApplyOutfitVisual 没带肤色参数时，肤色走 BP_ApplySkinColor。返回 成没成, 说明（带签名）
+-- 【适配】外观组件 ApplyOutfitVisual(行名, 显示斗笠, 肤色, true) / BP_ApplySkinColor(肤色)，反射签名后才调
+function LO.applyOutfit(actor, outfit, skin, hat)
+    local comp = LO.appearanceComp(actor)
+    if not valid(comp) then return false, "没有外观组件" end
+    local skinOk = type(skin) == "number" and skin >= 0 and skin <= 3
+    local msg, okAll, skinDone = {}, true, false
+    if LO.outfitOk(outfit) then
+        local sig = LO.funcSig(comp, "ApplyOutfitVisual")
+        local args, fit, i = {}, sig ~= nil, 0
+        for _, p in ipairs(sig or {}) do
+            local n, t = p[1], p[2]
+            if n ~= "ReturnValue" then
+                i = i + 1
+                if i == 1 then
+                    if t == "NameProperty" then args[i] = FName(outfit) else fit = false end
+                elseif t == "BoolProperty" then
+                    if n:find("Hat", 1, true) then args[i] = hat ~= true
+                    elseif n:find("Force", 1, true) then args[i] = true
+                    else args[i] = false end
+                elseif (t == "EnumProperty" or t == "ByteProperty") and n:find("Skin", 1, true) then
+                    args[i] = skinOk and skin or 0
+                    skinDone = skinOk
+                else
+                    fit = false
+                end
+            end
+        end
+        if fit and i >= 1 then
+            local ok, err = pcall(function() comp:ApplyOutfitVisual(table.unpack(args, 1, i)) end)
+            msg[#msg + 1] = "ApplyOutfitVisual" .. LO.sigText(sig) .. " " .. (ok and "调用成功" or ("失败 " .. tostring(err)))
+            okAll = ok
+            if not ok then skinDone = false end
+        else
+            msg[#msg + 1] = "ApplyOutfitVisual 签名对不上，没调 " .. LO.sigText(sig)
+            okAll, skinDone = false, false
+        end
+    end
+    if skinOk and not skinDone then
+        local sig = LO.funcSig(comp, "BP_ApplySkinColor")
+        local ins = LO.sigInputs(sig)
+        if sig and #ins == 1 and (ins[1] == "EnumProperty" or ins[1] == "ByteProperty") then
+            local ok, err = pcall(function() comp:BP_ApplySkinColor(skin) end)
+            msg[#msg + 1] = "BP_ApplySkinColor" .. LO.sigText(sig) .. " " .. (ok and "调用成功" or ("失败 " .. tostring(err)))
+        else
+            msg[#msg + 1] = "BP_ApplySkinColor 签名对不上，没调 " .. LO.sigText(sig)
+        end
+    end
+    return okAll, table.concat(msg, "；")
+end
+
+-- 外观组件上全部函数的签名（排查用，只反射不调用）
+-- 【适配】UStruct:ForEachFunction + UFunction:ForEachProperty（只取名字和类型）
+function LO.appcProbe(actor)
+    local comp = LO.appearanceComp(actor)
+    if not valid(comp) then return "没有外观组件" end
+    local native = LO.appcNative(comp)
+    local cls = native and StaticFindObject(native)
+    local fns = {}
+    if valid(cls) then
+        pcall(function()
+            cls:ForEachFunction(function(f)
+                local n = fnameStr(f:GetFName())
+                fns[#fns + 1] = n .. LO.sigText(LO.funcSig(comp, n))
+            end)
+        end)
+    end
+    return string.format("%s（原生类 %s）函数 %d 个：%s", short(pathOf(comp)), tostring(native), #fns, table.concat(fns, " "))
 end
 
 -- ============================================================ GAS：技能路径表 pbz_abilities.lua + 给技能 / GameplayEffect

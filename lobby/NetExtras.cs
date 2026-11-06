@@ -20,16 +20,20 @@ namespace PbzLobby
     // server 是自建服务器大厅（UDP 打洞，不通走服务器中转，ServerLobby.cs）。顺序 = 游戏内面板按 End 换方式的顺序
     static class Modes
     {
-        public static readonly string[] All = { "server", "lan", "ai" };     // §98 发布版（build.bat release）不带 Steam 两种方式
+        public static readonly string[] All = { "server", "ranked", "lan", "ai" };     // §98 发布版（build.bat release）不带 Steam 两种方式
+        public static readonly string[] Known = All;
 
         public static string Valid(string m) { return m == "wan" ? "server" : Array.IndexOf(All, m) >= 0 ? m : "lan"; }     // vlan → lan、wan → server
 
         // §85 能开房的方式（AI 对战时等人的房间）：除了 ai 都行，顺序同 All
         public static readonly string[] Rooms = { "server", "lan" };
-        public static string ValidRoom(string m) { m = Valid(m); return m == "ai" ? "lan" : m; }
+        public static string ValidRoom(string m) { m = Valid(m); return Array.IndexOf(Rooms, m) >= 0 ? m : "lan"; }     // ai / ranked（§110）不能开等人的房间
 
         // 要登 Steam 的方式（选了才初始化 Steam，见 Steam.cs 文件头）
         public static bool IsSteam(string m) { return m == "steam" || m == "steamlobby"; }
+
+        // 走服务器大厅那一套（ServerLink）的方式：服务器大厅、§110 武林盟主（排位房间只在服务器大厅里登记）
+        public static bool IsServer(string m) { return m == "server" || m == "ranked"; }
 
         public static string Name(string m)
         {
@@ -37,6 +41,7 @@ namespace PbzLobby
             {
                 case "steam": return L.T("Steam 好友", "Steam friends");
                 case "server": return L.T("服务器大厅（含 IP 直连）", "Lobby server (incl. direct IP)");
+                case "ranked": return L.T("武林盟主（排位，经大厅服务器）", "Ranked (via the lobby server)");
                 case "steamlobby": return L.T("Steam 大厅", "Steam lobby");
                 case "ai": return L.T("本地 AI 对战（不联网）", "Local AI battle (offline)");
                 default: return L.T("局域网（含 Tailscale / ZeroTier）", "LAN (incl. Tailscale / ZeroTier)");
@@ -57,6 +62,7 @@ namespace PbzLobby
         public int AiLevel = 1;     // §75 本地 AI 难度：0 简单 / 1 普通 / 2 困难（LocalAi.Levels）
         public bool AiRoom;                 // §85 AI 对战时同时开房等真人（开关）
         public string AiRoomMode = "lan";   // §85 等人的房间用哪种连接方式（不能是 ai）
+        public bool Steam;             // 列不列 Steam 两种方式（netcfg.txt 的 steam=1；默认不列，见 Modes.ShowSteam）
         public string Secret = "";     // v0.22.0 联机密码（明文存这里：只是两个人对局用的共享口令）；空 = 不签名
         public readonly Dictionary<string, List<string>> Recent = new Dictionary<string, List<string>>();
         readonly string path;
@@ -68,6 +74,7 @@ namespace PbzLobby
             if (d == null) return;
             string v;
             int n;
+            if (d.TryGetValue("steam", out v)) Steam = v == "1";     // 要在认 mode 之前：藏着时 mode=steam 会被当成 lan
             if (d.TryGetValue("mode", out v)) Mode = Modes.Valid(v);
             if (d.TryGetValue("name", out v) && v.Length > 0) Name = v;
             if (d.TryGetValue("port", out v) && int.TryParse(v, out n) && n > 0 && n < 65536) Port = n;
@@ -79,7 +86,7 @@ namespace PbzLobby
             if (d.TryGetValue("airoommode", out v)) AiRoomMode = Modes.ValidRoom(v);
             if (d.TryGetValue("server", out v)) Server = v.Trim();
             if (d.TryGetValue("secret", out v)) Secret = v.Trim();
-            foreach (var m in Modes.All)
+            foreach (var m in Modes.Known)
                 if (d.TryGetValue("recent_" + m, out v) && v.Length > 0) Recent[m] = new List<string>(v.Split(','));
             // 旧版虚拟局域网 / 广域网的"最近"并到局域网 / 服务器大厅后面（去重、最多 5 个），下次保存时旧的键就没了
             MergeOld(d, "vlan", "lan");
@@ -115,7 +122,7 @@ namespace PbzLobby
             var sb = new System.Text.StringBuilder();
             sb.Append("mode=").Append(Mode).Append('\n').Append("name=").Append(Name.Replace("\n", " ")).Append('\n')
               .Append("port=").Append(Port).Append('\n').Append("upnp=").Append(Upnp ? 1 : 0).Append('\n')
-              .Append("relay=").Append(Relay ? 1 : 0).Append('\n')
+              .Append("relay=").Append(Relay ? 1 : 0).Append('\n').Append("steam=").Append(Steam ? 1 : 0).Append('\n')
               .Append("server=").Append(Server.Replace("\n", " ")).Append('\n')
               .Append("secret=").Append(Secret.Replace("\n", " ")).Append('\n')
               .Append("ailevel=").Append(AiLevel).Append('\n')

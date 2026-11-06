@@ -122,6 +122,7 @@ Optional: Settings has a match password. If both players enter the same one, eve
 | Key | Action |
 |---|---|
 | Home | Open / close the online panel (while open: Esc or Close also closes it; PgUp/PgDn to select, End to confirm) |
+| Delete | In-room chat: once connected, opens a text box; Enter sends to your opponent, Esc cancels; chat shows at the lower left |
 | F1 | Ready / unready. During a match, press twice within 3 seconds to forfeit |
 | F2 | Save your current position as the arena center (the host's counts) |
 | F6 | Hide the opponent, back to single player |
