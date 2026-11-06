@@ -17,8 +17,11 @@
 
 ### 需要
 - Steam 版《影之刃零》
-- UE4SS 的**影之刃零专用版**（KintaroModding 维护）：<https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8>
-  下载 `phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip`，整个解压到 `<游戏目录>\platform\steam\`
+- UE4SS 的**影之刃零专用版**，下面两个都可以：
+  - **Nexus 版**（测过 1.0.3）：<https://www.nexusmods.com/phantombladezero/mods/5>
+  - **KintaroModding 版**：<https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8>，下载 `phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip`（同一页上的 `UE4SS_*.zip` 是通用版，别下错）
+
+  整个解压到 `<游戏目录>\platform\steam\`，解压后应该有 `dwmapi.dll` 和 `ue4ss\` 文件夹
 - Windows 10 / 11（联机程序用系统自带的 .NET Framework 4）
 
 ### 安装和使用
@@ -79,8 +82,11 @@ Each PC shows the real you plus a puppet of your opponent. When the opponent att
 
 ### Requirements
 - Phantom Blade Zero (Steam)
-- **UE4SS for Phantom Blade Zero** (the KintaroModding build): <https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8>
-  Download `phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip` and extract all of it into `<game folder>\platform\steam\`. You should then have `dwmapi.dll` and a `ue4ss\` folder there. (The generic `UE4SS_*.zip` on the same page is the wrong file.)
+- **UE4SS for Phantom Blade Zero** – either of these works:
+  - **Nexus version** (tested with 1.0.3): <https://www.nexusmods.com/phantombladezero/mods/5>
+  - **KintaroModding build**: <https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8> – download `phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip` (the generic `UE4SS_*.zip` on the same page is the wrong file)
+
+  Extract all of it into `<game folder>\platform\steam\`. You should then have `dwmapi.dll` and a `ue4ss\` folder there.
 - Windows 10 / 11. The helper program uses the .NET Framework 4 that ships with Windows; nothing else to install.
 
 To find `<game folder>`: in your Steam library, right-click Phantom Blade Zero → Manage → Browse local files.
