@@ -156,12 +156,20 @@ local function gstat()
 end
 
 -- 墙钟时间（秒）。os.clock 是 CPU 时间，多线程下会比真实时间快，不能用
--- 【适配】GameplayStatics:GetRealTimeSeconds(玩家1控制器)，拿不到用 os.time
+-- §116 GetRealTimeSeconds 是"这张地图加载以来"的秒数，换地图从 0 重算（2026-11-06 16:36 实测：客机"前往主机所在地图"后，
+-- 换图前定下的 3 秒提示按新地图的时钟算成还剩 670 秒，"Q317 加入了你的房间"在断开后还挂了十来分钟）。
+-- 倒退超过 1 秒就把旧地图走过的时间并进 nowBase，返回值一直往前走；不换图时和原来完全一样
+local nowBase, nowLast = 0, nil
+-- 【适配】GameplayStatics:GetRealTimeSeconds(玩家1控制器) + 换图归零补偿，拿不到用 os.time
 local function now()
     local pc = getP1PC()
     if pc then
         local ok, t = pcall(function() return gstat():GetRealTimeSeconds(pc) end)
-        if ok and type(t) == "number" then return t end
+        if ok and type(t) == "number" then
+            if nowLast and t < nowLast - 1.0 then nowBase = nowBase + nowLast end
+            nowLast = t
+            return nowBase + t
+        end
     end
     return os.time()
 end
@@ -658,6 +666,12 @@ local function yawTo(a, b)
     return math.deg(math.atan(b.Y - a.Y, b.X - a.X))
 end
 
+-- §128 动画根运动的位移倍数（1 = 照动画走，0 = 动作照播、人不动）。返回 是否调用成功
+-- 【适配】Character:SetAnimRootMotionTranslationScale(倍数)
+local function rootMotionScale(actor, s)
+    return pcall(function() actor:SetAnimRootMotionTranslationScale(s) end)
+end
+
 -- 【适配】Actor:K2_SetActorRotation，替身再 SetControlRotation
 local function setYaw(actor, yaw)
     local rot = { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }
@@ -1045,6 +1059,295 @@ function LO.applyGE(actor, path, label)
     out("  %s：BP_ApplyGameplayEffectToSelf %s", label, ok and "成功" or ("失败 " .. tostring(r)))
 end
 
+-- 【适配】ASC:RemoveActiveGameplayEffectBySourceEffect(GE 类, nil, -1)
+function LO.removeGE(actor, path, label)
+    local cls, asc = LO.geClass(path), ascOf(actor)
+    if not (cls and valid(asc)) then return end
+    local ok, r = pcall(function() asc:RemoveActiveGameplayEffectBySourceEffect(cls, nil, -1) end)
+    out("  %s：RemoveActiveGameplayEffectBySourceEffect %s", label, ok and "成功" or ("失败 " .. tostring(r)))
+end
+
+-- §118 身上生效的武器效果 GE：武器升级（白影 GE_Baiying_FrozenReinforced_Lv1–3 / LockFrozenWhileBlocked 加冰冻积累、
+-- 混沌 GE_Weapon_ChaosBlade_Lv15 …）和形态 / 增益（混沌冰形态 GE_Chaos_FrostBuff、GE_BaiYing_Buff）。
+-- 只要路径在 WGE_ROOT 下、而且不直接改属性的（Def.Modifiers 为空：改属性的已经随 att= 过去，再上一份会算两次）。
+-- 返回 { "BaiYing/UpgradeData/GE_Baiying_FrozenReinforced_Lv1", … }（去重、排序）；读不到容器返回 nil
+LO.WGE_ROOT, LO.wgeMods = "/PBZCombatAsset/ActorData/Players/Hun/Weapon/", {}
+
+-- 【适配】ASC.ActiveGameplayEffects.GameplayEffects_Internal[i].Spec.Def（只读属性，不调函数）、GE 默认对象的 Modifiers
+function LO.weaponEffects(actor)
+    local asc = ascOf(actor)
+    if not valid(asc) then return nil end
+    local arr = rawProp(rawProp(asc, "ActiveGameplayEffects"), "GameplayEffects_Internal")
+    if arr == nil then return nil end
+    local seen, list = {}, {}
+    local okE = eachArr(arr, function(_, age)
+        local def = rawProp(rawProp(age, "Spec"), "Def")
+        if not valid(def) then return end
+        local p = pathOf(def)        -- /PBZCombatAsset/…/GE_X.Default__GE_X_C
+        local id = p:sub(1, #LO.WGE_ROOT) == LO.WGE_ROOT and p:sub(#LO.WGE_ROOT + 1):match("^([%w_/]+)%.") or nil
+        if not id or seen[id] then return end
+        seen[id] = true
+        if LO.wgeMods[id] == nil then
+            local n = 0
+            local okM = eachArr(rawProp(def, "Modifiers"), function() n = n + 1 end)
+            LO.wgeMods[id] = okM and n or -1         -- 读不到 Modifiers = 不知道，不发
+        end
+        -- 只要升级和增益（名字带 Buff）；同目录下还有挨打方身上的效果（白影 GameplayEffects/GE_BaiYing_AssaultTriggered），不发
+        local isUpg = id:find("/UpgradeData/", 1, true) or (id:match("([^/]+)$") or ""):find("Buff", 1, true)
+        if LO.wgeMods[id] == 0 and isUpg then list[#list + 1] = id end
+    end)
+    if not okE then return nil end
+    table.sort(list)
+    return list
+end
+
+-- 【适配】武器效果的短名（"BaiYing/UpgradeData/GE_X"）→ GE 类路径（"/PBZCombatAsset/…/GE_X.GE_X_C"）
+function LO.wgePath(id)
+    local name = id:match("([%w_]+)$")
+    return LO.WGE_ROOT .. id .. "." .. name .. "_C"
+end
+
+-- §119 角色身上正在放的某个技能的实例（ActiveCount > 0 那一格的 NonReplicated / Replicated 实例）；没有返回 nil
+-- 【适配】ASC.ActivatableAbilities.Items[i].{ActiveCount, Ability:GetClass(), NonReplicatedInstances, ReplicatedInstances}
+function LO.activeInstance(actor, clsName)
+    local asc = ascOf(actor)
+    local items = asc and rawProp(rawProp(asc, "ActivatableAbilities"), "Items")
+    if not items then return nil end
+    local found
+    eachArr(items, function(_, spec)
+        if found then return end
+        local n = rawProp(spec, "ActiveCount")
+        if not (type(n) == "number" and n > 0) then return end
+        local ab = rawProp(spec, "Ability")
+        if not valid(ab) then return end
+        local okC, cls = pcall(function() return ab:GetClass() end)
+        if not (okC and shortName(full(cls)) == clsName) then return end
+        for _, key in ipairs({ "NonReplicatedInstances", "ReplicatedInstances" }) do
+            eachArr(rawProp(spec, key), function(_, inst) if not found and valid(inst) then found = inst end end)
+        end
+    end)
+    return found
+end
+
+-- §119 对象的类（含父类）里名字匹配 pat 的函数和参数名（只反射不调用）。返回 { "TrySummonHuoQiang()", … }
+-- 【适配】UObject:GetClass() / UStruct:ForEachFunction / GetSuperStruct + UFunction:ForEachProperty
+function LO.funcsLike(obj, pat)
+    local list = {}
+    local okC, c = pcall(function() return obj:GetClass() end)
+    c = okC and c or nil
+    for _ = 1, 3 do
+        if not valid(c) then break end
+        pcall(function()
+            c:ForEachFunction(function(f)
+                local n = fnameStr(f:GetFName())
+                if n:find(pat) then
+                    local ps = {}
+                    pcall(function() f:ForEachProperty(function(p) ps[#ps + 1] = fnameStr(p:GetFName()) end) end)
+                    list[#list + 1] = n .. "(" .. table.concat(ps, ",") .. ")"
+                end
+            end)
+        end)
+        local okS, sup = pcall(function() return c:GetSuperStruct() end)
+        c = okS and sup or nil
+    end
+    return list
+end
+
+-- §119 对象（类含父类）里名字含 pats 里任一段的属性和当前值（只读；数字 / 布尔 / 字符串照写，别的写类型）。返回 "名=值 …"
+-- 【适配】UObject:GetClass() / UStruct:ForEachProperty / GetSuperStruct + obj[属性名]
+function LO.propsLike(obj, pats)
+    local list = {}
+    local okC, c = pcall(function() return obj:GetClass() end)
+    c = okC and c or nil
+    for _ = 1, 3 do
+        if not valid(c) then break end
+        pcall(function()
+            c:ForEachProperty(function(p)
+                local n = fnameStr(p:GetFName())
+                local hit = false
+                for _, s in ipairs(pats) do if n:find(s, 1, true) then hit = true end end
+                if hit and not n:find("CallFunc_", 1, true) and not n:find("K2Node_", 1, true) and not n:find("Temp_", 1, true) then
+                    local v = rawProp(obj, n)
+                    local t = type(v)
+                    list[#list + 1] = n .. "=" .. ((t == "number" or t == "boolean" or t == "string") and tostring(v) or t)
+                end
+            end)
+        end)
+        local okS, sup = pcall(function() return c:GetSuperStruct() end)
+        c = okS and sup or nil
+    end
+    return table.concat(list, " ")
+end
+
+-- §119 角色的瞄准组件（子弹的 BP_BulletTargetSelector_LockTarget 经 GetTargetingComponent 问它锁定了谁）
+-- 【适配】角色属性 "Targeting Component"（BP_TargetingComponent_C）/ "PBZTargeting"
+function LO.targetingComp(actor)
+    if not valid(actor) then return nil end
+    for _, k in ipairs({ "Targeting Component", "PBZTargeting", "TargetingComponent" }) do
+        local c = rawProp(actor, k)
+        if valid(c) then return c, k end
+    end
+    return nil
+end
+
+-- §119 诊断：挂在 actor 身上的特效——NiagaraComponent（主人是它）的特效资产名 + 激活没有，外加模型的 OverlayMaterial。
+-- 只读；返回 { "NS_xxx(激活)", … }, 叠加材质名
+-- 【适配】FindAllOf("NiagaraComponent") + GetOwner / Asset / IsActive；Mesh.OverlayMaterial
+function LO.fxOn(actor)
+    local list = {}
+    for _, c in pairs(FindAllOf("NiagaraComponent") or {}) do
+        local okO, o = pcall(function() return c:GetOwner() end)
+        if okO and sameObj(o, actor) then
+            local a = rawProp(c, "Asset")
+            local okA, act = pcall(function() return c:IsActive() end)
+            list[#list + 1] = (valid(a) and shortName(full(a)) or "?") .. ((okA and act) and "(激活)" or "")
+        end
+    end
+    table.sort(list)
+    local mesh = rawProp(actor, "Mesh")
+    local ov = valid(mesh) and rawProp(mesh, "OverlayMaterial")
+    return list, valid(ov) and shortName(full(ov)) or "-"
+end
+
+-- §119 在角色身上放一个 Niagara 特效（紫冥剑布局闪避的金光；真人那边是技能自己放的，替身的技能早收了）。
+-- 先 SpawnSystemAttached 挂在角色模型上（跟着闪避走），不行退回 SpawnSystemAtLocation。返回 是否成功, 用的哪个 / 错误
+-- 【适配】LoadAsset NiagaraSystem + Default__NiagaraFunctionLibrary:SpawnSystemAttached / SpawnSystemAtLocation
+function LO.spawnFx(actor, path)
+    local sys = LO.geClass(path)
+    if not sys then return false, "找不到特效 " .. path end
+    local lib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
+    if not valid(lib) then return false, "找不到 NiagaraFunctionLibrary" end
+    local mesh = rawProp(actor, "Mesh")
+    local zero, one = { X = 0.0, Y = 0.0, Z = 0.0 }, { X = 1.0, Y = 1.0, Z = 1.0 }
+    local rot0 = { Pitch = 0.0, Yaw = 0.0, Roll = 0.0 }
+    if valid(mesh) then
+        local ok, err = pcall(function()
+            lib:SpawnSystemAttached(sys, mesh, FName("None"), zero, rot0, 0, true, true, 0, true)
+        end)
+        if ok then return true, "SpawnSystemAttached" end
+        LO.fxErr = tostring(err)
+    end
+    local okL, loc = pcall(function() return actor:K2_GetActorLocation() end)
+    if not (okL and loc) then return false, "读不到位置；挂上去失败 " .. tostring(LO.fxErr) end
+    local okR, rot = pcall(function() return actor:K2_GetActorRotation() end)
+    local ok2, err2 = pcall(function()
+        lib:SpawnSystemAtLocation(actor, sys, loc, okR and rot or rot0, one, true, true, 0, true)
+    end)
+    if ok2 then return true, "SpawnSystemAtLocation（挂上去失败 " .. tostring(LO.fxErr):sub(-60) .. "）" end
+    return false, "两种都失败：" .. tostring(LO.fxErr):sub(-60) .. " / " .. tostring(err2):sub(-60)
+end
+
+-- §119 让瞄准组件锁定 target：SetLockTarget(target)，再问 HasLockTarget()。返回 是否调用成功, 错误, HasLockTarget 的结果
+-- 18:41 实测：传角色本身报"Expected a live, compatible … userdata"——参数不是 Actor
+-- 【适配】TargetingComponent:SetLockTarget(对象) / HasLockTarget()
+function LO.tcSetLock(tc, target)
+    local ok, err = pcall(function() tc:SetLockTarget(target) end)
+    local okH, has = pcall(function() return tc:HasLockTarget() end)
+    return ok, err, okH and has or ("问不了 " .. tostring(has))
+end
+
+-- §119 一个 FProperty 的 名字、类型、对象类 / 结构体名、结构体（只反射）
+-- 【适配】FProperty:GetFName / GetClass / GetPropertyClass / GetStruct
+function LO.propInfo(p)
+    local n, t, pc, st = "?", "?", nil, nil
+    pcall(function() n = fnameStr(p:GetFName()) end)
+    pcall(function() t = fnameStr(p:GetClass():GetFName()) end)
+    pcall(function() pc = fnameStr(p:GetPropertyClass():GetFName()) end)
+    if t == "StructProperty" then
+        pcall(function() st = p:GetStruct(); pc = fnameStr(st:GetFName()) end)
+    end
+    return n, t, pc, st
+end
+
+-- §119 瞄准组件取消锁定
+-- 【适配】TargetingComponent:StopLockTarget()
+function LO.tcStop(tc)
+    return pcall(function() tc:StopLockTarget() end)
+end
+
+-- §119 对象的类（含父类）里函数 fname 的参数：{ {n, t, cls, fields = { {n, t, cls}, … } (结构体才有)}, … }；没找到返回 nil
+-- 【适配】UStruct:ForEachFunction / GetSuperStruct + UFunction:ForEachProperty + 结构体 UScriptStruct:ForEachProperty
+function LO.paramList(obj, fname)
+    local okC, c = pcall(function() return obj:GetClass() end)
+    c = okC and c or nil
+    local res = nil
+    for _ = 1, 4 do
+        if res or not valid(c) then break end
+        pcall(function()
+            c:ForEachFunction(function(f)
+                if res or fnameStr(f:GetFName()) ~= fname then return end
+                res = {}
+                pcall(function()
+                    f:ForEachProperty(function(p)
+                        local n, t, pc, st = LO.propInfo(p)
+                        local e = { n = n, t = t, cls = pc }
+                        if st then
+                            e.fields = {}
+                            pcall(function()
+                                st:ForEachProperty(function(q)
+                                    local qn, qt, qc = LO.propInfo(q)
+                                    e.fields[#e.fields + 1] = { n = qn, t = qt, cls = qc }
+                                end)
+                            end)
+                        end
+                        res[#res + 1] = e
+                    end)
+                end)
+            end)
+        end)
+        local okS, sup = pcall(function() return c:GetSuperStruct() end)
+        c = okS and sup or nil
+    end
+    return res
+end
+
+-- §119 paramList 的文字版（日志用）
+-- 【适配】同 paramList（只反射）
+function LO.paramTypes(obj, fname)
+    local l = LO.paramList(obj, fname)
+    if not l then return "（没找到）" end
+    local ps = {}
+    for _, e in ipairs(l) do
+        local s = e.n .. ":" .. e.t .. (e.cls and ("<" .. e.cls .. ">") or "")
+        if e.fields then
+            local fs = {}
+            for _, f in ipairs(e.fields) do fs[#fs + 1] = f.n .. ":" .. f.t .. (f.cls and ("<" .. f.cls .. ">") or "") end
+            s = s .. "{" .. table.concat(fs, ", ") .. "}"
+        end
+        ps[#ps + 1] = s
+    end
+    return table.concat(ps, ", ")
+end
+
+-- §119 角色身上可能被别人锁定的目标对象（给 SetLockTarget 试）：LockViewTarget 等组件属性 + 名字带 Target 的组件
+-- 【适配】角色属性 LockViewTarget / "Target Component" / TargetComponent + Actor:K2_GetComponentsByClass(ActorComponent)
+function LO.lockCandidates(actor)
+    local list, seen = {}, {}
+    local function add(name, o)
+        if valid(o) and not seen[pathOf(o)] then seen[pathOf(o)] = true; list[#list + 1] = { name = name, obj = o } end
+    end
+    for _, k in ipairs({ "LockViewTarget", "Target Component", "TargetComponent", "LockOnTarget", "TargetableComponent" }) do
+        add(k, rawProp(actor, k))
+    end
+    local cls = StaticFindObject("/Script/Engine.ActorComponent")
+    local ok, comps = pcall(function() return actor:K2_GetComponentsByClass(cls) end)
+    if ok and comps then
+        eachArr(comps, function(_, c)
+            local n = shortName(full(c)) or ""
+            local cn = (full(c):match("^(%S+)") or "")
+            if (n .. cn):find("Target") or (n .. cn):find("Lock") then add(cn .. " " .. n, c) end
+        end)
+    end
+    return list
+end
+
+-- §119 调对象上一个不带参数的蓝图函数。返回 是否调用成功, 错误
+-- 【适配】obj:<函数名>()
+function LO.callNoArg(obj, fname)
+    if not valid(obj) then return false, "对象无效" end
+    return pcall(function() obj[fname](obj) end)
+end
+
 -- 替身自己的 UI 逻辑组件（按 Owner 找）
 -- 【适配】FindAllOf("BP_UIGameplayLogicComponent_C") 按 GetOwner 找（v0.17.6 debuff 图标排查，§36）
 function LO.uiCompOf(actor)
@@ -1150,12 +1453,20 @@ end
 
 -- ============================================================ 锁定（v0.23.3）
 
--- 这个角色锁定着谁（硬锁定；软锁定不算）。没锁 / 读不到返回 nil
--- 【适配】PBZCharacter:GetLockingTarget(bIgnoreSoftLocking = true)（v0.9.10 锁定探针，§19.15）
+-- 这个角色锁定着谁（硬锁定；软锁定不算）。没锁 / 读不到返回 nil；第二个返回值 = 从哪读到的
+-- §132（2026-11-07 用户："我锁定他了，但是我的枪打不到他，他的也打不到我"）：真人对战里收到的 lk 一直是 0；
+-- 日志里"对方锁定着你"全是假对手发的（它永远发 lk=1），真人锁定从没验证过。§119 实测看到你锁替身时目标存在你的
+-- 瞄准组件（Targeting Component.LockTarget = 替身的 CharacterMesh0）——GetLockingTarget 读不到时问瞄准组件
+-- 【适配】PBZCharacter:GetLockingTarget(bIgnoreSoftLocking = true)（v0.9.10 锁定探针，§19.15）；TargetingComponent:HasLockTarget()
 local function lockingTarget(actor)
     if not valid(actor) then return nil end
     local ok, t = pcall(function() return actor:GetLockingTarget(true) end)
-    if ok and valid(t) then return t end
+    if ok and valid(t) then return t, "GetLockingTarget" end
+    local tc = LO.targetingComp(actor)
+    if tc then
+        local okH, has = pcall(function() return tc:HasLockTarget() end)
+        if okH and has == true then return tc, "瞄准组件" end
+    end
     return nil
 end
 
@@ -1477,6 +1788,28 @@ local function createPuppet()
     ST.watch.pup = {}
 end
 
+-- §116.2 只读诊断（用户 2026-11-06"不确定伤害数值对不对"）：本地 AI 的扣血 = 我打在本机替身身上、游戏算出的伤害 × 系数，
+-- 替身只抄了 COPY_ATTRS（等级 / 血 / 攻击 / 杀气），防御类没抄。比一下我和替身的全部属性，看差在哪。
+-- 每局变的（血量 / 杀气 / 精纯杀气 / 暗源 / 积累条）不比。返回 { {名字, 我的当前值, 替身的当前值, 我的基础值, 替身的基础值}, ... }, 属性总数
+local ATTR_DIFF_SKIP = { Health = true, Shachi = true, UltimateCharge = true, UltimateChargeCount = true, SpiritShadow = true,
+                         Infliction = true }
+-- 【适配】attrAll(我) / attrAll(替身) 逐个比当前值和基础值，差超过 0.001 的列出来
+local function attrDiff(a, b)
+    local la, lb = attrAll(a), attrAll(b)
+    if not (la and lb) then return nil end
+    local vb = {}
+    for _, x in ipairs(lb) do vb[x.name] = x end
+    local d = {}
+    for _, x in ipairs(la) do
+        local y = vb[x.name]
+        if y and not ATTR_DIFF_SKIP[x.name] and type(x.cur) == "number" and type(y.cur) == "number"
+            and (math.abs(x.cur - y.cur) > 0.001 or math.abs((x.base or 0) - (y.base or 0)) > 0.001) then
+            d[#d + 1] = { x.name, x.cur, y.cur, x.base, y.base }
+        end
+    end
+    return d, #la
+end
+
 -- 【适配】FindAllOf("Character") 里名字带 Monster、不是玩家1 / 替身的第一个
 local function findMonster()
     local chars = FindAllOf("Character")
@@ -1585,6 +1918,202 @@ local function bossBarSet(bar, v)
     if v.sh then ok = pcall(function() bar:ForSeq_UpdateShachi(v.sh) end) and ok end
     if v.name then ok = pcall(function() bar:ForSeq_SetNameText(FText(v.name)) end) and ok end
     return ok
+end
+
+-- §113.1 探针（只反射、不调用）：游戏自己改属性的原生函数在哪个类、参数是什么。exe 里 ModifyCharacterAttributeValue 和
+-- ModiferOp / Instant / GetCharacterAttributeValue / MakeAttributeModEffectSpec 挨着，原生组件用 GE_MA_%s_%d_%s（SetByCaller
+-- AttributeOpMagnitude）改属性——走这条路 ASC 会广播属性变化，HUD 自己刷新（直接调 HUD 回调会崩，实测 4）
+local ATTR_PROBE_FUNCS = { "ModifyCharacterAttributeValue", "MakeAttributeModEffectSpec", "GetAttributeModEffectName",
+                           "GetCharacterAttributeValue", "GetAttributeFromCharacter", "MakeOutgoingSpec", "AssignSetByCallerMagnitude",
+                           "BP_ApplyGameplayEffectSpecToSelf" }
+local attrProbeDone = false
+-- 只读；每个会话只跑一次，返回日志行
+-- 【适配】FindObjects(Function, 名字) + UFunction:GetFullName / ForEachProperty + FProperty:HasAnyPropertyFlags / GetStruct / GetPropertyClass
+local function attrModProbe()
+    if attrProbeDone then return {} end
+    attrProbeDone = true
+    local lines = {}
+    for _, fname in ipairs(ATTR_PROBE_FUNCS) do
+        local ok, found = pcall(FindObjects, 4, "Function", fname, 0, 0, true)
+        if not ok then lines[#lines + 1] = string.format("  %s：FindObjects 出错 %s", fname, tostring(found)); found = nil end
+        local n = 0
+        for _, f in pairs(found or {}) do
+            if valid(f) then
+                n = n + 1
+                local full = "?"
+                pcall(function() full = f:GetFullName() end)
+                local ps = {}
+                pcall(function()
+                    f:ForEachProperty(function(p)
+                        local nm, t, extra, flag = fnameStr(p:GetFName()), "?", "", ""
+                        pcall(function() t = fnameStr(p:GetClass():GetFName()) end)
+                        pcall(function() extra = "<" .. fnameStr(p:GetStruct():GetFName()) .. ">" end)
+                        if extra == "" then pcall(function() extra = "<" .. fnameStr(p:GetPropertyClass():GetFName()) .. ">" end) end
+                        pcall(function()
+                            if p:HasAnyPropertyFlags(0x400) then flag = " ret" elseif p:HasAnyPropertyFlags(0x100) then flag = " out"
+                            elseif not p:HasAnyPropertyFlags(0x80) then flag = " local" end
+                        end)
+                        ps[#ps + 1] = nm .. ":" .. t .. extra .. flag
+                    end)
+                end)
+                lines[#lines + 1] = string.format("  %s (%s)", full, table.concat(ps, ", "))
+            end
+        end
+        if n == 0 and ok then lines[#lines + 1] = "  " .. fname .. "：没找到" end
+    end
+    return lines
+end
+
+-- §113.1 用游戏自己的改属性函数写属性（实测 5 探针）：
+--   /Script/SGameAttributes.AttributeUtils:ModifyCharacterAttributeValue(Character, Attribute:GameplayAttribute, ModiferOp:byte, Value:float)
+-- 走 GE_MA_* + ASC，属性变化会广播，HUD（W_WeaponUI 的 WaitForAttributeChanged）自己刷新。
+-- GameplayAttribute 结构体不在 Lua 里手搓（里面有 FieldPath）：从游戏自己的 GE_MA_<属性>_<1|0>_Override 的 Modifiers[1].Attribute
+-- 读现成的；运算也读它的 ModifierOp（就是 Override），不猜枚举值
+local ATTRMOD_DIR = "/PBZCombatAsset/Config/AttributesModifyEffect/"
+local ATTRMOD_LIB = "/Script/SGameAttributes.Default__AttributeUtils"
+local attrModCache = {}      -- 属性名 → { attr = 结构体, op = 运算, src = 路径 } / false（找不到）
+-- 【适配】StaticFindObject / LoadAsset GE_MA_<属性>_<1|0>_Override（GameplayEffect 对象或蓝图类默认对象），读 Modifiers[1].Attribute / ModifierOp
+local function attrModInfo(attr)
+    if attrModCache[attr] ~= nil then return attrModCache[attr] end
+    for _, k in ipairs({ "1", "0" }) do
+        local nm = "GE_MA_" .. attr .. "_" .. k .. "_Override"
+        local base = ATTRMOD_DIR .. nm
+        for _, p in ipairs({ base .. "." .. nm, base .. ".Default__" .. nm .. "_C" }) do
+            local o = StaticFindObject(p)
+            if not valid(o) and type(LoadAsset) == "function" then
+                pcall(LoadAsset, base .. "." .. nm)
+                o = StaticFindObject(p)
+            end
+            if valid(o) then
+                local info
+                pcall(function()
+                    local m = o.Modifiers[1]
+                    info = { attr = m.Attribute, op = m.ModifierOp, src = p }
+                    info.name = m.Attribute.AttributeName:ToString()
+                end)
+                if info and info.attr ~= nil and info.op ~= nil and (info.name == nil or info.name == attr) then
+                    attrModCache[attr] = info
+                    return info
+                end
+            end
+        end
+    end
+    attrModCache[attr] = false
+    return false
+end
+-- 返回 成功?, 说明。成功 = 调用没报错且读回来等于 value（误差 0.01）；失败时调用方自己退回 setAttr
+-- 【适配】AttributeUtils 类默认对象:ModifyCharacterAttributeValue(角色, GE_MA 里的 GameplayAttribute, 它的 ModifierOp, value)
+local function attrModSet(actor, attr, value)
+    if not valid(actor) then return false, "没有角色" end
+    local info = attrModInfo(attr)
+    if not info then return false, "找不到 GE_MA_" .. attr .. "_*_Override" end
+    local lib = StaticFindObject(ATTRMOD_LIB)
+    if not valid(lib) then return false, "找不到 " .. ATTRMOD_LIB end
+    local ok, err = pcall(function() lib:ModifyCharacterAttributeValue(actor, info.attr, info.op, value) end)
+    if not ok then return false, "调用出错 " .. tostring(err) end
+    local now = attrOf(actor, attr)
+    if not (now and math.abs(now - value) < 0.01) then
+        return false, string.format("调用了但值是 %s（要 %s；%s，op=%s）", tostring(now), tostring(value), info.src, tostring(info.op))
+    end
+    return true, string.format("%s，op=%s", info.src, tostring(info.op))
+end
+
+-- §113 直接写属性（setAttr）不走 ASC，HUD 的 W_WeaponUI 靠 WaitForAttributeChanged 听属性变化，收不到 → 精纯杀气 / 暗源的显示不动。
+-- 写完后按它自己的回调补一下：OnUltimateCharageCountChange / OnUltimateChargeChange（属性变化时它自己调的那两个，NewValue / OldValue），
+-- 暗源那格叫 Bullet（BulletNum / BulletText / "Change Bullet"）。参数按反射到的名字填，认不出的参数就不调、只记日志
+local WUI_CLASS = "/Game/PBZContent/UI/Hud/W_WeaponUI.W_WeaponUI_C"
+local wuiSig, wuiLogged, wuiNArgs = {}, false, {}
+-- 蓝图函数的 ForEachProperty 连局部变量一起列（13.1 实测：Temp_* / CallFunc_* / K2Node_*），参数排在最前。
+-- 参数先认 CPF_Parm（0x80）标志；UE4SS 不给标志时，按"第一个局部变量名前缀之前的都是参数"
+local WUI_LOCAL = { "^Temp_", "^CallFunc_", "^K2Node_" }
+-- 返回 { {名字, 类型名, 是不是参数}, ... }，没有这个函数 = false
+-- 【适配】StaticFindObject(W_WeaponUI_C:<函数>) + UFunction:ForEachProperty + FProperty:HasAnyPropertyFlags(CPF_Parm)
+local function wuiSigOf(fname)
+    if wuiSig[fname] ~= nil then return wuiSig[fname] end
+    local f = StaticFindObject(WUI_CLASS .. ":" .. fname)
+    if not valid(f) then wuiSig[fname] = false; return false end
+    local sig, inLocals = {}, false
+    pcall(function()
+        f:ForEachProperty(function(p)
+            local n, t = fnameStr(p:GetFName()), "?"
+            pcall(function() t = fnameStr(p:GetClass():GetFName()) end)
+            local okF, parm = pcall(function() return p:HasAnyPropertyFlags(0x80) end)
+            if not (okF and type(parm) == "boolean") then
+                for _, pat in ipairs(WUI_LOCAL) do if n:find(pat) then inLocals = true end end
+                parm = not inLocals
+            end
+            sig[#sig + 1] = { n, t, parm }
+        end)
+    end)
+    wuiSig[fname] = sig
+    return sig
+end
+-- 【适配】按反射到的参数名从 args 里取值、按 FProperty 类型转换（Bool → 布尔，Int → 取整）；局部变量 / 返回值跳过；参数在 args 里找不到 → nil
+local function wuiArgs(sig, args)
+    local r = {}
+    for _, p in ipairs(sig) do
+        local n, t = p[1], p[2]
+        if p[3] and n ~= "ReturnValue" then
+            local v = args[n]
+            if v == nil then return nil end
+            if t == "BoolProperty" then v = v == true or (type(v) == "number" and v ~= 0)
+            elseif t == "IntProperty" or t == "Int64Property" or t == "ByteProperty" then v = math.floor(v + 0.5) end
+            r[#r + 1] = v
+        end
+    end
+    return r
+end
+-- 【适配】签名里的参数部分（日志用）
+local function wuiSigText(sig)
+    if not sig then return "（没有这个函数）" end
+    local a = {}
+    for _, p in ipairs(sig) do if p[3] then a[#a + 1] = p[1] .. ":" .. p[2] end end
+    return "(" .. table.concat(a, ", ") .. ")"
+end
+-- old / new = { cnt, chg, sp }（属性值，nil = 没变）；返回日志行（第一次带上各函数的参数和调用结果）
+-- 13.1 实测签名：OnUltimateCharageCountChange(OldValue:int, NewValue:int, IsAddUltimateCharge:bool)、
+--   OnUltimateChargeChange(NewValue:double, OldValue:double)、Change Bullet()
+-- 【适配】FindAllOf("W_WeaponUI_C")（跳过 Default__ 类默认对象）+ 调它的蓝图函数刷新精纯杀气 / 暗源显示
+local function weaponUiRefresh(old, new)
+    local lines, calls = {}, {}
+    local first = not wuiLogged
+    wuiLogged = true
+    -- 13.1 实测 4（15:37:55）：OnUltimateCharageCountChange 截成 2 个参数真调进去后游戏崩了（Fatal Error + crashdump），撤掉。
+    -- 精纯杀气格数的显示另想办法（见 HANDOVER §113.1），别再直接调这个
+    if new.chg then calls[#calls + 1] = { "OnUltimateChargeChange", { NewValue = new.chg, OldValue = old.chg or new.chg } } end
+    if new.sp then calls[#calls + 1] = { "Change Bullet", {} } end
+    local all, n = FindAllOf("W_WeaponUI_C"), 0
+    for _, w in pairs(all or {}) do
+        local isDefault = false
+        pcall(function() isDefault = fnameStr(w:GetFName()):find("^Default__") ~= nil end)
+        if valid(w) and not isDefault then
+            n = n + 1
+            for _, c in ipairs(calls) do
+                local sig = wuiSigOf(c[1])
+                local args = sig and wuiArgs(sig, c[2])
+                if not sig then lines[#lines + 1] = "  " .. c[1] .. "：没有这个函数"
+                elseif not args then lines[#lines + 1] = "  " .. c[1] .. wuiSigText(sig) .. "：参数认不出，没调"
+                else
+                    -- 13.1 实测 3：IsAddUltimateCharge 没有局部变量前缀、其实是局部变量，UE4SS 报"UFunction expected 2 parameters, received 3"。
+                    -- 按它说的个数截掉后面的重试，记住个数（wuiNArgs），以后直接按这个数传
+                    local k = wuiNArgs[c[1]]
+                    if k and k < #args then for i = #args, k + 1, -1 do args[i] = nil end end
+                    local ok, err = pcall(function() w[c[1]](w, table.unpack(args)) end)
+                    local want = not ok and tonumber(tostring(err):match("expected (%d+) parameters"))
+                    if want and want < #args then
+                        wuiNArgs[c[1]] = want
+                        for i = #args, want + 1, -1 do args[i] = nil end
+                        ok, err = pcall(function() w[c[1]](w, table.unpack(args)) end)
+                        if first then lines[#lines + 1] = string.format("  %s 实际只收 %d 个参数，截掉后重试", c[1], want) end
+                    end
+                    if not ok then lines[#lines + 1] = string.format("  %s%s 失败：%s", c[1], wuiSigText(sig), tostring(err))
+                    elseif first then lines[#lines + 1] = string.format("  %s%s 已调（%d 个参数）", c[1], wuiSigText(sig), #args) end
+                end
+            end
+        end
+    end
+    if n == 0 then lines[#lines + 1] = "  没找到 W_WeaponUI_C（HUD 没显示？）" end
+    return lines
 end
 
 local shachiVisSaved = {}     -- 血条路径 → 藏之前的可见性（按路径记：同一个控件每次取到的 Lua 对象可能不是同一个）
@@ -1917,6 +2446,7 @@ return {
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
     puppet = puppet, gstat = gstat, now = now, attrSetOf = attrSetOf, attrOf = attrOf, hpOf = hpOf,
+    rootMotionScale = rootMotionScale,
     setAttr = setAttr, ascOf = ascOf, factionComp = factionComp, factionActors = factionActors, factionValue = factionValue, factionName = factionName, anyToStr = anyToStr,
     montageOf = montageOf, montageByName = montageByName, playOn = playOn, tagNames = tagNames, tagsOf = tagsOf, activeAbilities = activeAbilities, cancelMoves = cancelMoves, cancelAbilities = cancelAbilities,
     yawTo = yawTo, setYaw = setYaw, facePlayer = facePlayer, placeInFront = placeInFront, setBraking = setBraking, equipWeapon = equipWeapon,
@@ -1927,7 +2457,7 @@ return {
     montages = montages, isStoryMap = isStoryMap, travelTo = travelTo, airOf = airOf, launch = launch, hover = hover, unhide = unhide,
     activeMontage = activeMontage, montageSetPos = montageSetPos, montageNotifies = montageNotifies, attrAll = attrAll,
     bossBarShow = bossBarShow, bossBarHide = bossBarHide, bossBarOf = bossBarOf, bossBarSet = bossBarSet, bossBarDiag = bossBarDiag,
-    bossBarShachiShow = bossBarShachiShow,
+    bossBarShachiShow = bossBarShachiShow, weaponUiRefresh = weaponUiRefresh, attrModProbe = attrModProbe, attrModSet = attrModSet, attrDiff = attrDiff,
     LO = LO,
 }
 end

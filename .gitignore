@@ -1,3 +1,7 @@
 *.exe
+*.dll
+lobby/aot/bin/
+lobby/aot/obj/
+lobby/aot/out/
 mod/PBZ_MP/net/
 mod/PBZ_MP/rec/

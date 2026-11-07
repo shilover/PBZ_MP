@@ -67,15 +67,15 @@ namespace PbzLobby
             try
             {
                 p.watcher = new FileSystemWatcher(dir) { NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite, IncludeSubdirectories = false };
-                FileSystemEventHandler h = (s, e) => p.OnFileEvent(e.Name);
+                FileSystemEventHandler h = (s, e) => Safe.Run("pipe-watch", () => p.OnFileEvent(e.Name));
                 p.watcher.Changed += h;
                 p.watcher.Created += h;
                 p.watcher.Deleted += h;
-                p.watcher.Renamed += (s, e) => { p.OnFileEvent(e.Name); p.OnFileEvent(e.OldName); };
+                p.watcher.Renamed += (s, e) => Safe.Run("pipe-watch", () => { p.OnFileEvent(e.Name); p.OnFileEvent(e.OldName); });
                 p.watcher.EnableRaisingEvents = true;
             }
             catch (Exception) { }
-            new Thread(p.Serve) { IsBackground = true, Name = "GamePipe" }.Start();
+            Safe.Thread("GamePipe", p.Serve).Start();
             try { File.WriteAllText(p.infoFile, "name=" + p.Name + "\n", Kv.Utf8); } catch (Exception) { }
             return p;
         }

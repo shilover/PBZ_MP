@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- pbz_lobby.dll: the online helper compiled with NativeAOT into a native DLL that main.lua loads inside the game.
+       Same source as lobby\build.bat's PBZLobby.exe; the old window code builds against ..\Headless.cs. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishAot>true</PublishAot>
+    <AssemblyName>pbz_lobby</AssemblyName>
+    <RootNamespace>PbzLobby</RootNamespace>
+    <DefineConstants>$(DefineConstants);AOT</DefineConstants>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>$(NoWarn);CS0618;CS0649;CS0169;CS0414;CS0067;SYSLIB0014</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Program.cs;..\Transport.cs;..\NetExtras.cs;..\ServerLobby.cs;..\Ranked.cs;..\Reliable.cs;..\LocalAi.cs;..\GamePipe.cs" />
+    <Compile Include="..\Headless.cs" />
+    <Compile Include="AotEntry.cs" />
+    <Compile Include="..\NoSteam.cs;..\NoSteamLobby.cs" />
+  </ItemGroup>
+</Project>

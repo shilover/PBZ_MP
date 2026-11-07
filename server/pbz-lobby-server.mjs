@@ -10,15 +10,18 @@
 // 协议（文本，一个 UDP 包一条；字段用 | 分开，服务器收到的字段里的 | \t \n 都会被替换掉）：
 //   主机 → PBZS|REG|<密钥>|<名字>|<地图>|<已满 0/1>|<局域网地址 IP:端口>|<允许中转 0/1>[|<排位 0/1>|<主机 pid>]   每 2 秒；10 秒没收到就删房间
 //        （第 7 段旧版联机程序不发，当允许；主机发 0 时这个房间的会话一律不中转。第 8、9 段 = 武林盟主排位房间，HANDOVER §110：
-//         服务器没开 --ranked → ERR|-|noranked，主机 pid 没登记 → ERR|-|unknown，都不登记）
+//         服务器没开 --ranked → ERR|-|noranked，主机 pid 没登记 → ERR|-|unknown，都不登记；
+//         §135 第 10 段 = 主机的 SteamID：排位对局只走 Steam，服务器只管登记 / 介绍 / 记分，不打洞、不中转）
 //        ← PBZS|REGOK|<房间号>|<你的公网地址>
 //   主机 → PBZS|UNREG|<密钥>
 //   任何 → PBZS|LIST                     ← PBZS|ROOMS\n<房间号>\t<名字>\t<地图>\t<已满>\t<所在服务器>\t<排位 0/1>\t<称号>\n…（最多 40 个；
 //                                           所在服务器为空 = 就是这台，否则是别的服务器的 IP:端口，加入要去那台；盟主开的房间排最前）
 //   任何 → PBZS|PING                     ← PBZS|PONG|<你的公网地址>
-//   客机 → PBZS|JOIN|<房间号>|<局域网地址>[|<客机 pid>]  → 客机 PBZS|PEER|<房间号>|<会话号>|<主机公网>|<主机局域网>
+//   客机 → PBZS|JOIN|<房间号>|<局域网地址>[|<客机 pid>|<客机 SteamID>]  → 客机 PBZS|PEER|<房间号>|<会话号>|<主机公网>|<主机局域网>
 //                                         → 主机 PBZS|PEER|<房间号>|<会话号>|<客机公网>|<客机局域网>
 //                                         ← 出错 PBZS|ERR|<房间号>|nofound / full / ranked（排位房间，客机没带登记过的 pid）
+//                                           / needsteam（排位房间走 Steam，客机没带 SteamID）/ oldhost（主机是旧版、没带 SteamID）
+//                                         排位房间的 PEER 多第 7 段 = 对方的 SteamID（§135）
 //   客机 → PBZS|RELAY|<会话号>             ← PBZS|RELAYOK|<会话号>；同时发给主机 PBZS|RELAYON|<会话号>
 //                                         ← 没开 --relay 时 PBZS|ERR|<会话号>|norelay；主机不允许中转时 …|hostnorelay
 //   双方 → PBZR|<会话号>\n<原样的状态包>    服务器按来源转给会话的另一方（包原样转发，带着这个头）
@@ -69,9 +72,22 @@ const sessions = new Map();       // 会话号 → { a 主机端点, b 客机端
 const remote = new Map();         // "<所在服务器>|<房间号>" → 别的服务器的房间（推过来的 / 从上游拉来的）
 /** @type {Map<string, {addr:string, ep:string|null, self:string, lookedUp:number}>} */
 const upstreams = new Map(UPSTREAMS.map((a) => [a, { addr: a, ep: null, self: '', lookedUp: 0 }]));
-const stats = { rx: 0, relayed: 0, dropped: 0 };
+const stats = { rx: 0, relayed: 0, dropped: 0, rebound: 0 };
 
 const log = (...a) => { if (!QUIET) console.log(new Date().toISOString().slice(11, 23), ...a); };
+// §133 中转诊断：--quiet 下也写，但只写会话号 / 房间号 / 计数，从不写 IP（中转两个方向各转了多少、为什么丢）
+const note = (...a) => console.log(new Date().toISOString().slice(11, 23), ...a);
+const ctr = (s) => s.ctr ?? (s.ctr = { ab: 0, ba: 0, early: 0, unk: 0, unkA: 0, unkB: 0, rate: 0, rebA: 0, rebB: 0, logged: '' });
+const ip16 = (e) => ipOf(e).split('.').slice(0, 2).join('.');
+function relaySummary(s, why) {
+    const c = ctr(s);
+    const line = `主机→客机 ${c.ab}，客机→主机 ${c.ba}，没开中转前 ${c.early}，认不出 ${c.unk}（像主机 ${c.unkA} / 像客机 ${c.unkB}），限速 ${c.rate}，`
+        + `换端口 主机 ${c.rebA} / 客机 ${c.rebB}`;
+    if (why !== '定时' || line !== c.logged) note(`[relay-diag] 会话 ${s.sid} 房间 ${s.room} ${why}：${line}`);
+    c.logged = line;
+}
+// §135 SteamID64：17 位数字，7656 开头；别的一律当没有
+const steamIdOf = (s) => (/^7656\d{13}$/.test(String(s ?? '').trim()) ? String(s).trim() : '');
 const clean = (s, n) => String(s ?? '').replace(/[|\t\r\n]/g, ' ').slice(0, n);
 const ep = (r) => `${r.address}:${r.port}`;
 const newId = (len) => {
@@ -104,6 +120,24 @@ function splitEp(s) {
     return [s.slice(0, i), Number(s.slice(i + 1))];
 }
 
+// §131 中转会话里某一端换了公网端口（NAT 重新映射；校园网这类大 NAT 很常见）：以前只认登记时的"IP:端口"，
+// 换了端口的包一律丢掉，结果那一端只过得去第一个包。现在会话号对、IP 只和其中一端对得上，就认作那一端并更新端点。
+// 两端同一个公网 IP（分不清是谁）或 IP 都对不上，还是只认原来的端点。
+const ipOf = (e) => splitEp(e)[0];
+function sideOf(s, from) {
+    if (from === s.a) return 'a';
+    if (from === s.b) return 'b';
+    const ip = ipOf(from), ia = ipOf(s.a) === ip, ib = ipOf(s.b) === ip;
+    if (ia === ib) return null;
+    const side = ia ? 'a' : 'b';
+    s.rebinds = (s.rebinds || 0) + 1;
+    if (s.rebinds <= 5) log(`[relay] 会话 ${s.sid} ${side === 'a' ? '主机' : '客机'}换了端口 ${s[side]} → ${from}`);
+    s[side] = from;
+    stats.rebound++;
+    ctr(s)[side === 'a' ? 'rebA' : 'rebB']++;
+    return side;
+}
+
 function onControl(f, from) {
     const now = Date.now();
     switch (f[1]) {
@@ -129,11 +163,14 @@ function onControl(f, from) {
             room.name = clean(f[3], 32) || '?';
             room.map = clean(f[4], 48);
             room.full = f[5] === '1';
+            // §131 这个房间的会话里主机端点也跟着换（心跳带主机密钥，就是主机本人；中转里已经换过的也一并改成最新的）
+            for (const s of sessions.values()) if (s.room === id && s.a !== from) s.a = from;
             room.host = from;                       // 主机换了公网端口（NAT 重新映射）也跟着更新
             room.hostLocal = clean(f[6], 32);
             room.noRelay = f[7] === '0';            // 主机在设置里没允许中转（HANDOVER §102）
             room.ranked = rk;                       // §110 武林盟主排位房间
             room.pid = rk ? pid : '';
+            room.steam = rk ? steamIdOf(f[10]) : '';   // §135 排位对局走 Steam：主机的 SteamID（旧版联机程序不发 = 空）
             room.seen = now;
             send(`PBZS|REGOK|${id}|${from}`, from);
             return;
@@ -161,8 +198,10 @@ function onControl(f, from) {
             const id = clean(f[2], 16).toUpperCase();
             const room = rooms.get(id);
             if (!room) { send(`PBZS|ERR|${id}|nofound`, from); return; }
-            const cpid = clean(f[4], 16);
+            const cpid = clean(f[4], 16), csteam = steamIdOf(f[5]);
             if (room.ranked && !(ranked && ranked.known(cpid) && cpid !== room.pid)) { send(`PBZS|ERR|${id}|ranked`, from); return; }
+            // §135 排位对局只走 Steam：两边都要有 SteamID（一边是旧版就说清楚，别让客机一直连不上）
+            if (room.ranked && !room.steam !== !csteam) { send(`PBZS|ERR|${id}|${room.steam ? 'needsteam' : 'oldhost'}`, from); return; }
             // 同一个客机端点重发 JOIN（每次直连重试都会发）沿用原会话号
             let s = [...sessions.values()].find((x) => x.room === id && x.b === from && x.a === room.host);
             if (!s) {
@@ -174,16 +213,19 @@ function onControl(f, from) {
             s.bLocal = clean(f[3], 32);
             s.seen = now;
             if (room.ranked) ranked.session(s.sid, room.pid, cpid);
-            send(`PBZS|PEER|${id}|${s.sid}|${room.host}|${room.hostLocal}`, from);
-            send(`PBZS|PEER|${id}|${s.sid}|${from}|${s.bLocal}`, room.host);
+            s.bSteam = csteam;
+            // §135 第 7 段 = 对方的 SteamID（排位房间才有；旧版联机程序只看前 6 段）
+            send(`PBZS|PEER|${id}|${s.sid}|${room.host}|${room.hostLocal}${room.steam ? '|' + room.steam : ''}`, from);
+            send(`PBZS|PEER|${id}|${s.sid}|${from}|${s.bLocal}${csteam ? '|' + csteam : ''}`, room.host);
             return;
         }
         case 'RELAY': {
             const s = sessions.get(clean(f[2], 16));
-            if (!s || (s.b !== from && s.a !== from)) { send(`PBZS|ERR|${clean(f[2], 16)}|nosession`, from); return; }
+            if (!s || !sideOf(s, from)) { send(`PBZS|ERR|${clean(f[2], 16)}|nosession`, from); return; }
             if (!RELAY) { s.seen = now; send(`PBZS|ERR|${s.sid}|norelay`, from); return; }
             if (rooms.get(s.room)?.noRelay) { s.seen = now; send(`PBZS|ERR|${s.sid}|hostnorelay`, from); return; }
             if (!s.relay) log(`[relay] 会话 ${s.sid} 改走中转（${s.a} ⇄ ${s.b}）`);
+            if (!s.relay) note(`[relay-diag] 会话 ${s.sid} 房间 ${s.room} 改走中转（${from === s.a ? '主机' : '客机'}先请求）`);
             s.relay = true;
             s.seen = now;
             send(`PBZS|RELAYOK|${s.sid}`, from);
@@ -201,16 +243,26 @@ function onRelay(buf, from) {
     const nl = buf.indexOf(10);
     if (nl < 0 || nl > 40) { stats.dropped++; return; }
     const s = sessions.get(buf.toString('utf8', 5, nl));
-    if (!s || !s.relay) { stats.dropped++; return; }
-    const to = from === s.a ? s.b : from === s.b ? s.a : null;
-    if (!to) { stats.dropped++; return; }
+    if (!s) { stats.dropped++; return; }
+    if (!s.relay) { stats.dropped++; ctr(s).early++; return; }
+    const side = sideOf(s, from);           // §131 端口换了也认（按会话号 + IP）
+    if (!side) {
+        stats.dropped++;
+        const c = ctr(s);
+        c.unk++;
+        if (ip16(from) === ip16(s.a)) c.unkA++;
+        else if (ip16(from) === ip16(s.b)) c.unkB++;
+        return;
+    }
+    const to = side === 'a' ? s.b : s.a;
     const now = Date.now();
     const sec = Math.floor(now / 1000);
     const r = s.rate[from] ?? (s.rate[from] = { sec, n: 0 });
     if (r.sec !== sec) { r.sec = sec; r.n = 0; }
-    if (++r.n > RELAY_RATE) { stats.dropped++; return; }
+    if (++r.n > RELAY_RATE) { stats.dropped++; ctr(s).rate++; return; }
     s.seen = now;
     stats.relayed++;
+    ctr(s)[side === 'a' ? 'ab' : 'ba']++;
     send(buf, to);
 }
 
@@ -302,7 +354,13 @@ sock.on('error', (e) => { console.error('[server] socket 出错：', e.message);
 setInterval(() => {
     const now = Date.now();
     for (const r of rooms.values()) if (now - r.seen > ROOM_TTL) dropRoom(r.id, '心跳超时');
-    for (const s of sessions.values()) if (now - s.seen > SESSION_TTL) { sessions.delete(s.sid); log(`[session] 会话 ${s.sid} 超时删除`); }
+    for (const s of sessions.values()) {
+        if (now - s.seen > SESSION_TTL) {
+            sessions.delete(s.sid);
+            log(`[session] 会话 ${s.sid} 超时删除`);
+            if (s.ctr) relaySummary(s, '结束');
+        } else if (s.relay) relaySummary(s, '定时');   // §133 中转中每 2 秒看一次，有变化才写
+    }
     for (const [k, r] of remote) if (now - r.seen > ROOM_TTL) remote.delete(k);
     if (ranked) ranked.tick();
 }, 2000).unref();
@@ -313,7 +371,7 @@ if (upstreams.size > 0) {
 }
 
 setInterval(() => {
-    log(`[stat] 房间 ${rooms.size}（别的服务器的 ${remote.size}） 会话 ${sessions.size} 收包 ${stats.rx} 转发 ${stats.relayed} 丢弃 ${stats.dropped}`);
+    log(`[stat] 房间 ${rooms.size}（别的服务器的 ${remote.size}） 会话 ${sessions.size} 收包 ${stats.rx} 转发 ${stats.relayed} 丢弃 ${stats.dropped} 换端口 ${stats.rebound}`);
 }, 60_000).unref();
 
 sock.bind(PORT, HOST, () => {

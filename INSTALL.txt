@@ -41,7 +41,7 @@ save first.
        Mods\PBZ_MP\Scripts\pbz_places.lua
        Mods\PBZ_MP\Scripts\pbz_balance.lua     (per-move PvP damage factors, editable)
        Mods\PBZ_MP\enabled.txt
-       Mods\PBZ_MP\PBZLobby.exe        (the online helper program)
+       Mods\PBZ_MP\pbz_lobby.dll       (the online helper, runs inside the game)
        Mods\PBZ_MP\net\                (empty folder)
        Mods\PBZ_MP\rec\                (empty folder)
 2) UE4SS loads the mod because of enabled.txt. To be safe you can also
@@ -51,6 +51,8 @@ save first.
 Updating from an older version:
 - Just overwrite. net\ and rec\ hold your online settings and
   recordings; keep them.
+- Versions before 0.28.6 had a separate PBZLobby.exe. It is no longer
+  needed; you can delete Mods\PBZ_MP\PBZLobby.exe.
 
 
 3. How to play online
@@ -60,8 +62,8 @@ Updating from an older version:
 2) Press Home in game to open the online panel. A mouse cursor appears
    and every button is clickable. Settings has a language option
    (Chinese / English).
-   (The helper PBZLobby.exe starts in the background with the game and
-   exits a few seconds after the game closes; you don't need to touch it.)
+   (The online helper pbz_lobby.dll is loaded by the mod and runs inside
+   the game; there is no separate program to start or close.)
 3) Pick the connection method at the top of the panel. Both players must
    pick the same one:
    - Lobby server: someone has to host a lobby server (see section 8).
@@ -76,6 +78,10 @@ Updating from an older version:
      If the server is down: the host forwards the UDP port (27015 by
      default, changeable in Settings, or turn on UPnP), and the guest
      uses "Join by IP..." with the host's public-IP:port.
+     Campus / office networks and other restricted networks often can't
+     accept incoming connections and may also block the server relay;
+     they can only connect out. So the player on such a network should
+     let the other player create the room and join it.
    - LAN: same router. Also pick this for virtual LANs such as
      Tailscale / ZeroTier.
    - Local AI: offline, against a computer-controlled opponent (practice).
@@ -179,6 +185,7 @@ off.
 Players who tested and reported bugs (Bilibili):
   成步堂芦苇
   谦逊的刘恒宇
+  亦如黎明中的花朵_
 
 
 Uninstall: delete the Mods\PBZ_MP folder (and the line in mods.txt if

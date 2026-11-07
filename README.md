@@ -33,14 +33,14 @@
 连接方式：
 | 方式 | 说明 |
 |---|---|
-| 服务器大厅 | 要有人架一台大厅服务器（`server/`，见下），双方在面板"设置…"里填同一个地址。先打洞直连；直连不通时，服务器开了中转、并且双方都在设置里允许"直连不通时用服务器中转"（默认不用），才走中转 |
+| 服务器大厅 | 要有人架一台大厅服务器（`server/`，见下），双方在面板"设置…"里填同一个地址。先打洞直连；直连不通时，服务器开了中转、并且双方都在设置里允许"直连不通时用服务器中转"（默认不用），才走中转。校园网 / 公司网等受限网络往往进不来、也走不通中转：在这类网络的一方请让对方建房、自己去加入 |
 | 局域网 | 同一个路由器下，或者用 Tailscale / ZeroTier 等虚拟局域网 |
 | 本地 AI 对战 | 不联网，和电脑控制的对手打 |
 
 可以和第三方模组 [Phantom Pact](https://github.com/yhsharaf/PhantomPact) 同时安装：它联机期间本模组自动暂停。两者是独立的项目，本模组没有使用它的代码。
 
 ### 联网和隐私
-- 联机程序 `PBZLobby.exe` 随游戏在后台启动、游戏退出几秒后自己退出。它只在你联机时收发对局数据（默认 UDP 27015，局域网发现 27016），不自动更新、不访问任何网站。勾了 UPnP 时会让你的路由器转发端口；装了 Tailscale 时会读本机 Tailscale 的节点列表。
+- 联机程序 `pbz_lobby.dll` 由模组在游戏里载入，在游戏进程里运行（不另开程序），随游戏一起退出。它只在你联机时收发对局数据（默认 UDP 27015，局域网发现 27016），不自动更新、不访问任何网站。勾了 UPnP 时会让你的路由器转发端口；装了 Tailscale 时会读本机 Tailscale 的节点列表。
 - 联机时对方能看到你的公网 IP（直连）和你填的昵称。
 - 大厅服务器由玩家自己架设；架服务器的人能看到连上来的玩家的 IP 和昵称（开了中转还会经手对局数据）。见 `server/README.md`。
 
@@ -54,15 +54,17 @@ node server/pbz-lobby-server.mjs --port 27020 --relay   # 打开中转（每对�
 
 ### 从源码编译
 ```bat
-lobby\build.bat
+lobby\aot\build_aot.bat
 ```
-得到 `lobby\PBZLobby.exe`（用 Windows 自带的 csc，不用装 Visual Studio）。发布包里的 exe 就是用这份源码这样编译的。
+得到 `lobby\aot\out\pbz_lobby.dll`（NativeAOT 原生 DLL，玩家不用装 .NET）。要 .NET 8 SDK 和 MSVC 生成工具（Visual Studio Build Tools 的"使用 C++ 的桌面开发"，NativeAOT 链接要用）。发布包里的 DLL 就是用这份源码这样编译的。
+
+同一份源码也能用 Windows 自带的 csc 编成独立的 `PBZLobby.exe`（`lobby\build.bat`，不用装任何东西）：模组目录里没有 DLL、或 DLL 载不进来时，模组会改用这个 exe。
 
 ### 目录
 | 路径 | 内容 |
 |---|---|
 | `mod/PBZ_MP/` | 游戏内模组（UE4SS Lua） |
-| `lobby/` | 联机程序 `PBZLobby.exe` 的源码（C#） |
+| `lobby/` | 联机程序的源码（C#）；`lobby/aot/` 把它编成 `pbz_lobby.dll` |
 | `server/` | 大厅服务器（Node.js） |
 
 ### 感谢
@@ -70,6 +72,7 @@ lobby\build.bat
 
 - 成步堂芦苇
 - 谦逊的刘恒宇
+- 亦如黎明中的花朵_
 
 ### 许可证
 [GPL-3.0](LICENSE)。
@@ -95,7 +98,7 @@ To find `<game folder>`: in your Steam library, right-click Phantom Blade Zero �
 1. Put the `PBZ_MP` folder into `<game folder>\platform\steam\ue4ss\Mods\`. You should have:
    - `Mods\PBZ_MP\Scripts\` (four `.lua` files)
    - `Mods\PBZ_MP\enabled.txt`
-   - `Mods\PBZ_MP\PBZLobby.exe` (the helper program)
+   - `Mods\PBZ_MP\pbz_lobby.dll` (the online helper, loaded inside the game)
    - empty folders `Mods\PBZ_MP\net\` and `Mods\PBZ_MP\rec\`
 2. UE4SS loads the mod because of `enabled.txt`. To be safe you can also add the line `PBZ_MP : 1` to `Mods\mods.txt`.
 3. Updating: just overwrite. `net\` and `rec\` hold your settings and recordings; keep them.
@@ -104,12 +107,12 @@ Uninstall: delete `Mods\PBZ_MP` (and the `mods.txt` line if you added it).
 
 ### How to play
 1. Both players start the game and load a save. Different maps are fine: once connected, the guest can jump to the host's map (press **F1** twice, or use the button in the panel; this autosaves first).
-2. Press **Home** in game to open the online panel. It shows a mouse cursor and every button is clickable. The helper `PBZLobby.exe` starts in the background with the game and exits a few seconds after the game closes. The panel's Settings has a language option (中文 / English).
+2. Press **Home** in game to open the online panel. It shows a mouse cursor and every button is clickable. The online helper `pbz_lobby.dll` is loaded by the mod and runs inside the game process (no separate program); it stops when the game closes. The panel's Settings has a language option (中文 / English).
 3. Pick the same connection method on both sides (tabs at the top of the panel):
 
 | Method | Notes |
 |---|---|
-| Lobby server | Someone has to host a lobby server (`server/`, see below). Both players enter the same address in the panel's Settings; it is empty by default. The host creates a room; the guest clicks it in the room list or joins by room code. The game first tries a direct connection. If that fails, it falls back to the server's relay only when the server has relay turned on and both players allow "Use server relay if direct fails" in Settings (off by default); otherwise the host has to forward the UDP port (or tick UPnP), or both players switch to Tailscale. If the server is down, the guest can use "Join by IP" with the host's `public IP:port`. |
+| Lobby server | Someone has to host a lobby server (`server/`, see below). Both players enter the same address in the panel's Settings; it is empty by default. The host creates a room; the guest clicks it in the room list or joins by room code. The game first tries a direct connection. If that fails, it falls back to the server's relay only when the server has relay turned on and both players allow "Use server relay if direct fails" in Settings (off by default); otherwise the host has to forward the UDP port (or tick UPnP), or both players switch to Tailscale. If the server is down, the guest can use "Join by IP" with the host's `public IP:port`. Campus / office networks often can't accept incoming connections or use the relay: the player on such a network should let the other player host and join their room. |
 | LAN | Same router, or a virtual LAN such as Tailscale / ZeroTier. |
 | Local AI battle | Offline, against a computer-controlled opponent (for practice). |
 
@@ -145,7 +148,7 @@ Note roughly when it happened and what you were doing, then send these files:
 - If the game crashed: the newest `crash_<date>_<time>.dmp` in `<game folder>\platform\steam\ue4ss\`
 
 ### Network and privacy
-- `PBZLobby.exe` only sends and receives match data while you are playing online (UDP 27015 by default; LAN discovery uses 27016). It does not auto-update and does not contact any website. With UPnP ticked, it asks your router to forward the port. If Tailscale is installed, it reads the local Tailscale peer list.
+- The online helper `pbz_lobby.dll` only sends and receives match data while you are playing online (UDP 27015 by default; LAN discovery uses 27016). It does not auto-update and does not contact any website. With UPnP ticked, it asks your router to forward the port. If Tailscale is installed, it reads the local Tailscale peer list.
 - When playing online, your opponent can see your public IP (direct connection) and the nickname you set.
 - Lobby servers are run by players. Whoever runs one can see the IP and nickname of everyone who connects, and also the match traffic if relay is on. See `server/README.md` (in Chinese).
 
@@ -159,15 +162,17 @@ Open UDP 27020 inbound in your firewall (UDP, not TCP). Relay lets players conne
 
 ### Building from source
 ```bat
-lobby\build.bat
+lobby\aot\build_aot.bat
 ```
-This produces `lobby\PBZLobby.exe` using the csc.exe that ships with Windows; no Visual Studio needed. The exe in the release zip is built from this source exactly this way.
+This produces `lobby\aot\out\pbz_lobby.dll`, a NativeAOT native DLL (players don't need .NET installed). It needs the .NET 8 SDK and the MSVC build tools (Visual Studio Build Tools, "Desktop development with C++"; NativeAOT links with them). The DLL in the release zip is built from this source exactly this way.
+
+The same source also builds a standalone `PBZLobby.exe` with the csc.exe that ships with Windows (`lobby\build.bat`, nothing to install). If the mod folder has no DLL, or the DLL can't be loaded, the mod uses this exe instead.
 
 ### Layout
 | Path | Contents |
 |---|---|
 | `mod/PBZ_MP/` | In-game mod (UE4SS Lua) |
-| `lobby/` | Source of the helper program `PBZLobby.exe` (C#) |
+| `lobby/` | Source of the online helper (C#); `lobby/aot/` builds it into `pbz_lobby.dll` |
 | `server/` | Lobby server (Node.js) |
 
 ### Thanks
@@ -175,6 +180,7 @@ Players who tested the mod and reported bugs (on Bilibili):
 
 - 成步堂芦苇
 - 谦逊的刘恒宇
+- 亦如黎明中的花朵_
 
 ### License
 [GPL-3.0](LICENSE).

@@ -82,11 +82,31 @@ namespace PbzLobby
     }
 
     // 服务器大厅的一条连接。host：登记房间、等服务器介绍客机；client：JOIN 房间号 → 打洞 → 不通就中转
-    class ServerLink : ITransport
+    // §135 经大厅服务器开房 / 加入的连接共有的那一侧：服务器大厅（ServerLink，UDP 打洞 / 中转）和武林盟主（RankedLink，对局数据走 Steam）。
+    // 主程序（房间号、线路、报错、对方昵称前的称号）和排位上报（RankClient.Track：会话号、对方状态包里的 rk= / mt= / quit=）只认这个
+    interface IRoomLink
+    {
+        string RoomId { get; }
+        string Sid { get; }                 // 服务器给的会话号（排位上报用）
+        string Route { get; }               // 面板的线路（RouteName 翻成文字）
+        string Error { get; }
+        string RankPid { get; set; }        // 排位房间：自己的 pid（登记 / 加入带上）；null = 普通服务器大厅
+        string PeerRk { get; }              // 对方状态包里的 rk= / mt= / quit=（排位房间才取）
+        string PeerMt { get; }
+        string PeerQuit { get; }
+        Action<Dictionary<string, string>> PeerPacket { get; set; }     // §110.11 每个新的对方状态包（排位统计看 res=）
+        string ServerName { get; set; }     // 设置里填的服务器地址（提示里显示用，LobbyServer.Show）
+        Func<string> MapOf { get; set; }
+    }
+
+    class ServerLink : ITransport, IRoomLink
     {
         public const int Tries = 3;              // 用户 2026-11-04 定：直连重试 3 次连不上改走服务器中转
         public const double TryWindow = 2.5;     // 每次直连等多少秒
         const double LostAfter = 6.0;            // 连上后多久没收到对方的包算断了（客机重新走一遍加入，主机重新等人）
+        // §134 客机直连 3 次不通、中转也一个包没收到：多半有一方在校园网 / 公司网（严格 NAT、对海外服务器的高频 UDP 限流），只能主动连出去
+        public static string BlockedHint { get { return L.T("连不上：如果有一方在校园网 / 公司网，请让对方建房、你来加入",
+                                                            "Can't connect: if either of you is on a campus / office network, let the other player host and you join"); } }
 
         readonly UdpClient udp;
         readonly IPEndPoint server;
@@ -94,8 +114,8 @@ namespace PbzLobby
         readonly RemoteOut outq;
         readonly bool host;
         public readonly bool SimNoDirect;        // 测试用（--sim-no-direct）：丢掉所有不是服务器发来的包 = 模拟打洞不通
-        public Func<string> MapOf = () => "?";
-        public string ServerName = "";     // 设置里填的服务器地址（提示里显示用，LobbyServer.Show）
+        public Func<string> MapOf { get; set; }
+        public string ServerName { get; set; }
         readonly RxState rx = new RxState();
         long tx;
         Action<string> log = delegate { };
@@ -107,17 +127,27 @@ namespace PbzLobby
         readonly List<IPEndPoint> cands = new List<IPEndPoint>();
         IPEndPoint peer;
         bool relay, relayOk, joined;
+        bool blocked;      // §134 中转一直没收到对方的包：BlockedHint 留着，直到直连或中转真的通了
         bool noRelay;      // 服务器没开 --relay（回了 ERR …|norelay / hostnorelay）或自己关了中转：不再进中转，提示留着，一轮轮接着试直连
         // 自己允不允许走服务器中转（设置里的"允许中转"，默认关，HANDOVER §102）。客机关着：直连不通也不请求中转；
         // 主机关着：登记房间时告诉服务器（REG 第 7 段 0），服务器拒绝给这个房间中转；旧服务器不认这一段，主机就不理中转来的包
         public bool AllowRelay;
         // §110 武林盟主：排位房间（主机 REG 第 8、9 段 / 客机 JOIN 第 4 段带上自己的 pid）。null = 普通服务器大厅
-        public string RankPid;
+        public string RankPid { get; set; }
         // §110 对方状态包里的 rk=（对方 pid）、mt=（主机的对局状态，客机看这个）、quit=（客机弃权的局号，主机看这个）
-        public volatile string PeerRk, PeerMt, PeerQuit;
-        public Action<Dictionary<string, string>> PeerPacket;     // §110.11 每个新的对方状态包（排位统计看 res=）
+        public string PeerRk { get; private set; }
+        public string PeerMt { get; private set; }
+        public string PeerQuit { get; private set; }
+        public Action<Dictionary<string, string>> PeerPacket { get; set; }
         int attempt = 1;
         DateTime attemptAt, lastJoin, lastPunch, lastReg, lastRelayReq, lastFromPeer = DateTime.MinValue, lastFromServer = DateTime.MinValue, punchUntil;
+        // §130 连接诊断（net\net_conn.log）：只在状态变化时写；计数在每轮打洞 / 每个会话开始时清零
+        readonly DateTime born = DateTime.UtcNow;
+        DateTime relayAt, relayReqAt, joinAt;
+        bool srvAnswered, srvQuietLogged, regLogged, joinLogged, punchEndLogged;
+        int unknownPkts, noAckPkts, relayIgnored, relayBadSid;
+        long relayRx;
+        string noRelayWhy = "", lastErrWhy = "", peerPub = "", peerLocal = "", busySid = "";
 
         // host：roomOrNull = null；client：要加入的房间号
         public ServerLink(IPEndPoint server, string roomOrNull, int port, string name, string fRemote, bool simNoDirect)
@@ -125,11 +155,13 @@ namespace PbzLobby
             this.server = server;
             outq = new RemoteOut(fRemote);
             this.name = name;
+            MapOf = () => "?";
+            ServerName = "";
             SimNoDirect = simNoDirect;
             host = roomOrNull == null;
             if (!host) roomId = roomOrNull.Trim().ToUpperInvariant();
             key = Guid.NewGuid().ToString("N");
-            udp = new UdpClient(new IPEndPoint(IPAddress.Any, port));
+            udp = new UdpClient(new IPEndPoint(NetBind.Addr, port));
             try { udp.Client.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch (Exception) { }   // 同 Link：忽略 ICMP 端口不可达
             attemptAt = DateTime.UtcNow;
         }
@@ -140,6 +172,19 @@ namespace PbzLobby
         public string Error { get { return error; } }
         public int LocalPort { get { return ((IPEndPoint)udp.Client.LocalEndPoint).Port; } }
         public string PeerStr { get { return relay ? L.T("经服务器中转", "via server relay") : (peer != null ? peer.ToString() : ""); } }
+        // §130 诊断里写的（地址脱敏）
+        public string PeerDiag { get { return relay ? "经服务器中转" : peer != null ? NetLog.Ip(peer) : "（还没有）"; } }
+        public string ServerDiag
+        {
+            get
+            {
+                var t = (ServerName ?? "").Trim();
+                foreach (var c in t) if (char.IsLetter(c)) return t + "（" + NetLog.Ip(server) + "）";
+                return NetLog.Ip(server);     // 填的是 IP（或互通过来的房间）：也脱敏
+            }
+        }
+        static string Ms(DateTime from, DateTime now) { return (int)(now - from).TotalMilliseconds + " ms"; }
+        string Cand(IPEndPoint ep) { int i = cands.IndexOf(ep); return i == 0 ? "公网候选" : i == 1 ? "内网候选" : "不在候选里"; }
         public string PeerName { get { return ""; } }
         public string PeerNick { get { return rx.PeerNick; } }
         public long Tx { get { return tx; } }
@@ -206,7 +251,13 @@ namespace PbzLobby
                 if (relay) continue;     // 已经改走中转：之后到的直连包不理（免得两条路来回切）
                 // v0.20.3 输入 IP 直连：主机还没有客机时，也收陌生地址发来的包（握手 / 状态），其余只收认识的地址
                 bool known = from.Equals(peer) || cands.Contains(from);
-                if (!known && !(host && peer == null && sid == null)) continue;
+                if (!known && !(host && peer == null && sid == null))
+                {
+                    if (unknownPkts++ == 0)
+                        NetLog.W("收到不在候选里的地址 " + NetLog.Ip(from) + " 的包，丢掉（对方的 NAT 可能给这次连接换了端口）；候选："
+                                 + string.Join(" / ", cands.ConvertAll(NetLog.Ip).ToArray()));
+                    continue;
+                }
                 // 打洞包（PBZPUNCH / 打洞用的 PBZHELLO sid=）是这一层自己的，不签名；其余先验签（v0.22.0）
                 string text;
                 if (Starts(data, "PBZPUNCH") || Starts(data, "PBZHELLO\nsid=")) text = Kv.Utf8.GetString(data);
@@ -221,17 +272,23 @@ namespace PbzLobby
                     peer = from;
                     rx.Reset();
                     log(L.T("客机用 IP 直连进来：", "Direct-IP client: ") + from);
+                    NetLog.W("客机用 IP 直连进来：" + NetLog.Ip(from) + "（第一个包 " + Link.Head(text) + "）");
                 }
                 if (!from.Equals(peer) && !cands.Contains(from)) continue;
                 if (peer == null)
                 {
                     // 客机要确认是双向通的：主机的打洞包带 ack=1（= 主机收到过我们的包）或已经是状态包才算直连。
                     // 只有"主机 → 客机"通的时候（客机的包到不了主机），没有这一步客机会以为连上了、永远不改走中转
-                    if (!host && text.StartsWith("PBZ") && text.IndexOf("ack=1", StringComparison.Ordinal) < 0) continue;
+                    if (!host && text.StartsWith("PBZ") && text.IndexOf("ack=1", StringComparison.Ordinal) < 0)
+                    {
+                        if (noAckPkts++ == 0) NetLog.W("收到主机的打洞包（" + Cand(from) + "）但没带 ack：主机→客机通了，客机→主机还没通，接着打洞");
+                        continue;
+                    }
                     peer = from;
                     rx.Reset();
                     log(L.T("直连成功：", "Direct connection: ") + from + (host ? "" : L.T("（第 " + attempt + " 次）", " (try " + attempt + ")")));
-                    if (noRelay) error = "";
+                    NetLog.W("直连成功：" + NetLog.Ip(from) + "（" + Cand(from) + (host ? "" : "，第 " + attempt + " 次，这次打洞 " + Ms(attemptAt, now)) + "）");
+                    if (noRelay || blocked) { error = ""; blocked = false; }
                 }
                 lastFromPeer = now;
                 if (wire.Control(text)) continue;
@@ -240,7 +297,23 @@ namespace PbzLobby
             outq.Flush();   // 每轮写一个（RemoteOut，HANDOVER §72.10）
             if (got > 0) TakeNewest();
             if (host) HostTick(now); else ClientTick(now);
+            ServerWatch(now);
             return got;
+        }
+
+        // §130 大厅服务器有没有回应：第一次回应、5 秒没回应、恢复各写一行
+        void ServerWatch(DateTime now)
+        {
+            if (lastFromServer != DateTime.MinValue && !ServerQuiet)
+            {
+                if (!srvAnswered) NetLog.W(srvQuietLogged ? "大厅服务器恢复回应" : "大厅服务器有回应（开始后 " + Ms(born, lastFromServer) + "）");
+                srvAnswered = true; srvQuietLogged = false;
+                return;
+            }
+            if (srvQuietLogged || (lastFromServer == DateTime.MinValue && (now - born).TotalSeconds < 5)) return;
+            srvQuietLogged = true; srvAnswered = false;
+            NetLog.W(lastFromServer == DateTime.MinValue ? "大厅服务器 5 秒都没回应：服务器 " + ServerDiag + "（地址填错 / 服务器没开 / 本机防火墙挡了 UDP）"
+                                                         : "大厅服务器 5 秒没回应了");
         }
 
         // 最新的对方状态包：昵称；§110 排位房间再取 rk= / mt= / quit=
@@ -265,15 +338,26 @@ namespace PbzLobby
             {
                 // 中转来的状态包：PBZR|<会话号>\n<包>
                 int nl = Array.IndexOf(data, (byte)'\n');
-                if (nl < 0 || sid == null || Encoding.ASCII.GetString(data, 5, nl - 5) != sid) return 0;
+                if (nl < 0 || sid == null || Encoding.ASCII.GetString(data, 5, nl - 5) != sid)
+                {
+                    if (relayBadSid++ == 0) NetLog.W("收到中转包但会话号对不上（本机 " + (sid ?? "没有会话") + "），丢掉");
+                    return 0;
+                }
                 if (!relay)
                 {
-                    if (!host || !AllowRelay) return 0;
-                    relay = true; peer = null; rx.Reset();
+                    if (!host || !AllowRelay)
+                    {
+                        if (relayIgnored++ == 0) NetLog.W(host ? "收到中转来的包，但本机设置里没允许中转，丢掉" : "还在打洞时收到中转包，丢掉");
+                        return 0;
+                    }
+                    relay = true; peer = null; rx.Reset(); relayAt = now; relayRx = 0;
                     log(L.T("对方改走服务器中转", "Peer switched to server relay"));
+                    NetLog.W("对方改走服务器中转（收到第一个中转包时切过来）");
                 }
                 var body = wire.Verify(data, nl + 1, data.Length - nl - 1, Send);
                 if (body == null) return 0;
+                if (blocked) { error = ""; blocked = false; }
+                if (relayRx++ == 0) NetLog.W("中转收到对方第一个包（" + Link.Head(body) + "，切到中转后 " + Ms(relayAt, now) + "）");
                 lastFromPeer = now;
                 if (wire.Control(body) || !rx.Take(body)) return 0;
                 outq.Push(body);   // 中转来的也要排队写（§72.10 漏了这条路，中转时对方状态一帧都写不出去）
@@ -285,7 +369,11 @@ namespace PbzLobby
             switch (f[1])
             {
                 case "REGOK":
-                    if (f.Length > 2 && roomId != f[2]) { roomId = f[2]; log(L.T("房间已登记到大厅：", "Room listed on the lobby server: ") + roomId); }
+                    if (f.Length > 2 && roomId != f[2])
+                    {
+                        roomId = f[2]; log(L.T("房间已登记到大厅：", "Room listed on the lobby server: ") + roomId);
+                        NetLog.W("房间已登记：房间号 " + roomId + "（开始后 " + Ms(born, now) + "）");
+                    }
                     error = "";
                     break;
                 case "PEER":
@@ -294,15 +382,27 @@ namespace PbzLobby
                     break;
                 case "ERR":
                     var why = f.Length > 3 ? f[3] : "";
+                    if (why != lastErrWhy)
+                    {
+                        lastErrWhy = why;
+                        NetLog.W("大厅服务器报错 " + why + "：" + (why == "norelay" ? "服务器没开中转" : why == "hostnorelay" ? "主机关了中转"
+                                 : why == "nofound" ? "没有这个房间（" + roomId + "）" : why == "full" ? "房间已满" : "（见面板提示）")
+                                 + (relay && !relayOk ? "（请求中转后 " + Ms(relayReqAt, now) + "）" : ""));
+                    }
                     if (why == "norelay" || why == "hostnorelay")
                     {
                         bool byHost = why == "hostnorelay";
                         if (!noRelay) log(byHost ? L.T("主机关了中转，接着试直连", "The host does not allow relay; retrying direct")
                                                  : L.T("大厅服务器没开中转，接着试直连", "The lobby server has no relay; retrying direct"));
                         noRelay = true;
+                        noRelayWhy = why;
                         error = byHost ? L.T("直连不通，主机关了中转：主机转发端口或用 Tailscale", "Direct failed, the host does not allow relay")
                                        : L.T("直连不通，服务器没开中转：主机转发端口或用 Tailscale", "Direct failed, server has no relay");
-                        if (!host && relay && !relayOk) Restart(now);   // 中转等不来：回去重新加入、再打几轮洞（等中转时直连包是不收的）
+                        if (!host && relay && !relayOk)   // 中转等不来：回去重新加入、再打几轮洞（等中转时直连包是不收的）
+                        {
+                            NetLog.W("中转用不了（" + why + "），重新加入再试直连");
+                            Restart(now);
+                        }
                         break;
                     }
                     error = why == "nofound" ? L.T("大厅里没有这个房间（" + roomId + "）", "No such room on the lobby server (" + roomId + ")")
@@ -314,11 +414,21 @@ namespace PbzLobby
                           : L.T("大厅服务器报错：", "Lobby server error: ") + why;
                     break;
                 case "RELAYOK":
-                    if (f.Length > 2 && f[2] == sid && !relayOk) { relayOk = true; log(L.T("服务器中转已就绪", "Server relay ready")); }
+                    if (f.Length > 2 && f[2] == sid && !relayOk)
+                    {
+                        relayOk = true; log(L.T("服务器中转已就绪", "Server relay ready"));
+                        NetLog.W("服务器同意中转（RELAYOK，请求后 " + Ms(relayReqAt, now) + "）");
+                    }
                     break;
                 case "RELAYON":
                     // 刚切过来时还没收到中转的包：从现在起算"多久没动静"，不然主机会马上当成对方走了
-                    if (f.Length > 2 && f[2] == sid && !relay && AllowRelay) { relay = true; peer = null; rx.Reset(); lastFromPeer = now; log(L.T("对方改走服务器中转", "Peer switched to server relay")); }
+                    if (f.Length > 2 && f[2] == sid && !relay && AllowRelay)
+                    {
+                        relay = true; peer = null; rx.Reset(); lastFromPeer = now; relayAt = now; relayRx = 0;
+                        log(L.T("对方改走服务器中转", "Peer switched to server relay"));
+                        NetLog.W("服务器通知对方改走中转（RELAYON）");
+                    }
+                    else if (f.Length > 2 && f[2] == sid && !relay && relayIgnored++ == 0) NetLog.W("服务器通知对方改走中转，但本机设置里没允许中转，不理");
                     break;
             }
             return 0;
@@ -329,20 +439,36 @@ namespace PbzLobby
             if (host)
             {
                 // 正连着一个人（3 秒内有包）时不换人；服务器那边也会因为"已满"拒掉新的加入
-                if (newSid != sid && (now - lastFromPeer).TotalSeconds < 3) return;
+                if (newSid != sid && (now - lastFromPeer).TotalSeconds < 3)
+                {
+                    if (busySid != newSid) { busySid = newSid; NetLog.W("正连着人，忽略新的加入（会话 " + newSid + "）"); }
+                    return;
+                }
                 if (newSid != sid)
                 {
                     sid = newSid; peer = null; relay = false; rx.Reset();
                     log(L.T("有人要加入（", "A player is joining (") + pub + L.T("），开始打洞", "), punching"));
+                    NetLog.W("有人要加入：会话 " + newSid + "，对方公网 " + NetLog.Ip(pub) + "，内网 " + NetLog.Ip(local) + "，开始打洞");
+                    peerPub = pub; peerLocal = local; unknownPkts = noAckPkts = relayIgnored = relayBadSid = 0; relayRx = 0;
                 }
+                else if (pub != peerPub || local != peerLocal)
+                {
+                    NetLog.W("客机重试，地址变了：公网 " + NetLog.Ip(pub) + "，内网 " + NetLog.Ip(local) + "（NAT 每次换端口 = 对称型 NAT，打洞很难通）");
+                    peerPub = pub; peerLocal = local;
+                }
+                else NetLog.W("客机重试（同一会话），再打一轮洞");
+                punchEndLogged = false;
                 punchUntil = now.AddSeconds(Tries * TryWindow + 2);
             }
             else
             {
                 if (sid == null) log(L.T("服务器介绍主机地址 ", "Host address from the lobby server: ") + pub + (local.Length > 0 ? " / " + local : ""));
+                if (sid != newSid || pub != peerPub || local != peerLocal)
+                    NetLog.W("服务器给主机地址：公网 " + NetLog.Ip(pub) + "，内网 " + NetLog.Ip(local) + "（会话 " + newSid + "，JOIN 后 " + Ms(joinAt, now) + "），开始第 " + attempt + " 次打洞");
+                peerPub = pub; peerLocal = local;
                 sid = newSid;
                 joined = true;
-                if (!noRelay) error = "";      // 没中转的提示留着，直到直连真的通了
+                if (!noRelay && !blocked) error = "";      // 没中转 / 连不上的提示留着，直到直连真的通了
             }
             cands.Clear();
             var a = LobbyServer.ParseEp(pub);
@@ -364,6 +490,7 @@ namespace PbzLobby
             {
                 lastReg = now;
                 bool full = (now - lastFromPeer).TotalSeconds < 3;
+                if (!regLogged) { regLogged = true; NetLog.W("开始登记房间：大厅服务器 " + ServerDiag + "，本机内网 " + NetLog.Ip(LobbyServer.LocalAddr(LocalPort)) + "，允许中转 " + (AllowRelay ? "是" : "否") + "（每 2 秒一次）"); }
                 Raw("PBZS|REG|" + key + "|" + LobbyServer.Clean(name) + "|" + LobbyServer.Clean(MapOf()) + "|" + (full ? "1" : "0")
                     + "|" + LobbyServer.LocalAddr(LocalPort) + "|" + (AllowRelay ? "1" : "0")
                     + (RankPid != null ? "|1|" + RankPid : ""), server);
@@ -372,10 +499,17 @@ namespace PbzLobby
             }
             // 收到客机的包之后也接着打：带 ack=1 告诉客机"你的包我收到了"（客机靠它确认双向通）
             if (!relay && now < punchUntil) Punch(now, "PBZPUNCH\nsid=" + sid + "\n" + (peer != null ? "ack=1\n" : ""));
+            if (sid != null && peer == null && !relay && now >= punchUntil && !punchEndLogged)
+            {
+                punchEndLogged = true;
+                NetLog.W("打洞时间到了，还没收到客机的包（不在候选里的包 " + unknownPkts + " 个）：等客机重试或改走中转");
+            }
             // 对方走了：清掉，等下一个人
             if ((peer != null || relay) && (now - lastFromPeer).TotalSeconds > LostAfter)
             {
                 log(L.T("对方 " + LostAfter + " 秒没动静，房间重新开放", "No packets for " + LostAfter + " s, room open again"));
+                NetLog.W("对方 " + LostAfter + " 秒没动静，房间重新开放（之前" + (relay ? "经中转，中转收包 " + relayRx + " 个" : "直连 " + NetLog.Ip(peer))
+                         + "，这个会话收状态包 " + rx.Rx + " 个）");
                 peer = null; relay = false; relayOk = false; sid = null; cands.Clear();
             }
         }
@@ -388,19 +522,28 @@ namespace PbzLobby
                 if ((now - lastFromPeer).TotalSeconds > LostAfter + (relayOk ? 0 : 4))
                 {
                     log(L.T("中转也断了，重新加入", "Relay lost, joining again"));
+                    NetLog.W((relayRx == 0 ? "中转一直没收到对方的包" : "中转断了") + "，重新加入（服务器同意中转 " + (relayOk ? "是" : "否")
+                             + "，中转收包 " + relayRx + " 个，" + (relayRx == 0 ? "切到中转后 " + Ms(relayAt, now) : "最后收包在 " + Ms(lastFromPeer, now) + " 前") + "）");
+                    if (relayRx == 0) { blocked = true; error = BlockedHint; }
                     Restart(now);
                 }
                 return;
             }
             if (peer != null)
             {
-                if ((now - lastFromPeer).TotalSeconds > LostAfter) { log(L.T("直连断了，重新加入", "Direct link lost, joining again")); Restart(now); }
+                if ((now - lastFromPeer).TotalSeconds > LostAfter)
+                {
+                    log(L.T("直连断了，重新加入", "Direct link lost, joining again"));
+                    NetLog.W("直连断了：" + LostAfter + " 秒没收到对方的包，重新加入");
+                    Restart(now);
+                }
                 return;
             }
             // 打洞中：没拿到会话前每 0.5 秒发 JOIN；拿到后每 0.2 秒往主机的公网 / 局域网地址发握手
             if (!joined && (now - lastJoin).TotalSeconds > 0.5)
             {
                 lastJoin = now;
+                if (!joinLogged) { joinLogged = true; joinAt = now; NetLog.W("发加入请求（JOIN）：房间 " + roomId + "，本机内网 " + NetLog.Ip(LobbyServer.LocalAddr(LocalPort)) + "，第 " + attempt + " 次"); }
                 Raw("PBZS|JOIN|" + roomId + "|" + LobbyServer.LocalAddr(LocalPort) + (RankPid != null ? "|" + RankPid : ""), server);
             }
             Punch(now, "PBZHELLO\nsid=" + sid + "\n");
@@ -417,14 +560,19 @@ namespace PbzLobby
                 attempt++;
                 attemptAt = now;
                 joined = false;                // 重新 JOIN 一次：服务器重发 PEER 给主机，主机再打一轮洞
+                joinLogged = false;
                 log(L.T("直连没通，第 " + attempt + " 次重试", "No direct link yet, try " + attempt));
+                NetLog.W("第 " + (attempt - 1) + " 次直连 " + TryWindow + " 秒没通（不在候选里的包 " + unknownPkts + " 个，没带 ack 的打洞包 " + noAckPkts + " 个）");
+                unknownPkts = noAckPkts = 0;
                 return;
             }
             if (!AllowRelay && !noRelay)
             {
                 noRelay = true;
+                noRelayWhy = "本机没允许中转";
                 error = L.T("直连不通，你关了中转：主机转发端口、用 Tailscale，或在设置里允许中转", "Direct failed and relay is off in your settings");
                 log(L.T("直连 " + Tries + " 次都没通，设置里没允许中转，重新加入再试", "Direct failed " + Tries + " times, relay is off in settings; joining again"));
+                NetLog.W("直连 " + Tries + " 次都没通，本机设置里没允许中转，重新加入再试");
                 Restart(now);
                 return;
             }
@@ -432,6 +580,7 @@ namespace PbzLobby
             {
                 // 已经知道服务器没开中转：不再进中转，从头再来一轮直连（对方开了端口转发 / UPnP 之后就能连上）
                 log(L.T("直连 " + Tries + " 次都没通，服务器没开中转，重新加入再试", "Direct failed " + Tries + " times, no relay on the server; joining again"));
+                NetLog.W("直连 " + Tries + " 次都没通，中转用不了（" + noRelayWhy + "），重新加入再试");
                 Restart(now);
                 return;
             }
@@ -439,18 +588,22 @@ namespace PbzLobby
             relayOk = false;
             lastFromPeer = now;
             rx.Reset();
+            relayAt = relayReqAt = now; relayRx = 0;
             log(L.T("直连 " + Tries + " 次都没通，改走服务器中转", "Direct failed " + Tries + " times, using server relay"));
+            NetLog.W("直连 " + Tries + " 次都没通（最后一次：不在候选里的包 " + unknownPkts + " 个，没带 ack 的打洞包 " + noAckPkts + " 个），请求服务器中转（RELAY）");
         }
 
         void Restart(DateTime now)
         {
             peer = null; relay = false; relayOk = false; joined = false; sid = null; cands.Clear();
             attempt = 1; attemptAt = now; rx.Reset();
+            joinLogged = false; lastErrWhy = ""; unknownPkts = noAckPkts = relayIgnored = relayBadSid = 0; relayRx = 0;
         }
 
         public void Close()
         {
             if (host) Raw("PBZS|UNREG|" + key, server);
+            NetLog.W(host ? "关房间：向大厅服务器注销" : "客机离开");
             try { udp.Close(); } catch (Exception) { }
         }
     }
@@ -476,6 +629,7 @@ namespace PbzLobby
                 lastAnswer = DateTime.MinValue;
                 lastAsk = DateTime.MinValue;
                 startedAt = DateTime.MinValue;
+                listOk = listQuietLogged = false;
                 Error = "";
             }
             if (server == null && (now - lastAsk).TotalSeconds > 5)
@@ -495,7 +649,7 @@ namespace PbzLobby
             {
                 try
                 {
-                    sock = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+                    sock = new UdpClient(new IPEndPoint(NetBind.Addr, 0));
                     try { sock.Client.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch (Exception) { }
                 }
                 catch (Exception ex) { Error = ex.Message; return rooms; }
@@ -518,6 +672,7 @@ namespace PbzLobby
                     if (p.Length >= 4) list.Add(p);
                 }
                 rooms = list;
+                if (!listOk) { listOk = true; NetLog.W("房间列表：大厅服务器有回应（" + list.Count + " 个房间）"); }
                 lastAnswer = now;
                 Error = "";
             }
@@ -533,11 +688,18 @@ namespace PbzLobby
             {
                 Error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + LobbyServer.Show(serverText, server);
                 rooms = new List<string[]>();
+                if (listOk || !listQuietLogged)
+                {
+                    listOk = false; listQuietLogged = true;
+                    NetLog.W("房间列表：大厅服务器没回应（" + (lastAnswer == DateTime.MinValue ? "一直" : "6 秒") + "没回答列表请求；服务器 "
+                             + NetLog.Ip(server) + "）");
+                }
             }
             return rooms;
         }
 
         DateTime startedAt = DateTime.MinValue;
+        bool listOk, listQuietLogged;     // §130 net_conn.log 只记有回应 / 没回应的变化
 
         // §91 第一份房间列表还没回来（也没报错）：面板显示"正在获取房间…"而不是"没有房间"
         public bool Listing { get { return serverText.Trim().Length > 0 && lastAnswer == DateTime.MinValue && Error.Length == 0; } }

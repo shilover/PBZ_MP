@@ -8,7 +8,9 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Threading;
+#if !AOT
 using System.Web.Script.Serialization;
+#endif
 
 namespace PbzLobby
 {
@@ -60,9 +62,10 @@ namespace PbzLobby
         public bool Upnp;
         public bool Relay;          // §102 服务器大厅：允许走服务器中转（默认关；服务器也得开 --relay）
         public int AiLevel = 1;     // §75 本地 AI 难度：0 简单 / 1 普通 / 2 困难（LocalAi.Levels）
+        public LocalAi.Loadout AiLoad = new LocalAi.Loadout();   // §114 AI 装备（aiw= / aie= / aio= / aimed= / aiacc=；不合法的值不认，用默认）
         public bool AiRoom;                 // §85 AI 对战时同时开房等真人（开关）
         public string AiRoomMode = "lan";   // §85 等人的房间用哪种连接方式（不能是 ai）
-        public bool Steam;             // 列不列 Steam 两种方式（netcfg.txt 的 steam=1；默认不列，见 Modes.ShowSteam）
+        public bool Steam;             // 公开版没有 Steam 方式
         public string Secret = "";     // v0.22.0 联机密码（明文存这里：只是两个人对局用的共享口令）；空 = 不签名
         public readonly Dictionary<string, List<string>> Recent = new Dictionary<string, List<string>>();
         readonly string path;
@@ -82,6 +85,11 @@ namespace PbzLobby
             if (d.TryGetValue("relay", out v)) Relay = v == "1";
             int lv;
             if (d.TryGetValue("ailevel", out v) && int.TryParse(v, out lv) && lv >= 0 && lv <= 2) AiLevel = lv;
+            if (d.TryGetValue("aiw", out v)) AiLoad.SetWeapon(v);
+            if (d.TryGetValue("aie", out v)) AiLoad.SetEdge(v);
+            if (d.TryGetValue("aio", out v)) AiLoad.SetOutfit(v);
+            if (d.TryGetValue("aimed", out v)) AiLoad.SetPotions(v);
+            if (d.TryGetValue("aiacc", out v)) AiLoad.SetAcc(v);
             if (d.TryGetValue("airoom", out v)) AiRoom = v == "1";
             if (d.TryGetValue("airoommode", out v)) AiRoomMode = Modes.ValidRoom(v);
             if (d.TryGetValue("server", out v)) Server = v.Trim();
@@ -123,9 +131,13 @@ namespace PbzLobby
             sb.Append("mode=").Append(Mode).Append('\n').Append("name=").Append(Name.Replace("\n", " ")).Append('\n')
               .Append("port=").Append(Port).Append('\n').Append("upnp=").Append(Upnp ? 1 : 0).Append('\n')
               .Append("relay=").Append(Relay ? 1 : 0).Append('\n').Append("steam=").Append(Steam ? 1 : 0).Append('\n')
+              .Append("steamset=1\n")     // §136 这一版起 steam= 是认真的（见构造函数）
               .Append("server=").Append(Server.Replace("\n", " ")).Append('\n')
               .Append("secret=").Append(Secret.Replace("\n", " ")).Append('\n')
               .Append("ailevel=").Append(AiLevel).Append('\n')
+              .Append("aiw=").Append(AiLoad.WeaponWire()).Append('\n').Append("aie=").Append(AiLoad.Edge).Append('\n')
+              .Append("aio=").Append(AiLoad.Outfit).Append('\n').Append("aimed=").Append(AiLoad.Potions).Append('\n')
+              .Append("aiacc=").Append(AiLoad.AccWire()).Append('\n')
               .Append("airoom=").Append(AiRoom ? 1 : 0).Append('\n').Append("airoommode=").Append(AiRoomMode).Append('\n');
             foreach (var kv in Recent) sb.Append("recent_").Append(kv.Key).Append('=').Append(string.Join(",", kv.Value)).Append('\n');
             Kv.WriteAtomic(path, sb.ToString());
@@ -208,6 +220,84 @@ namespace PbzLobby
         }
     }
 
+    // §130 非 Steam 方式（服务器大厅 / 输入 IP 直连 / 局域网）的连接诊断：net\net_conn.log，仿 §125 的 steam_conn.log。
+    // 一行一个事件（带毫秒时间），只在事件发生时写，不每帧写；游戏里的联机程序每个进程第一次 Start 时把上一份改名成 net_conn.prev.log。
+    // IP 一律经 Ip() 脱敏：只留前两段 + 本进程随机盐的短哈希（同一份日志里看得出是不是同一个地址，盐不落盘）。写失败吞掉
+    static class NetLog
+    {
+        static string path;
+        static bool rotated;
+        static readonly object lk = new object();
+        static readonly string salt = Guid.NewGuid().ToString("N");
+        // 联机程序是哪种：csc 编的 exe / NativeAOT 编的无界面 exe（测试用）/ 游戏进程里的 pbz_lobby.dll（AotEntry 改成 DLL）
+        public static string Build =
+#if AOT
+            "AOT exe";
+#else
+            "exe";
+#endif
+
+        // rotate：游戏里的联机程序（--bg / DLL）改名；命令行测试（RunCli）不改名（两个进程可能共用一个 net 目录）
+        public static void Start(string dir, bool rotate)
+        {
+            try
+            {
+                lock (lk)
+                {
+                    path = Path.Combine(dir, "net_conn.log");
+                    if (!rotate || rotated) return;
+                    rotated = true;     // DLL 版面板"退出"后再开，还在同一个游戏进程里：不再改名
+                    var prev = Path.Combine(dir, "net_conn.prev.log");
+                    if (File.Exists(path)) { File.Delete(prev); File.Move(path, prev); }
+                }
+            }
+            catch (Exception) { }
+        }
+
+        public static void W(string m)
+        {
+            var p = path;
+            if (p == null) return;
+            try
+            {
+                lock (lk)
+                {
+                    var b = Kv.Utf8.GetBytes(DateTime.Now.ToString("HH:mm:ss.fff ") + m + "\r\n");
+                    using (var f = new FileStream(p, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) f.Write(b, 0, b.Length);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        // 203.0.113.7:27015 → "[公网]203.0.*.*#3fa2:27015"；内网 / 回环 / CGNAT（Tailscale 等）另标
+        public static string Ip(IPEndPoint ep) { return ep == null ? "-" : Ip(ep.Address) + ":" + ep.Port; }
+        public static string Ip(IPAddress a)
+        {
+            if (a == null) return "-";
+            if (a.IsIPv4MappedToIPv6) a = a.MapToIPv4();
+            var s = a.ToString();
+            uint h = 2166136261;
+            foreach (var c in salt + s) { h ^= c; h *= 16777619; }
+            var tag = (h & 0xffff).ToString("x4");
+            if (a.AddressFamily != AddressFamily.InterNetwork)
+            {
+                var g = s.Split(':');
+                return "[IPv6]" + (g.Length > 1 ? g[0] + ":" + g[1] : "?") + ":*#" + tag;
+            }
+            var b = a.GetAddressBytes();
+            string kind = b[0] == 127 ? "回环" : b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] < 32) || (b[0] == 192 && b[1] == 168) ? "内网"
+                        : b[0] == 100 && b[1] >= 64 && b[1] < 128 ? "CGNAT/虚拟网" : "公网";
+            return "[" + kind + "]" + b[0] + "." + b[1] + ".*.*#" + tag;
+        }
+        // 服务器发来的 "IP:端口" 文本；认不出也不原样写
+        public static string Ip(string ipPort)
+        {
+            if (string.IsNullOrEmpty(ipPort)) return "（空）";
+            var ep = LobbyServer.ParseEp(ipPort);
+            return ep != null ? Ip(ep) : "（认不出的地址）";
+        }
+    }
+
     // 广域网：用 Windows 自带的 UPnP（HNetCfg.NATUPnP，COM）让路由器把 UDP 端口转发到本机。路由器没开 UPnP 就失败，提示手动转发
     static class Upnp
     {
@@ -218,29 +308,30 @@ namespace PbzLobby
         public static void MapAsync(int port)
         {
             Status = L.T("UPnP：正在请求路由器转发 UDP ", "UPnP: asking the router to forward UDP ") + port + "…";
-            ThreadPool.QueueUserWorkItem(delegate
+            NetLog.W("UPnP：请求路由器转发 UDP " + port);
+            Safe.Pool("upnp-map", delegate
             {
                 try
                 {
                     var local = Addr.PrimaryLocal();
                     if (local == null) throw new Exception(L.T("没找到有网关的网卡", "no adapter with a gateway"));
-                    var maps = Collection();
-                    if (maps == null) throw new Exception(L.T("路由器没开 UPnP（或 Windows 的网络发现关了）", "the router has UPnP off (or Windows network discovery is off)"));
-                    try { maps.GetType().InvokeMember("Remove", BindingFlags.InvokeMethod, null, maps, new object[] { port, "UDP" }); } catch (Exception) { }
-                    var m = maps.GetType().InvokeMember("Add", BindingFlags.InvokeMethod, null, maps,
-                                                        new object[] { port, "UDP", port, local.ToString(), true, "PBZ_MP" });
+                    if (!Nat.Available()) throw new Exception(L.T("路由器没开 UPnP（或 Windows 的网络发现关了）", "the router has UPnP off (or Windows network discovery is off)"));
+                    Nat.Remove(port);
+                    string ext = Nat.Add(port, local.ToString());
                     mapped = port;
-                    string ext = "";
-                    try { ext = (string)m.GetType().InvokeMember("ExternalIPAddress", BindingFlags.GetProperty, null, m, null); } catch (Exception) { }
                     PublicIp = ext ?? "";
                     Status = L.T("UPnP：已转发 UDP ", "UPnP: forwarding UDP ") + port + " → " + local
                              + (PublicIp.Length > 0 ? L.T("，公网 IP ", ", public IP ") + PublicIp : "");
+                    IPAddress pub;
+                    NetLog.W("UPnP 成功：UDP " + port + " → " + NetLog.Ip(local) + "，路由器报的公网 IP "
+                             + (IPAddress.TryParse(PublicIp, out pub) ? NetLog.Ip(pub) : "（没给）"));
                 }
                 catch (Exception ex)
                 {
                     var e = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;
                     Status = L.T("UPnP 失败：", "UPnP failed: ") + e.Message + L.T("。请在路由器里手动把 UDP ", ". Forward UDP ") + port
                              + L.T(" 转发到本机", " to this PC in your router");
+                    NetLog.W("UPnP 失败（UDP " + port + "）：" + e.Message);
                 }
             });
         }
@@ -252,17 +343,24 @@ namespace PbzLobby
             mapped = 0;
             PublicIp = "";
             Status = "";
-            ThreadPool.QueueUserWorkItem(delegate
+            Safe.Pool("upnp-unmap", delegate
             {
                 try
                 {
-                    var maps = Collection();
-                    if (maps != null) maps.GetType().InvokeMember("Remove", BindingFlags.InvokeMethod, null, maps, new object[] { port, "UDP" });
+                    Nat.Remove(port);
                 }
                 catch (Exception) { }
             });
         }
 
+    }
+
+    // 路由器的静态端口映射表（HNetCfg.NATUPnP 的 StaticPortMappingCollection）。
+    // exe：COM 晚绑定（InvokeMember）。AOT 版（pbz_lobby.dll）：NativeAOT 不支持 COM 晚绑定，按接口的虚表直接调
+    // （IUPnPNAT / IStaticPortMappingCollection / IStaticPortMapping 都是 IDispatch 双接口，前 7 格是 IUnknown + IDispatch）
+    static class Nat
+    {
+#if !AOT
         static object Collection()
         {
             var t = Type.GetTypeFromProgID("HNetCfg.NATUPnP");
@@ -270,6 +368,87 @@ namespace PbzLobby
             var nat = Activator.CreateInstance(t);
             return t.InvokeMember("StaticPortMappingCollection", BindingFlags.GetProperty, null, nat, null);
         }
+
+        public static bool Available() { return Collection() != null; }
+
+        public static void Remove(int port)
+        {
+            try
+            {
+                var maps = Collection();
+                if (maps != null) maps.GetType().InvokeMember("Remove", BindingFlags.InvokeMethod, null, maps, new object[] { port, "UDP" });
+            }
+            catch (Exception) { }
+        }
+
+        // 返回路由器报的公网 IP（拿不到给 ""）
+        public static string Add(int port, string local)
+        {
+            var maps = Collection();
+            if (maps == null) throw new Exception("UPnP");
+            var m = maps.GetType().InvokeMember("Add", BindingFlags.InvokeMethod, null, maps, new object[] { port, "UDP", port, local, true, "PBZ_MP" });
+            try { return (string)m.GetType().InvokeMember("ExternalIPAddress", BindingFlags.GetProperty, null, m, null) ?? ""; } catch (Exception) { return ""; }
+        }
+#else
+        static readonly Guid ClsidNat = new Guid("AE1E00AA-3FD5-403C-8A27-2BBDC30CD0E1"), IidNat = new Guid("B171C812-CC76-485A-94D8-B6B3A2794E99");
+        [System.Runtime.InteropServices.DllImport("ole32")] static extern int CoInitializeEx(IntPtr reserved, uint model);
+        [System.Runtime.InteropServices.DllImport("ole32")] static extern int CoCreateInstance(in Guid clsid, IntPtr outer, uint ctx, in Guid iid, out IntPtr obj);
+        [System.Runtime.InteropServices.DllImport("oleaut32", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] static extern IntPtr SysAllocString(string s);
+        [System.Runtime.InteropServices.DllImport("oleaut32")] static extern void SysFreeString(IntPtr b);
+
+        static unsafe IntPtr Slot(IntPtr obj, int i) { return (*(IntPtr**)obj)[i]; }
+        static unsafe void Release(IntPtr obj) { if (obj != IntPtr.Zero) ((delegate* unmanaged[Stdcall]<IntPtr, uint>)Slot(obj, 2))(obj); }
+
+        // 线程池线程默认没进 COM 套间：进多线程套间（已经进过返回 S_FALSE / RPC_E_CHANGED_MODE，都能用）
+        static unsafe IntPtr Collection()
+        {
+            CoInitializeEx(IntPtr.Zero, 0 /* COINIT_MULTITHREADED */);
+            IntPtr nat, maps = IntPtr.Zero;
+            if (CoCreateInstance(ClsidNat, IntPtr.Zero, 1 /* CLSCTX_INPROC_SERVER */, IidNat, out nat) < 0 || nat == IntPtr.Zero) return IntPtr.Zero;
+            try
+            {
+                int hr = ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr*, int>)Slot(nat, 7))(nat, &maps);   // get_StaticPortMappingCollection
+                return hr < 0 ? IntPtr.Zero : maps;   // 路由器没开 UPnP 时这里是 S_OK + NULL
+            }
+            finally { Release(nat); }
+        }
+
+        public static bool Available()
+        {
+            var maps = Collection();
+            Release(maps);
+            return maps != IntPtr.Zero;
+        }
+
+        public static unsafe void Remove(int port)
+        {
+            var maps = Collection();
+            if (maps == IntPtr.Zero) return;
+            var udp = SysAllocString("UDP");
+            try { ((delegate* unmanaged[Stdcall]<IntPtr, int, IntPtr, int>)Slot(maps, 10))(maps, port, udp); }   // Remove(lExternalPort, bstrProtocol)
+            finally { SysFreeString(udp); Release(maps); }
+        }
+
+        public static unsafe string Add(int port, string local)
+        {
+            var maps = Collection();
+            if (maps == IntPtr.Zero) throw new Exception("UPnP");
+            IntPtr udp = SysAllocString("UDP"), client = SysAllocString(local), desc = SysAllocString("PBZ_MP"), m = IntPtr.Zero;
+            try
+            {
+                // Add(lExternalPort, bstrProtocol, lInternalPort, bstrInternalClient, bEnabled (VARIANT_BOOL), bstrDescription, ppSPM)
+                int hr = ((delegate* unmanaged[Stdcall]<IntPtr, int, IntPtr, int, IntPtr, short, IntPtr, IntPtr*, int>)Slot(maps, 11))(maps, port, udp, port, client, -1, desc, &m);
+                if (hr < 0) throw new Exception("UPnP Add 0x" + hr.ToString("X8"));
+                if (m == IntPtr.Zero) return "";
+                IntPtr ext = IntPtr.Zero;
+                int hr2 = ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr*, int>)Slot(m, 7))(m, &ext);         // get_ExternalIPAddress
+                string s = hr2 >= 0 && ext != IntPtr.Zero ? System.Runtime.InteropServices.Marshal.PtrToStringBSTR(ext) : "";
+                if (ext != IntPtr.Zero) SysFreeString(ext);
+                return s ?? "";
+            }
+            finally { SysFreeString(udp); SysFreeString(client); SysFreeString(desc); Release(m); Release(maps); }
+        }
+#endif
     }
 
     // 虚拟局域网：Tailscale 不转发广播，所以主机把房间广播单播给每个在线节点；加入方也把在线节点列成可加入目标。
@@ -321,6 +500,37 @@ namespace PbzLobby
         }
 
         // 只取 Peer 里在线的节点：HostName、TailscaleIPs 里的 IPv4
+#if AOT
+        // AOT 版没有 JavaScriptSerializer：用 System.Text.Json 读同样的字段
+        public static List<string[]> Parse(string json)
+        {
+            var list = new List<string[]>();
+            try
+            {
+                using (var doc = System.Text.Json.JsonDocument.Parse(json))
+                {
+                    System.Text.Json.JsonElement peers;
+                    if (!doc.RootElement.TryGetProperty("Peer", out peers) || peers.ValueKind != System.Text.Json.JsonValueKind.Object) return list;
+                    foreach (var kv in peers.EnumerateObject())
+                    {
+                        var n = kv.Value;
+                        System.Text.Json.JsonElement on, ips, host;
+                        if (!n.TryGetProperty("Online", out on) || on.ValueKind != System.Text.Json.JsonValueKind.True) continue;
+                        if (!n.TryGetProperty("TailscaleIPs", out ips) || ips.ValueKind != System.Text.Json.JsonValueKind.Array) continue;
+                        string h = n.TryGetProperty("HostName", out host) && host.ValueKind == System.Text.Json.JsonValueKind.String ? host.GetString() : null;
+                        foreach (var ip in ips.EnumerateArray())
+                        {
+                            var s = ip.ValueKind == System.Text.Json.JsonValueKind.String ? ip.GetString() : null;
+                            if (s != null && s.IndexOf(':') < 0) { list.Add(new[] { s, h ?? s }); break; }
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+            list.Sort((a, b) => string.CompareOrdinal(a[1], b[1]));
+            return list;
+        }
+#else
         public static List<string[]> Parse(string json)
         {
             var list = new List<string[]>();
@@ -344,5 +554,6 @@ namespace PbzLobby
             list.Sort((a, b) => string.CompareOrdinal(a[1], b[1]));
             return list;
         }
+#endif
     }
 }

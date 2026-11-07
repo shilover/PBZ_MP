@@ -308,7 +308,7 @@ namespace PbzLobby
             {
                 try
                 {
-                    sock = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+                    sock = new UdpClient(new IPEndPoint(NetBind.Addr, 0));
                     try { sock.Client.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch (Exception) { }
                 }
                 catch (Exception ex) { Error = ex.Message; return; }
@@ -485,7 +485,7 @@ namespace PbzLobby
         // §110.2 从主机的 mt=<状态>:<回合>:<主机分>:<客机分>:<赢家>:<局号> 判开局 / 打完；弃权看 quit=，掉线看连接
         void Track(Session s, DateTime now)
         {
-            var sl = s != null ? s.T as ServerLink : null;
+            var sl = s != null ? s.T as IRoomLink : null;     // §135 武林盟主是 RankedLink（对局走 Steam），服务器大厅是 ServerLink
             bool ranked = sl != null && s.Mode == "ranked" && sl.Sid != null;
             // 2026-11-06 用户在对局中点"断开"测试，两局都作废了：以前会话号一变就当"自己走了"报输，可主机这边会话号变
             // 是对方断了又重新加入（主机的连接一直在），两边都报输 → 对不上。现在分开：
