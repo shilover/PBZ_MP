@@ -160,7 +160,9 @@ https://github.com/shilover/PBZ_MP/issues):
 8. Hosting your own lobby server (optional; only for "Lobby server")
 --------------------------------------------------------------------
 The server is the server\ folder (on Nexus: the optional "Lobby Server"
-file). It is licensed under GPL-3.0 (see LICENSE).
+file). It is licensed under AGPL-3.0 (see server\LICENSE); the rest of
+PBZ_MP is GPL-3.0. If you run a modified server for other players, you
+must offer them its source (AGPL section 13).
 - You need a PC or VPS with a public IP and Node.js 18 or newer; no
   npm install
 - Run:        node pbz-lobby-server.mjs --port 27020

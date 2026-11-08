@@ -118,7 +118,8 @@
 
 八、自己架大厅服务器（可选，只有"服务器大厅"方式要用）
 --------------------------------------------------------
-压缩包里的 server\ 文件夹就是服务端，许可证 GPL-3.0（见 LICENSE）。
+压缩包里的 server\ 文件夹就是服务端，许可证 AGPL-3.0（见 server\LICENSE；模组其余部分是 GPL-3.0）。
+改过的服务端给别人用，要向连上来的玩家提供改过的源码（AGPL 第 13 条）。
 - 需要一台有公网 IP 的电脑或 VPS，装 Node.js 18 以上，不用 npm install
 - 运行：node pbz-lobby-server.mjs --port 27020
 - 中转默认关。打开：node pbz-lobby-server.mjs --port 27020 --relay

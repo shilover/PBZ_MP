@@ -1,6 +1,6 @@
 // PBZ_MP 服务器大厅（docs/HANDOVER.md §47）：房间登记 / 列表 + UDP 打洞介绍 + 直连不通时的中转。
 // 只用 Node 自带的 dgram，一个 UDP 端口干全部的事；不存盘，重启后房间由主机的心跳（每 2 秒一次）自己补回来。
-// 许可证 GPL-3.0（见 LICENSE），不提供任何担保。架这台服务器的人是服务运营者，自己负责当地合规（server/README.md）。
+// 许可证 AGPL-3.0（见 server/LICENSE），不提供任何担保。架这台服务器的人是服务运营者，自己负责当地合规（server/README.md）。
 //
 //   node server/pbz-lobby-server.mjs [--port 27020] [--host 0.0.0.0] [--relay] [--quiet] [--upstream 域名或IP:端口 …]
 //   环境变量 PORT / HOST / RELAY=1 也行。--upstream 可以写多个（HANDOVER §50 服务器互通）。
