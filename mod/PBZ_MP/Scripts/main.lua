@@ -21,7 +21,7 @@
 
 local UEHelpers = require("UEHelpers")
 
-local VERSION = "0.29.6"
+local VERSION = "0.30.2"
 local TAG = "[PBZ_MP] "
 -- v0.14.0：所有文件都放在模组自己的目录（…/Mods/PBZ_MP/），不再写死本机的游戏路径，别人的电脑上也能用。
 -- 从本脚本的路径推出模组目录（脚本在 PBZ_MP/Scripts/main.lua）；拿不到时退回 UE4SS 的工作目录（游戏 exe 所在的 platform/steam）下的相对路径
@@ -55,6 +55,34 @@ local NET_DIR = ROOT .. "/net"
 local REC_DIR = ROOT .. "/rec"
 local F_LOCAL = NET_DIR .. "/state_local.txt"
 local F_REMOTE = NET_DIR .. "/state_remote.txt"
+-- §147 双开（-allowmultipleinstances）两份游戏共用这个文件夹，日志以前交错写进同一个 mp_probe.log 分不清。
+-- 第一份每 5 秒在 net/log_owner.txt 写"编号 时间"（看门狗里写）；启动时发现别人的、15 秒内写过 → 我是第二份，日志写 mp_probe_2.log
+INST = { FILE = NET_DIR .. "/log_owner.txt", STALE = 15, BEAT = 5, slot = 1, at = -100,
+         id = tostring(os.time()) .. "-" .. tostring({}):gsub("^table: ", "") }
+function INST.claim()
+    local f = io.open(INST.FILE, "r")
+    local line = f and f:read("*l")
+    if f then f:close() end
+    local oid, ot = (line or ""):match("^(%S+) (%d+)$")
+    if oid and oid ~= INST.id and os.time() - tonumber(ot) < INST.STALE then INST.slot = 2 end
+    INST.beat()
+    return INST.slot
+end
+function INST.beat()
+    if INST.slot ~= 1 or os.time() - INST.at < INST.BEAT then return end
+    INST.at = os.time()
+    local f = io.open(INST.FILE, "w")
+    if f then f:write(INST.id, " ", tostring(INST.at), "\n"); f:close() end
+end
+-- §151 双开第二份另用一个 net 目录（net2）：联机程序 DLL 按自己所在目录找 net、还有单实例锁，两份游戏抢同一个联机程序
+-- （11-08 09:27 实测：先开的那份面板"联机程序没响应"）。第二份改走 PBZLobby.exe --dir net2，管道名 / lobby.txt / 设置都分开
+-- §153 第二份也用 DLL：DLL 拿不到"第一份"锁就自己用 net2（锁 / 管道名带 pid，§152）；DLL 不行才退回 exe --dir net2
+if INST.claim() == 2 then
+    LOG = ROOT .. "/mp_probe_2.log"
+    NET_DIR = ROOT .. "/net2"
+    F_LOCAL, F_REMOTE = NET_DIR .. "/state_local.txt", NET_DIR .. "/state_remote.txt"
+    pcall(os.execute, string.format('mkdir "%s" 2>nul', NET_DIR:gsub("/", "\\")))
+end
 
 local PLACE_DIST = 300.0     -- 替身归位：你正前方多远
 local REPLAY_DIST = 500.0    -- 回放起点：你正前方多远（录制时的"正前方"会朝向你）
@@ -135,6 +163,7 @@ local function out(fmt, ...)
     L[#L + 1] = (ok2 and ts or "??:??:??") .. " " .. tostring(s) .. "\n"
     if #L >= LOGBUF.MAX or os.clock() - LOGBUF.at >= LOGBUF.SEC or tostring(s):find("!!", 1, true) then LOGBUF.flush() end
 end
+if INST.slot == 2 then out("双开：另一份游戏在跑（net/log_owner.txt 15 秒内写过），这份的日志写 mp_probe_2.log（§147）") end
 
 
 -- ============================================================ 游戏适配层（v0.23.0，HANDOVER §59）
@@ -727,6 +756,7 @@ local WEAPON_OF_FAMILY = {
     ZhanMa = "ZhanMaBlade",   -- 斩马刀
     ChiRen = "Long",          -- 长形黑伤，淬炼后显示炽刃，ID 不变
     HeiMoShang = "Tang",      -- v0.16.0：黑伤淬炼后显示黑魔伤（12:32 日志 GA_Hun_HeiMoShang_A_C），ID 不变
+    Tang = "Tang",            -- §155 没淬炼的黑伤是 GA_Hun_Tang_*（11-08 新档：认不出"玩家1 当前武器"，状态包 w= 一直空）
     Double = "Double",        -- v0.16.0：绝影（双刃），12:45 日志 GA_Hun_Double_AA_C / GA_Hun_Double_SWT_C
 }
 -- 不收 "Long"：GA_Hun_Long_Stance_C（格挡架势）拿斩马刀时也会用，不代表武器
@@ -869,9 +899,19 @@ end
 -- 每次驱动 + 替身放招前：攻击力系数 = 伤害倍率 × （武器平衡系数，没有就按影之武装），写进替身
 function LO.rescale(pup, tn)
     LO.atkDm = NET.dmgNow()
+    local edge = ST.pupEdgeAt and tn - ST.pupEdgeAt < LO.EDGE_HOLD
     local f, why = BAL.now(tn)
     if f then LO.atkScale, LO.scaleWhy = NET.atkScale(false) * f, why
-    else LO.atkScale, LO.scaleWhy = NET.atkScale(ST.pupEdgeAt and tn - ST.pupEdgeAt < LO.EDGE_HOLD), nil end
+    else LO.atkScale, LO.scaleWhy = NET.atkScale(edge), nil end
+    -- §144 标准数值：再乘 30 级倍率 ÷ 本机倍率；§148 普通房间：乘 对方那把的倍率 ÷ 本机倍率（本机倍率见 STD.localMult）
+    local lf, lwhy = STD.levelScale(edge)
+    local lname = STD.active() and "标准数值" or "武器等级"
+    if lf ~= 1.0 then
+        LO.atkScale = LO.atkScale * lf
+        LO.scaleWhy = (LO.scaleWhy and (LO.scaleWhy .. "；") or "") .. string.format("%s %s ×%.2f", lname, lwhy or "", lf)
+    end
+    if lwhy and lwhy ~= LO.stdWhy then LO.stdWhy = lwhy; out("%s：替身等级系数 ×%.2f（%s）", lname, lf, lwhy) end
+    STD.tick(tn)
     LO.apply(pup, NET.ratt)
 end
 
@@ -879,13 +919,14 @@ end
 function LO.apply(pup, att)
     local names = LO.names(pup)
     if not (names and att and att ~= "") then return end
-    local attKey = pathOf(pup) .. "|" .. att
+    local attKey = pathOf(pup) .. "|" .. att .. (STD.active() and "|std" or "")
     local key = attKey .. "|" .. LO.atkScale
     local first = key ~= LO.appliedKey
     if not first and ST.ticks - (LO.appliedAt or 0) < 60 then return end
     local onlyScale = first and attKey == LO.appliedAttKey      -- 只是系数变了：日志短一点
     local vals = {}
     for n, v in att:gmatch("([%w_]+):([%-%d%.e+]+)") do vals[n] = tonumber(v) end
+    if STD.active() then vals.Attack, vals.ShachiAttack = STD.ATTR.Attack, STD.ATTR.ShachiAttack end   -- §144 攻击用基准
     local nSet, changed = 0, {}
     for _, n in ipairs(names) do
         local want = (vals[n] or LO.neutral(n)) * (LO.SCALED[n] and LO.atkScale or 1.0)
@@ -971,9 +1012,10 @@ end
 -- v0.23.0：武器组件 / 影之武装 / 技能路径表 / 给技能 / GE 这几个 LO 函数搬到 pbz_game.lua（游戏适配层）
 LO.slot, LO.slotShachi, LO.heldConfig, LO.armed, LO.config = G.LO.slot, G.LO.slotShachi, G.LO.heldConfig, G.LO.armed, G.LO.config
 LO.index, LO.give, LO.geClass, LO.applyGE, LO.uiCompOf = G.LO.index, G.LO.give, G.LO.geClass, G.LO.applyGE, G.LO.uiCompOf
+LO.setSlot, LO.curIndex = G.LO.setSlot, G.LO.curIndex      -- §144 方案 A+
 LO.outfitOf, LO.applyOutfit, LO.appcProbe, LO.outfitOk = G.LO.outfitOf, G.LO.applyOutfit, G.LO.appcProbe, G.LO.outfitOk
 LO.removeGE, LO.weaponEffects, LO.wgePath = G.LO.removeGE, G.LO.weaponEffects, G.LO.wgePath      -- §118 武器效果同步
-LO.activeInstance, LO.funcsLike, LO.callNoArg = G.LO.activeInstance, G.LO.funcsLike, G.LO.callNoArg  -- §119 紫冥剑实验
+LO.activeInstance, LO.funcsLike, LO.callNoArg, LO.callArgs = G.LO.activeInstance, G.LO.funcsLike, G.LO.callNoArg, G.LO.callArgs  -- §119 紫冥剑实验 / §139.4
 LO.propsLike, LO.targetingComp, LO.tcSetLock = G.LO.propsLike, G.LO.targetingComp, G.LO.tcSetLock
 LO.paramTypes, LO.lockCandidates, LO.paramList, LO.tcStop = G.LO.paramTypes, G.LO.lockCandidates, G.LO.paramList, G.LO.tcStop
 LO.spawnFx, LO.fxOn = G.LO.spawnFx, G.LO.fxOn
@@ -1178,7 +1220,8 @@ end
 
 function LO.syncPas(pup)
     if NET.rpas == nil then return end
-    local key = pathOf(pup) .. "|" .. NET.rpas
+    local std = STD.active()
+    local key = pathOf(pup) .. "|" .. NET.rpas .. (std and "|std" or "")
     if key == LO.pasKey then
         if LO.pasReportAt and ST.ticks >= LO.pasReportAt then
             LO.pasReportAt = nil
@@ -1193,6 +1236,7 @@ function LO.syncPas(pup)
     LO.pasKey, LO.pasReportAt = key, ST.ticks + 60
     local want = {}
     for n in NET.rpas:gmatch("[%w_]+") do want[n] = true end
+    if std then for _, n in ipairs(STD.TALENT_GA) do want[n] = true end end      -- §144 天赋按基准（饰品照对方的）
     local asc = ascOf(pup)
     if not valid(asc) then return end
     local have, cleared = {}, {}
@@ -1251,7 +1295,7 @@ end
 -- （17:23:27 dump）。现在照破防同步的做法：挨打方把自己**正在播的受击动作名**发过来，攻击方用 playNamed 在替身上播同一个
 function LO.isHitMontage(m)
     if not m or m == "" then return false end
-    for _, k in ipairs({ "_Hit_", "Knock", "Launch", "Lying", "GetUp", "Hitreact" }) do
+    for _, k in ipairs({ "_Hit_", "Knock", "Launch", "Lying", "GetUp", "Getup", "Hitreact" }) do   -- §143 马车撞飞后起身是 AM_Hun_Unarmed_Getup_F
         if m:find(k, 1, true) then return true end
     end
     return false
@@ -1505,6 +1549,15 @@ activateOnPuppet = function(pup, n, sub, how)
         okFire = fire(n)
         out("  补了武器升级之后 %s %s", n, okFire and "放出来了" or "还是放不出")
     end
+    -- §159 冲刺类（AdvancedDash / SpecialDash / StanceDash …）都受冲刺冷却 GE_DashCooldown（Dash.Cooldown 标签）挡：替身的上一下
+    -- 冲刺比对方晚到（延迟 / 补放），对方的下一下来时替身还在冷却。对方已经冲出来了 → 清掉替身的冷却再放一次
+    if not okFire and use:match("%u%l+Dash_") and LO.removeGE(pup, CHG.DASH_CD) then    -- 不含 A_Dash 这类冲刺后的攻击
+        okFire = fire(use)
+        if okFire then
+            ST.dashCd = (ST.dashCd or 0) + 1
+            if ST.dashCd <= 10 or ST.dashCd % 20 == 0 then out("  清掉冲刺冷却后 %s 放出来了（第 %d 次）", use, ST.dashCd) end
+        end
+    end
     -- v0.6.2 实测：替身没装备对应武器时同名技能激活恒为 false。武器同步（v0.7.1）之后这里基本不触发，
     -- 留作兜底：换成替身手上武器的同一招（同样的 A/AA/B... 后缀）
     if not okFire and not sub[n] then
@@ -1545,6 +1598,25 @@ activateOnPuppet = function(pup, n, sub, how)
             end
         end
     end
+    -- §157 切刀斩（*_SWT）和对方的 w= 同一个包到：替身换装每 8 帧才轮一次，这时手上还是上一把，SWT 放不出。
+    -- 先当场换装再放一次（11-08 双开实测：GA_Hun_Double_SWT_C 比"替身换装 → 绝影"早约 1 秒，放不出）
+    if not okFire and use:match("_SWT_C$") then
+        local p1 = getP1()
+        if valid(p1) and pcall(LO.dress, pup, p1) and fire(use) then
+            okFire = true
+            ST.dressForSwt = (ST.dressForSwt or 0) + 1
+            if ST.dressForSwt <= 10 then out("  切刀斩 %s 先换装再放，放出来了（第 %d 次）", use, ST.dressForSwt) end
+        end
+    end
+    -- §155 对方出了攻击招、替身却还收着刀（对方 arm= 还没跟上 / 从没拔过刀直接出招）：先拔刀再放一次
+    if not okFire and LO.armed(pup) == false then
+        local cwc = rawProp(pup, "Character Weapons Component")
+        if valid(cwc) and pcall(function() cwc:SetArmed(LO.slot(), true) end) and fire(use) then
+            okFire = true
+            ST.armForNew = (ST.armForNew or 0) + 1
+            if ST.armForNew <= 10 then out("  替身收着刀，拔刀后 %s 放出来了（第 %d 次）", use, ST.armForNew) end
+        end
+    end
     pupAction(use, how .. " 返回=" .. tostring(okFire))
     -- v0.23.4 放不出来时记下替身当时的状态（每招前 3 次），下一轮按这个找原因：手上武器、技能在不在、杀气、在放什么
     if not okFire then
@@ -1554,8 +1626,19 @@ activateOnPuppet = function(pup, n, sub, how)
         if ST.failN[use] <= 3 then
             local act = {}
             for a in pairs(activeAbilities(pup) or {}) do act[#act + 1] = a end
-            out("  !! 替身放不出 %s（第 %d 次）：手上武器 %s，替身有这个技能=%s，杀气 %s/%s，动作 %s，正在放 %s",
-                use, ST.failN[use], LO.short(LO.heldConfig(pup) or "?"), tostring(map[use] ~= nil),
+            -- §155 替身身上各武器族的招各有几个、武器组当前序号（查"主机这边替身有对方的武器、却没有这把武器的招"）
+            local fams, famList = {}, {}
+            for a in pairs(map) do
+                local f = a:match("^GA_Hun_(%w+)_[AB]")
+                if f then fams[f] = (fams[f] or 0) + 1 end
+            end
+            for f, c in pairs(fams) do famList[#famList + 1] = f .. "×" .. c end
+            local cwc, idx = rawProp(pup, "Character Weapons Component"), "?"
+            if valid(cwc) then pcall(function() idx = tostring(cwc:GetCurrentWeaponIndex(LO.slot(), false)) end) end
+            out("  替身技能按武器族：%s；武器组当前序号 %s；替身技能表 %d 个", table.concat(famList, " "), idx, (function() local k = 0; for _ in pairs(map) do k = k + 1 end; return k end)())
+            out("  !! 替身放不出 %s（第 %d 次）：手上武器 %s（对方 %s），拔刀 %s（对方 %s），替身有这个技能=%s，杀气 %s/%s，动作 %s，正在放 %s",
+                use, ST.failN[use], LO.short(LO.heldConfig(pup) or "?"), LO.short(NET.rwc or "?"), tostring(LO.armed(pup)),
+                tostring(NET.rarm), tostring(map[use] ~= nil),
                 tostring(attrOf(pup, "Shachi")), tostring(attrOf(pup, "Shachi_Max")), tostring(montageOf(pup)),
                 #act > 0 and table.concat(act, ",") or "无")
         end
@@ -1691,6 +1774,20 @@ end
 function NET.atkScale(edge)  -- 替身攻击力系数 = 伤害倍率 × 影之武装系数（v0.23.7）
     return NET.dmgNow() / 100 * (edge and LO.EDGE_SCALE or 1.0)
 end
+-- §147 中招日志带上替身当时的攻击力和系数（孤人 11-07 两边同一招差 4.5 倍，截图看不出是攻击力、系数还是防御）。
+-- 对方发来的 Attack = 替身 Attack ÷ 系数；"我"那一项是挨打方自己的攻击力，只用来对照两个号的成长
+function NET.pupAtkNote()
+    local pup, p1 = puppet(), getP1()
+    local a = valid(pup) and attrOf(pup, "Attack")
+    local s = valid(pup) and attrOf(pup, "ShachiAttack")
+    local m = valid(p1) and attrOf(p1, "Attack")
+    local ra = NET.ratt and (NET.ratt:match("^Attack:([%-%d%.e+]+)") or NET.ratt:match(";Attack:([%-%d%.e+]+)"))   -- 别撞上 ShachiAttack
+    return string.format("（替身 Attack %s / ShachiAttack %s，系数 ×%.0f%%%s；对方发来 Attack %s；我 Attack %s）",
+        type(a) == "number" and string.format("%.1f", a) or "?", type(s) == "number" and string.format("%.1f", s) or "?",
+        (LO.atkScale or 1) * 100, LO.scaleWhy and ("：" .. LO.scaleWhy) or "",
+        tostring(ra or "?"),
+        type(m) == "number" and string.format("%.1f", m) or "?")
+end
 -- §87 全部可格挡（房间设置，docs/PVP_RULES_DESIGN.md §2–§3）：0 关 / 1 开。同局数：主机定，客机按主机状态包里的 ab= 走
 -- （主机是旧版、没有 ab= → 关）；开局时定下 MATCH.ab，对局中改设置下一局生效。
 -- 存在 net/rules.txt 的 ab= 键：读写只认自己的键，别的键（伤害倍率 dm= 等）原样保留
@@ -1721,16 +1818,22 @@ end
 -- §108 med = 血瓶（喝药，默认开 = 原版；用户 2026-11-06"房间设置里可以做不能使用血瓶的功能么"）
 -- §128.2 npos = 对手位置严格跟随（开 = §128.1 全程跟网络位置、动画不带位移，默认；关 = 动画带位移 + §128 冲过头停住）。
 --   伤害在挨打方本机判、替身位置影响挨不挨打，所以两边要一致（用户 2026-11-06"改成房主设置吧"）；状态包键 npos=
-NET.FLAG_KEYS, NET.FLAG_DEF = { "ctr", "bal", "med", "npos" }, { ctr = 1, bal = 0, med = 1, npos = 1 }
-NET.flagCfg, NET.rflag = { ctr = 1, bal = 0, med = 1, npos = 1 }, {}
+-- §144 std = 标准数值（双方按基准存档的属性 / 天赋 / 30 级武器打，默认关；武林盟主服务器不发 std= 就是关）
+NET.FLAG_KEYS, NET.FLAG_DEF = { "ctr", "bal", "med", "npos", "std" }, { ctr = 1, bal = 0, med = 1, npos = 1, std = 0 }
+NET.flagCfg, NET.rflag = { ctr = 1, bal = 0, med = 1, npos = 1, std = 0 }, {}
+-- §144.1 锁住不让开的设置（用户 2026-11-07"完全平衡功能先锁定成不可打开"）：面板不显示、读到 1 也当关、发出去恒为 0
+-- §157.2 用户 11-08 解锁标准数值（§157 双开 6 项全过）。机制留着，要再锁哪项就往表里加
+NET.FLAG_LOCKED = {}
 NET.FLAG_WIRE = { med = "medok" }      -- 状态包里的键名和 rules.txt 不同的（med= 被 §103 喝药动作占了）
 NET.FLAG_NAME = { ctr = { "红蓝光反击", "RED/BLUE COUNTERS" }, bal = { "武器平衡", "WEAPON BALANCE" }, med = { "血瓶", "HEALING POTIONS" },
-                 npos = { "对手位置严格跟随（关 = 动画带位移）", "STRICT OPPONENT POSITION (OFF = ANIMATION-DRIVEN)" } }
+                 npos = { "对手位置严格跟随（关 = 动画带位移）", "STRICT OPPONENT POSITION (OFF = ANIMATION-DRIVEN)" },
+                 std = { "标准数值（不计各自养成）", "STANDARD STATS (IGNORE PROGRESSION)" } }
 function NET.flagLoad()
     local t = fileReadKV(NET.AB_FILE) or {}
     for _, k in ipairs(NET.FLAG_KEYS) do
         local n = tonumber(t[k])
         if n == 0 or n == 1 then NET.flagCfg[k] = n end
+        if NET.FLAG_LOCKED[k] then NET.flagCfg[k] = 0 end
     end
 end
 function NET.flagSet(k, n)
@@ -1743,8 +1846,10 @@ function NET.flagSet(k, n)
     fileWrite(NET.AB_FILE, table.concat(lines, "\n") .. "\n")
 end
 function NET.flag(k)         -- 房间设置：主机 / 没联机 = 自己的，客机 = 主机的
+    if NET.FLAG_LOCKED[k] then return false end     -- §144.1 锁住的：谁设成开都当关（包括旧版主机发来的 std=1）
     local rk = NET.rkRules()                 -- §110 武林盟主：服务器定的
     if rk and rk[k] ~= nil then return rk[k] == 1 end
+    if rk and k == "std" then return false end      -- §144 排位：服务器没定标准数值就是关，不跟主机
     if (MATCH.session and MATCH.session.role) == "client" then
         local r = NET.rflag[k]
         if r == nil then r = NET.FLAG_DEF[k] end
@@ -1938,6 +2043,770 @@ function NET.attrDiffLog(p1)
         out("  %s%s  你 %.3f(%.3f)  替身 %.3f(%.3f)", x.def and "★ " or "", x[1], x[2], x[4] or 0, x[3], x[5] or 0)
     end
 end
+
+-- §144 标准数值模式（房间设置"标准数值"，用户 2026-11-07"不计双方各自成长，都用同一套完整角色的数值""直接拿我存档的数据作为基准"
+-- "需要调整平衡的时候再从这个基础上调整不同武器 / 招式的伤害"）。基准 = 用户 11-07 的存档（tools/stat_probe/README.md 两次实测）：
+--   属性：血 3086（基础 850 + 三种记忆之花）、攻击 / 杀气攻击 200（+ 杀气核心）、杀气上限 800、状态积累上限 3630、
+--         精纯杀气格数上限 3 / 暗源上限 6（天赋）
+--   天赋：没开轮回的全满 = 下面 24 个 GE_Talent_* + 天赋树的加药次数 / 大招不清零（饰品槽那 4 个不给，配装用各自的）
+--   武器 / 影之武装：全 30 级、轮回 0。等级是伤害倍率 AttackMultipliers = 1 + 0.1 ×（等级 − 1），30 级 3.9
+-- 做法（用户选"替身乘系数"，不碰存档）：
+--   · 自己：开局把上面的属性写成基准（走 §113 的改属性函数），缺的天赋 GE 临时挂上；结束还原、挂上的摘掉；
+--     对局期间进游戏自带的"否决存档"（EnterSaveVeto），结束退出——临时改的东西不会被自动存档写进硬盘
+--   · 替身：攻击 / 杀气攻击用基准 200（对方包里的 att= 别的项照用，饰品效果是各自的）；伤害在挨打方本机按本机存档里那把武器的
+--     等级算（推测，待低等级存档实测），所以替身攻击力再乘 3.9 ÷ 本机那把的倍率，本机 30 级就是 ×1；天赋按基准补齐
+--   · 只用自己存档里有的装备（规则 2）；饰品精炼等级暂不统一（"未强化"待做）
+STD = {
+    ATTR = { Health_Max = 3086, Infliction_Max = 3630, Attack = 200, ShachiAttack = 200, Shachi_Max = 800,
+             UltimateChargeCount_Max = 3, SpiritShadow_Max = 6 },
+    ORDER = { "Health_Max", "Infliction_Max", "Shachi_Max", "Attack", "ShachiAttack", "UltimateChargeCount_Max", "SpiritShadow_Max" },
+    LEVEL = 30,
+    TALENT_GE = { "DecreaseStanceShachiCost", "DecreaseSwitchWeaponCooldown", "DecreaseSwitchWeaponCooldown_2", "EnableDashDuringLightAttack",
+                  "EnableDashEscapeWhenBroken", "EnableDashEscapeWhenBroken_GrantGA", "EnableDrawAttack", "EnableExecutionRecoverBullet",
+                  "EnableExecutionRecoverHealthAndShachi", "EnableIntoSuperSprint", "EnableNotConsumeBullet", "EnableOffset",
+                  "EnablePerfectDeflectRecoveryShachi", "EnableRecoveryMedicine", "EnableShachiAttachWhenNotEnoughShachi", "EnableSkipJump",
+                  "EnableTenacity", "EnableUseMedicineWhenHit", "IncreaseShachiWeaponMaxCount", "IncreaseShachiWeaponMaxCount_2",
+                  "IncreaseUltimateCharge", "IncreaseUltimateCharge_2", "ShachiWeaponExecution", "UltimateInvulnerable" },
+    TALENT_DIR = "/PBZCombatAsset/Prototypes/GameplayEffects/Talent/",
+    TREE_GE = { "GE_AddMedcineTime", "GE_NoClearUltimateChrage" },
+    TREE_DIR = "/Game/PBZContent/Blueprint/Ability/GameplayEffects/AbilityTree/",
+    TALENT_GA = { "GA_Talent_EnableIntoSuperSprint_C", "GA_Talent_EnableTenacity_C", "GA_Talent_PerfectDeflectRecoveryShachi_C" },
+    -- 武器配置所在的文件夹 → 存档里的武器 ID（DT_WeaponData / DT_ShaqiWeaponData 引用的配置路径对存档的 25 / 24 个 ID）
+    WEAPON = { Tang = "Tang", HeiMoShang = "Tang", Long = "Long", Double = "Double", WoodenSword = "WoodenSwordHun", Iron = "IronBlade",
+               GuiTouBlade = "GuiTouBlade", ChiZheCanJian = "ChiZheCanJian", ZhanMaBlade = "ZhanMaBlade", SnakeDual = "SnakeDual",
+               BronzeSword = "RenOuQingTongJian", YuuBlade = "YuuBlade", LuanYing = "LuanYing", PoJun = "PoJun", DualHook = "DualHook",
+               ShuangYue = "TianShaShuangYue", SlitheringSword = "SlitheringSword", BaiShanFengLeiJian = "BaiShanShuangJian",
+               Horizontal = "HorizontalBlade", JadeDualChakram = "JadeDualChakram", BaiYing = "BaiYing", YanYueDao = "RenOuYanYueDao",
+               ChaosBlade = "CiGuHunDun", Jigsaw = "Jigsaw", XieShan = "FangHuaXieShan", ZiMingJian = "ZiMingJian" },
+    SHACHI = { BrutalAxe = "BrutalAxe", CaoOuSiXian = "CaoOuSiXian", DuYanBow = "DuYanGong", HuangJinHuoChong = "HuangJinHuoChong",
+               HuoLiuXing = "HuoLiuXing", JianKeZhaoJiLing = "JianKeZhaoJiLing", JinGua = "JinGua", KuYeSiZhuChuan = "KuYeSiZhuChuan",
+               LionHead = "LionHead", Lute = "CuiXinPiPa", MiaoShouFeiDao = "MiaoShouFeiDao", Mojian = "MoJian", NiTouChe = "NiTouche",
+               ShachiHook = "ShachiHook", TanLang = "TanLang", ThunderSpear = "ThunderSpear", TieKuangQuanTao = "TieGongZhuQuanTao",
+               TigerCannon = "TigerCannon", UnnamedBow = "UnnamedBow", XuKongHuaShan = "XuKongHuaShan", XueDiZi = "XueDiZi",
+               YouLongCha = "YouLongCha", YouLongHead = "YouLongTou", ZhuoBiDun = "ZhuoBiDun" },
+    VETO_ID = "PBZ_MP_StandardStats",
+    lv = {},            -- 本机等级缓存：(w|s):武器 ID → 等级 / false（每场开局清）
+    saved = nil,        -- 对局前的属性（属性名 → 值）；nil = 这场还没开始改
+    added = nil,        -- 这场给自己挂上的天赋 GE 路径
+    pupAdded = {},      -- 替身路径 → 给它挂上的（替身换了自然重新补）
+    veto = false,
+    enforceAt = -100,
+    forced = nil,       -- 我们正套着临时强制配装的武器 ID（nil = 没套）
+    forceTried = nil,   -- 这把已经判断过（不用套 / 套不上），换武器前不再试
+    cleaned = false,    -- 进游戏后清过残留没有
+    -- 主武器临时强制配装的总开关。11-07 20:08 二周目实测：强制配装会把武器组第二把、影之武装、饰品**全部卸掉**（只剩那一把）→ main 上关着。
+    -- exp/std-loadout（方案 B，20:27 实测通过）：套完用游戏的临时整套配装快照把两把武器 / 两件影武装回去、逐格装回饰品。
+    -- 11-08 01:1x 实测：对局中切武器重新套会"切过去又被拉回来"、而且强制配装同时只能一把 → 改走方案 A+（STD.gearOn），这里关掉，代码留着
+    USE_FORCE = false,
+    gearSlots = nil,    -- 方案 A+ 换过配置的格子 { { slot, idx, base, cfg, id, label }, … }；nil = 这场还没换
+    gearMine = nil,     -- 方案 A+ 我们正挂着的 30 级效果（类路径 → true）；nil = 这场还没开始
+    gearKey = nil,      -- 上次按哪把武器 / 哪件影武挂的（"主|影"）
+    gearFix = 0,        -- 对局中发现配置被换回去、重新换的次数（到 GEAR_FIX_MAX 不再换）
+    GEAR_FIX_MAX = 6,
+    pushed = false,     -- 套强制配装后 Push 过配装快照（还原时先 Pop）
+    FORCE_EVERY = 0.3,  -- 对局中多久看一次手上的武器（换了就换套）
+    forceAt = -100,
+    -- 21:06 实测死循环（套 Tang、Push 后读到手上是 Double → 当成切武器 → 套 Double → 读到 Tang …每 0.5 秒一次，30 秒后崩溃）：
+    SETTLE = 3.0,       -- 换套后这么多秒内不认"切武器"
+    settleUntil = -100,
+    seen = nil,         -- 防抖：上一次读到的"新"武器（连续两次读到同一把才算切了）
+    GUARD_N = 4,        -- GUARD_SEC 秒内换套到 GUARD_N 次 → 本场停用强制配装
+    GUARD_SEC = 20.0,
+    forceTimes = {},
+    disabled = false,   -- 本场停用了（STD.restore 清）
+    -- 正式能拿到的 66 件饰品（catalog 去掉 7 件残留）：游戏没有"读装了哪些"的函数，逐个问 IsEquipAccessory
+    ACCESSORIES = { "AC_ActHit", "AC_AnimMovement", "AC_Attack", "AC_BigHit", "AC_Bleed", "AC_BreakAttack", "AC_BreakDrink",
+                    "AC_BreakRecover", "AC_BreakRegen", "AC_BreakShield", "AC_Chaos", "AC_Combo", "AC_Control", "AC_Counter", "AC_Deflect",
+                    "AC_Double", "AC_Drink", "AC_DrinkCost", "AC_Electrified", "AC_ElementRegen", "AC_Elemental", "AC_EvadePhantom",
+                    "AC_Execution", "AC_ExecutionSwitchCool", "AC_Frost", "AC_Health", "AC_HealthResistance", "AC_HeavyAttackCost",
+                    "AC_HeavyAttackDamage", "AC_HeavyAttackShachi", "AC_Ignite", "AC_Long", "AC_Loot", "AC_LowHealth", "AC_LowShachi",
+                    "AC_MagicWeapon", "AC_MartialWeapon", "AC_PerfectFrame", "AC_Poison", "AC_PoisonRegen", "AC_PowerWeapon",
+                    "AC_RandomDrink", "AC_Ranged", "AC_RangedWeapon", "AC_ResistBleed", "AC_ResistFire", "AC_ResistIce",
+                    "AC_ResistNonBreak", "AC_ResistPoison", "AC_ResistRanged", "AC_ResistThunder", "AC_Rider", "AC_Shachi",
+                    "AC_ShachiAttack", "AC_ShachiCool", "AC_ShachiRegen", "AC_ShachiWeapon", "AC_SpiritShadow", "AC_Stance", "AC_Stealth",
+                    "AC_SummonDuration", "AC_SwitchEndure", "AC_Tang", "AC_TimerEndure", "AC_UltimateBreak", "AC_UltimateCharge" },
+}
+STD.FORCE_FILE = NET_DIR .. "/std_forced.txt"   -- 账本：套着时写武器 ID，还原后删；进游戏时据此清残留（只清我们留下的）
+function STD.mult(lv) return (lv and lv > 1) and (1 + 0.1 * (lv - 1)) or 1.0 end
+function STD.active() return NET.flagNow("std") end
+function STD.talentPath(n) return STD.TALENT_DIR .. "GE_Talent_" .. n .. ".GE_Talent_" .. n .. "_C" end
+function STD.treePath(n) return STD.TREE_DIR .. n .. "." .. n .. "_C" end
+-- 武器配置路径 → 存档 ID, 是不是影之武装。文件夹名不分大小写（游戏包里是 JigSaw / MoJian，表里是 Jigsaw / Mojian）
+function STD.idOf(path)
+    if not path then return nil end
+    if not STD.lowerMap then
+        STD.lowerMap = { w = {}, s = {} }
+        for k, v in pairs(STD.WEAPON) do STD.lowerMap.w[k:lower()] = v end
+        for k, v in pairs(STD.SHACHI) do STD.lowerMap.s[k:lower()] = v end
+    end
+    local f = path:match("/Hun/Weapon/([%w_]+)/")
+    if f then return STD.WEAPON[f] or STD.lowerMap.w[f:lower()], false end
+    f = path:match("/Hun/ShaqiWeapon/([%w_]+)/")
+    if f then return STD.SHACHI[f] or STD.lowerMap.s[f:lower()], true end
+    return nil
+end
+-- 本机存档里这把的等级（缓存）；读不到 = nil
+function STD.localLevel(id, shachi)
+    local k = (shachi and "s:" or "w:") .. id
+    if STD.lv[k] == nil then
+        local lv, err = G.weaponLevel(id, not shachi)
+        STD.lv[k] = lv or false
+        out("武器等级：本机%s %s 的等级 %s", shachi and "影之武装" or "武器", id, lv and tostring(lv) or ("读不到（" .. tostring(err) .. "）"))
+    end
+    return STD.lv[k] or nil
+end
+-- 本机存档里这把铸魂过没有（缓存）；读不到 = false
+function STD.localSnapped(id, shachi)
+    local k = (shachi and "S:" or "W:") .. id
+    if STD.lv[k] == nil then STD.lv[k] = G.weaponSnapped(id, not shachi) == true end
+    return STD.lv[k]
+end
+-- §148 替身打我时游戏乘的等级倍率（11-08 08:1x–08:27 假对手实测，固定攻击 100、标准数值 / 武器平衡关；HANDOVER §148）：
+-- 替身那把**装在我的武器槽里** → 我存档里那把的 1 + 0.1 ×（等级 − 1），铸魂不影响（二周目装着的长形黑伤 30 级铸魂 −312 = 80 × 3.9）；
+-- 没装 / 没有 → ×1（二周目没装的木剑 30 级、黑伤 30 级都是 ×1；新档把 3 级黑伤卸下后 −96 → −80）。
+-- 以前"铸魂过 = ×1"是把"没装着"误认成了铸魂（§146.3 作废）
+STD.EQUIP_SEC = 2.0
+STD.eq = { at = -100 }
+-- 我现在装着的主武器 / 影之武装（背包的装备列表，存档 ID；每 EQUIP_SEC 秒最多读一次）。读不到 = nil
+function STD.equipped(id, shachi)
+    local tn = os.clock()
+    if tn - STD.eq.at >= STD.EQUIP_SEC then
+        local mains, shaqis = G.loadoutLists()
+        local function toSet(list)
+            if not list then return nil end
+            local s = {}
+            for _, x in ipairs(list) do s[x:lower()] = true end
+            return s
+        end
+        STD.eq = { at = tn, w = toSet(mains), s = toSet(shaqis) }
+    end
+    local s = shachi and STD.eq.s or STD.eq.w
+    if not s then return nil end
+    return s[id:lower()] == true
+end
+function STD.localMult(id, shachi)
+    local lv = STD.localLevel(id, shachi)
+    if not lv then return nil, "本机等级读不到" end
+    if lv < 1 then return 1.0, "本机没有这把" end
+    local eq = STD.equipped(id, shachi)
+    if eq == false then return 1.0, string.format("本机 %d 级、没装着", lv) end
+    return STD.mult(lv), string.format("本机 %d 级%s", lv, eq == nil and "（装备列表读不到，按装着算）" or "、装着")
+end
+-- 标准数值的基准 = 30 级装着（×3.9）
+STD.TARGET_MULT = STD.mult(STD.LEVEL)
+-- 替身这一招的等级系数：目标倍率 ÷ 本机倍率。返回 系数, 说明（认不出 / 读不到 → 1；普通房间对方没发等级 → 1, nil）
+-- 目标：标准数值 = 30 级；§148 普通房间 = 对方那把的倍率（状态包 wlv=，对方手上那把一定装着）
+function STD.levelScale(edge)
+    local std = STD.active()
+    local rlv = edge and NET.rlvS or NET.rlvW
+    if not std and not rlv then return 1.0, nil end
+    local path = edge and NET.rwcs or NET.rwc
+    local id, shachi = STD.idOf(path)
+    if not id then return 1.0, "认不出武器 " .. tostring(path) end
+    local m, why = STD.localMult(id, shachi)
+    if not m then return 1.0, id .. " " .. why end
+    if std then return STD.TARGET_MULT / m, id .. " " .. why end
+    return STD.mult(rlv) / m, string.format("%s 对方 %d 级 / %s", id, rlv, why)
+end
+-- §148 发给对方：我手上武器 / 当前影之武装在我存档里的等级，wlv=<武器>:<影之武装>（认不出 / 读不到 = -）
+function STD.wireLv()
+    local function one(path)
+        local id, shachi = STD.idOf(path)
+        local lv = id and STD.localLevel(id, shachi)
+        return lv and tostring(lv) or "-"
+    end
+    return one(NET.wcStr) .. ":" .. one(NET.wcsStr)
+end
+-- 角色缺的基准天赋 GE 挂上，返回挂上的路径表
+function STD.addTalents(actor, label)
+    local have = G.geSet(actor)
+    if not have then out("!! 标准数值：读不到%s身上的效果，天赋不补", label); return {} end
+    local added = {}
+    local function one(short, path)
+        if not have[short] then
+            LO.applyGE(actor, path, "标准数值：给" .. label .. "补天赋 " .. short)
+            added[#added + 1] = path
+        end
+    end
+    for _, n in ipairs(STD.TALENT_GE) do one("GE_Talent_" .. n, STD.talentPath(n)) end
+    for _, n in ipairs(STD.TREE_GE) do one(n, STD.treePath(n)) end
+    out("标准数值：%s天赋补了 %d 个（基准 %d 个）", label, #added, #STD.TALENT_GE + #STD.TREE_GE)
+    return added
+end
+-- 自己的属性写成基准（第一次碰到的属性记下对局前的值）；health = true 时顺手回满血（回合开始）
+function STD.writeAttrs(p1, health)
+    local parts = {}
+    for _, a in ipairs(STD.ORDER) do
+        local want, c = STD.ATTR[a], attrOf(p1, a)
+        if c then
+            if STD.saved and STD.saved[a] == nil then STD.saved[a] = c end
+            if math.abs(c - want) > 0.01 then
+                NET.resWrite(p1, a, want)
+                parts[#parts + 1] = string.format("%s %.0f→%.0f（读回 %s）", a, c, want, tostring(attrOf(p1, a)))
+            end
+        end
+    end
+    if health then
+        local hm = attrOf(p1, "Health_Max")
+        if hm and (attrOf(p1, "Health") or 0) < hm - 0.5 then NET.resWrite(p1, "Health", hm) end
+    end
+    return parts
+end
+-- 主武器临时 30 级 + 铸魂：走游戏自带的临时强制配装（HANDOVER §144 18:1x 实测：等级 / 铸魂 / 升级解锁的招和效果都由游戏处理，
+-- Restore 干净还原；只认背包里有的；存档会写进去但带 ForcedLoadoutActive / OrigLevel 标记，读回后 Restore 照样能还原）。
+-- 手上那把已经 30 级、铸魂过 → 不套（满级玩家什么都不变）；游戏自己正在强制配装（剧情）→ 不套、不碰
+function STD.force(p1, tn)
+    if not STD.USE_FORCE or STD.disabled then return end
+    local id = STD.idOf(LO.heldConfig(p1))
+    if tn and STD.verify then                          -- Push 后的确认（见上）
+        local v = STD.verify
+        if tn < v.at then return end
+        if id == v.id then
+            out("标准数值：确认手上是 %s（Push 主序号 %d）", id, v.mi)
+            STD.verify = nil
+        elseif not v.retried and #v.mains > 1 then
+            local mi2 = (v.mi == 0) and 1 or 0
+            out("!! 标准数值：Push(主序号 %d) 后手上是 %s（要的是 %s），改用序号 %d 再 Push", v.mi, id, v.id, mi2)
+            G.loadoutPop()
+            local okP = G.loadoutPush(v.mains, v.shaqis, mi2, v.si)
+            STD.pushed = okP and G.loadoutSnapshot() == true
+            v.mi, v.retried, v.at = mi2, true, tn + 0.6
+            STD.settleUntil = tn + STD.SETTLE
+        else
+            STD.disabled, STD.verify = true, nil
+            out("!! 标准数值：两个序号 Push 后手上都不是 %s（是 %s），本场停用强制配装", v.id, id)
+            STD.unforce("Push 对不上")
+        end
+        return
+    end
+    if not id or id == STD.forced or id == STD.forceTried then STD.seen = nil; return end
+    if tn then                                         -- 对局中（STD.tick 来的）：防抖 + 换套后静默
+        if tn < STD.settleUntil then return end
+        if STD.seen ~= id then STD.seen = id; return end    -- 第一次读到：等下一次还是它再换
+        STD.seen = nil
+        local recent = {}
+        for _, t in ipairs(STD.forceTimes) do if tn - t < STD.GUARD_SEC then recent[#recent + 1] = t end end
+        STD.forceTimes = recent
+        if #recent >= STD.GUARD_N then
+            STD.disabled = true
+            out("!! 标准数值：%d 秒内换套 %d 次，本场停用强制配装（还原，伤害只靠替身乘系数）", STD.GUARD_SEC, #recent)
+            STD.unforce("换套太频繁")
+            return
+        end
+        STD.forceTimes[#STD.forceTimes + 1] = tn
+    end
+    local sid = STD.idOf(LO.heldConfig(p1, LO.slotShachi()))     -- 手上的影之武装（Push 时让它还是当前那件）
+    if STD.forced then STD.unforce("换武器 → " .. id) end      -- 先回到原配装（Restore 后手上可能变回原来那把，id 已经记下）
+    STD.forceTried = id
+    local lv = G.weaponLevel(id, true)
+    if not lv or lv < 1 then out("标准数值：手上的 %s 本机等级读不到 / 没有（%s），不套强制配装", id, tostring(lv)); return end
+    local snapped = G.weaponSnapped(id, true)
+    if lv >= STD.LEVEL and snapped ~= false then out("标准数值：手上的 %s 已是 %d 级、铸魂 %s，不用套", id, lv, tostring(snapped)); return end
+    if G.forcedActive() then out("!! 标准数值：游戏自己正在强制配装中（剧情？），不套"); return end
+    -- 原配装：主武器 / 影武列表就是游戏里的格子顺序；饰品按清单顺序装回 0.. 格
+    local mains, shaqis = G.loadoutLists()
+    if not (mains and #mains > 0) then out("!! 标准数值：读不到当前配装，不套强制配装（会卸掉配装）"); return end
+    shaqis = shaqis or {}
+    local accs = G.accEquipped(STD.ACCESSORIES) or {}
+    local mi, si = 0, 0
+    for i, w in ipairs(mains) do if w == id then mi = i - 1 end end
+    for i, w in ipairs(shaqis) do if w == sid then si = i - 1 end end
+    local ok, err = G.forcedApply(id, STD.LEVEL, true)
+    local after = G.weaponLevel(id, true)
+    if not (ok and after == STD.LEVEL) then
+        out("!! 标准数值：%s 强制配装没生效（调用 %s %s，之后等级 %s）", id, tostring(ok), tostring(err or ""), tostring(after))
+        return
+    end
+    STD.forced, STD.lv = id, {}       -- 本机等级变了：替身等级系数的缓存作废
+    fileWrite(STD.FORCE_FILE, id .. "\n")
+    local okP, errP = G.loadoutPush(mains, shaqis, mi, si)
+    STD.pushed = okP and G.loadoutSnapshot() == true
+    -- 0.6 秒后在 STD.tick 里确认手上是不是这把（游戏切武器要几帧；21:06 死循环就是 Push 后手上不是要的那把）
+    STD.verify = { at = (STD.lastTn or 0) + 0.6, id = id, mains = mains, shaqis = shaqis, mi = mi, si = si, retried = false }
+    STD.settleUntil = (STD.lastTn or 0) + STD.SETTLE
+    local nAcc = 0
+    for i, a in ipairs(accs) do if G.accAssemble(a, i - 1) then nAcc = nAcc + 1 end end
+    STD.countLog("套上 " .. id)
+    out("标准数值：%s 临时强制配装 %d → %d 级、铸魂（原铸魂 %s）；装回配装 主武器 [%s] 第 %d 把、影武 [%s] 第 %d 件 %s；饰品 %d / %d 件",
+        id, lv, STD.LEVEL, tostring(snapped), table.concat(mains, ","), mi + 1, table.concat(shaqis, ","), si + 1,
+        STD.pushed and "成功" or ("失败 " .. tostring(errP or "快照没开")), nAcc, #accs)
+end
+-- §144 方案 A+（11-08 02:1x–02:2x 新档实测）：不用强制配装，直接把自己装着的两把武器 / 两件影之武装的配置换成铸魂配置
+-- （LO.setSlot，替身换装同一个调用；背包、存档都不动，切武器后保留），再照二周目扫描的标准答案挂 30 级升级效果
+-- （pbz_stdgear.lua，tools/gen_stdgear.py 生成）。黑伤实测：铸魂配置后黑魔伤的招一个不缺、补 6 个效果后和标准答案一致。
+-- 伤害倍率不在这里（还是替身乘 STD.levelScale）。都是运行时的，崩溃 / 重进游戏后游戏按背包重建，不留东西
+do
+    local okG, T = pcall(require, "pbz_stdgear")
+    if not (okG and type(T) == "table") then okG, T = pcall(function() return dofile(ROOT .. "/Scripts/pbz_stdgear.lua") end) end
+    if okG and type(T) == "table" and T.MAIN and T.SHACHI then
+        STD.GEAR = T
+        local n, s = 0, 0
+        for _ in pairs(T.MAIN) do n = n + 1 end
+        for _ in pairs(T.SHACHI) do s = s + 1 end
+        out("标准数值装备表 pbz_stdgear.lua：主武器 %d、影之武装 %d、常驻效果 %d", n, s, #(T.COMMON or {}))
+    else
+        out("!! 标准数值：装备表 pbz_stdgear.lua 读不到（%s），只统一属性 / 天赋 / 伤害", tostring(T))
+    end
+end
+function STD.geShort(path) return path:match("/([%w_]+)%.[^/]*$") or path end
+-- 开局：装着的两把 / 两件换铸魂配置（一场只做一次；STD.gearOff 还原），再按手上那把挂 30 级效果（STD.gearSync）
+function STD.gearOn(p1)
+    if STD.gearMine or not STD.GEAR then return end
+    STD.gearSlots, STD.gearMine, STD.gearKey, STD.gearFix = {}, {}, nil, 0
+    local mains, shaqis = G.loadoutLists()
+    if not mains then out("!! 标准数值（装备）：读不到当前配装，不换配置") end
+    local function slots(ids, tbl, slot, label)
+        for i, id in ipairs(ids or {}) do
+            local g = tbl[id]
+            if not g then
+                out("标准数值（装备）：%s %s 不在装备表里，不补", label, id)
+            elseif g.base then
+                -- 存档里已经铸魂的：游戏给的本来就是铸魂配置，不换（不然结束时"换回原配置"会把炽刃换成长形黑伤）；读不到当没铸魂
+                if G.weaponSnapped(id, slot == LO.slot()) then
+                    out("标准数值（装备）：%s第 %d 格 %s 存档里已铸魂，不换配置", label, i, id)
+                else
+                    local ok, err = LO.setSlot(p1, slot, i - 1, g.cfg)
+                    out("标准数值（装备）：%s第 %d 格 %s 换成铸魂配置 %s：%s", label, i, id, LO.short(g.cfg), ok and "成功" or ("失败 " .. tostring(err)))
+                    if ok then
+                        STD.gearSlots[#STD.gearSlots + 1] = { slot = slot, idx = i - 1, base = g.base, cfg = g.cfg, id = id, label = label }
+                    end
+                end
+            end
+        end
+    end
+    slots(mains, STD.GEAR.MAIN, LO.slot(), "主武器")
+    slots(shaqis, STD.GEAR.SHACHI, LO.slotShachi(), "影之武装")
+    STD.gearSync(p1)
+end
+-- 30 级效果跟着手上那把武器 / 那件影之武装走（11-08 02:48 二周目实测：满级存档里没拿在手上的炽刃 / 贪狼的升级效果也不在身上，
+-- 游戏是切到哪把挂哪把的）：要的 = 常驻 + 手上主武器的 + 手上影武的；我们挂过、现在不要的摘掉，身上已有的（游戏自己按存档挂的）不挂。
+-- 只动我们自己挂的；挂 / 摘效果不新建武器对象。手上那把没变就什么都不做（对局中 STD.tick 每 0.3 秒调）
+function STD.gearSync(p1)
+    if not (STD.gearMine and STD.GEAR) then return end
+    local mid = STD.idOf(LO.heldConfig(p1))
+    local sid = STD.idOf(LO.heldConfig(p1, LO.slotShachi()))
+    local key = tostring(mid) .. "|" .. tostring(sid)
+    if key == STD.gearKey then return end
+    local have = G.geSet(p1)
+    if not have then return end                   -- 读不到身上的效果：下次再试
+    STD.gearKey = key
+    local want, order = {}, {}
+    local function addGE(list)
+        for _, e in ipairs(list or {}) do
+            if not want[e[1]] then order[#order + 1] = e[1] end
+            if not want[e[1]] or want[e[1]] < e[2] then want[e[1]] = e[2] end
+        end
+    end
+    addGE(STD.GEAR.COMMON)
+    addGE(mid and STD.GEAR.MAIN[mid] and STD.GEAR.MAIN[mid].ge)
+    addGE(sid and STD.GEAR.SHACHI[sid] and STD.GEAR.SHACHI[sid].ge)
+    local nDel, nAdd, skip = 0, 0, 0
+    for path in pairs(STD.gearMine) do
+        if not want[path] then
+            LO.removeGE(p1, path, "标准数值：摘掉 30 级效果 " .. STD.geShort(path))
+            STD.gearMine[path] = nil
+            nDel = nDel + 1
+        end
+    end
+    for _, path in ipairs(order) do
+        if not STD.gearMine[path] then
+            local short = STD.geShort(path)
+            if have[short] then
+                skip = skip + 1
+            elseif LO.applyGE(p1, path, "标准数值：挂 30 级效果 " .. short, want[path]) then
+                STD.gearMine[path] = true
+                nAdd = nAdd + 1
+            end
+        end
+    end
+    out("标准数值（装备）：手上 %s / 影武 %s：挂 30 级效果 %d 个、摘 %d 个，本来就有 %d 个", tostring(mid), tostring(sid), nAdd, nDel, skip)
+end
+-- 对局中（STD.tick 每 2 秒）：手上那格的配置被游戏换回原配置了就再换一次（11-08 实测切武器不会换回，这里是保险）
+function STD.gearCheck(p1)
+    if not STD.gearSlots or STD.gearFix >= STD.GEAR_FIX_MAX then return end
+    for _, s in ipairs(STD.gearSlots) do
+        if LO.curIndex(p1, s.slot) == s.idx and LO.heldConfig(p1, s.slot) == s.base then
+            STD.gearFix = STD.gearFix + 1
+            local ok, err = LO.setSlot(p1, s.slot, s.idx, s.cfg)
+            out("!! 标准数值（装备）：%s %s 被换回原配置，重新换成铸魂配置 %s（第 %d 次%s）", s.label, s.id, ok and "成功" or ("失败 " .. tostring(err)),
+                STD.gearFix, STD.gearFix >= STD.GEAR_FIX_MAX and "，本场不再换" or "")
+        end
+    end
+end
+-- 结束：摘掉挂上的效果、换回原配置
+function STD.gearOff(p1)
+    if not STD.gearMine then return end
+    local slots, mine = STD.gearSlots or {}, STD.gearMine
+    STD.gearSlots, STD.gearMine, STD.gearKey = nil, nil, nil   -- 角色没了（切图）也不留状态：游戏按背包重建，不用还原；下面的调用自己 pcall
+    local n = 0
+    for path in pairs(mine) do LO.removeGE(p1, path, "标准数值：摘掉 30 级效果 " .. STD.geShort(path)); n = n + 1 end
+    local bad = 0
+    for i = #slots, 1, -1 do
+        local s = slots[i]
+        local ok, err = LO.setSlot(p1, s.slot, s.idx, s.base)
+        if not ok then bad = bad + 1; out("!! 标准数值（装备）：%s %s 换回原配置失败 %s", s.label, s.id, tostring(err)) end
+    end
+    out("标准数值（装备）：摘掉 30 级效果 %d 个，换回原配置 %d 格%s", n, #slots, bad > 0 and ("（失败 " .. bad .. " 格）") or "")
+end
+-- 诊断：换套前后的 Actor / ActorComponent 数（和上一次比），看新建的武器对象会不会被回收（21:07 崩溃 = UObject 撑满）
+function STD.countLog(tag)
+    local a, c = G.objCounts()
+    local p = STD.lastCount
+    out("标准数值·对象计数（%s）：Actor %d（%+d）、ActorComponent %d（%+d）；本场第 %d 次换套", tag, a, a - (p and p[1] or a),
+        c, c - (p and p[2] or c), #STD.forceTimes + 1)
+    STD.lastCount = { a, c }
+end
+function STD.unforce(why)
+    if not STD.forced then return end
+    local id = STD.forced
+    if STD.pushed or G.loadoutSnapshot() then         -- 先 Pop 配装快照，再 Restore 强制配装（20:32 实测这个顺序干净）
+        local okP, errP = G.loadoutPop()
+        if not okP then out("!! 标准数值：Pop 配装快照失败 %s", tostring(errP)) end
+    end
+    STD.pushed = false
+    local ok, err = G.forcedRestore()
+    out("标准数值：还原强制配装 %s（%s）：%s，之后等级 %s", id, why, ok and "成功" or ("失败 " .. tostring(err)), tostring(G.weaponLevel(id, true)))
+    STD.forced, STD.forceTried, STD.lv, STD.verify = nil, nil, {}, nil
+    os.remove(STD.FORCE_FILE)
+    STD.countLog("还原后")
+end
+-- 进游戏（有玩家角色）后调一次：账本还在 = 上次对局没走到还原（崩溃 / 强退 / 存档里带着），游戏仍在强制配装中就还原。
+-- 没有账本的强制配装是游戏自己的（剧情），不碰
+function STD.cleanup()
+    if STD.cleaned then return end
+    STD.cleaned = true
+    local f = io.open(STD.FORCE_FILE, "r")
+    if not f then return end
+    local id = (f:read("a") or ""):match("[%w_]+") or "?"
+    f:close()
+    if G.loadoutSnapshot() then G.loadoutPop() end     -- 方案 B 留下的配装快照
+    local act = G.forcedActive()
+    if act then
+        local ok, err = G.forcedRestore()
+        out("标准数值：发现上次留下的强制配装 %s，还原 %s（之后等级 %s）", id, ok and "成功" or ("失败 " .. tostring(err)), tostring(G.weaponLevel(id, true)))
+    else
+        out("标准数值：账本里有 %s，但游戏不在强制配装中（%s），只删账本", id, tostring(act))
+    end
+    os.remove(STD.FORCE_FILE)
+end
+-- 进倒计时 / 开打时调（跟 §113 NET.resApply 一起）
+function STD.apply(p1, why)
+    if not (STD.active() and valid(p1)) then return end
+    if not STD.saved then
+        STD.saved, STD.lv = {}, {}
+        local okV, msg = G.saveVeto(true, STD.VETO_ID)
+        STD.veto = okV
+        out("标准数值：进否决存档 %s（%s）", okV and "成功" or "失败", tostring(msg))
+        STD.added = STD.addTalents(p1, "自己")
+        STD.gearOn(p1)
+    end
+    STD.force(p1)
+    local parts = STD.writeAttrs(p1, true)
+    if #parts > 0 then out("标准数值（%s）：%s", why, table.concat(parts, "，")) end
+    local pup = puppet()
+    if valid(pup) and not STD.pupAdded[pathOf(pup)] then STD.pupAdded[pathOf(pup)] = STD.addTalents(pup, "替身") end
+end
+-- 对局中每 2 秒查一次（游戏重新聚合属性会把值改回去，同 LO.apply 每 2 秒重写替身）
+function STD.tick(tn)
+    if not (STD.saved and MATCH.state ~= "idle") then return end
+    if tn - STD.forceAt >= STD.FORCE_EVERY then        -- 对局中换了武器：还原上一把、套这一把（用户"能在玩家切换武器的时候换成切换生成么"）
+        STD.forceAt = tn
+        STD.lastTn = tn
+        local p0 = getP1()
+        if valid(p0) then STD.force(p0, tn); STD.gearSync(p0) end
+    end
+    if tn - STD.enforceAt < 2.0 then return end
+    STD.enforceAt = tn
+    local p1 = getP1()
+    if not valid(p1) then return end
+    local parts = STD.writeAttrs(p1, false)
+    if #parts > 0 then out("标准数值：属性被改回去了，重写：%s", table.concat(parts, "，")) end
+    STD.gearCheck(p1)
+end
+-- 回自由活动时调：属性还原、摘掉挂上的天赋、退出否决存档
+function STD.restore(p1)
+    STD.unforce("对局结束")
+    STD.gearOff(p1)
+    STD.disabled, STD.forceTimes, STD.seen, STD.settleUntil, STD.verify = false, {}, nil, -100, nil
+    local s = STD.saved
+    STD.saved = nil
+    if s and valid(p1) then
+        for _, a in ipairs(STD.ORDER) do
+            local v, c = s[a], attrOf(p1, a)
+            if v and c and math.abs(c - v) > 0.01 then NET.resWrite(p1, a, v) end
+        end
+        for _, path in ipairs(STD.added or {}) do LO.removeGE(p1, path, "标准数值：摘掉自己的临时天赋 " .. path:match("([%w_]+)_C$")) end
+        out("标准数值：属性还原成对局前（血上限 %s、攻击 %s），摘掉临时天赋 %d 个", tostring(s.Health_Max), tostring(s.Attack), #(STD.added or {}))
+    end
+    STD.added = nil
+    local pup = puppet()
+    for key, list in pairs(STD.pupAdded) do      -- 替身身上挂的也摘掉（下一场不是标准数值时替身别多带天赋）
+        if valid(pup) and pathOf(pup) == key then
+            for _, path in ipairs(list) do LO.removeGE(pup, path, "标准数值：摘掉替身的临时天赋 " .. path:match("([%w_]+)_C$")) end
+        end
+    end
+    STD.pupAdded = {}
+    if STD.veto then
+        local okV, msg = G.saveVeto(false, STD.VETO_ID)
+        out("标准数值：退出否决存档 %s（%s）", okV and "成功" or "失败", tostring(msg))
+        STD.veto = false
+    end
+end
+
+-- §158 数值表下发（用户 11-08"完全平衡数据 / 武器平衡数据改成从服务器下发 / 从主机下发"）。
+-- 伤害在挨打方本机按它自己的表算，两边的 pbz_balance.lua / 标准数值基准不一样就不对称、谁也看不出来。
+-- 现在：主机状态包带 cfgh=<哈希>；客机的哈希对不上就经可靠通道要（cfgreq），主机把配置拆成块发（cfg <哈希> <第几块> <共几块> <内容>）；
+-- 每场第 1 回合倒计时定下这一场用哪份（主机 = 本地；客机 = 收齐、哈希对得上的主机那份，不然用本地并在横幅上标出来），结束换回本地。
+-- 只下发可调的数：标准数值的属性 / 等级 / 统一给的天赋、武器平衡的族系数 / 单招系数 / 影之武装系数。
+-- pbz_stdgear.lua（每把武器 30 级该挂什么，是从游戏里读出来的事实）不下发。
+-- 收到的东西都过白名单：属性名只认 STD.ORDER、天赋只认本地基准里有的、系数 0–5、招式名只认 GA_ 开头的字母数字下划线。
+CFG = { CHUNK = 600, REQ_EVERY = 3.0, local_ = nil, localStr = nil, localHash = nil,
+        rHash = nil,            -- 对方（主机）状态包里报的哈希
+        have = nil, haveHash = nil, parts = nil, partsHash = nil, reqAt = -100, srcNote = nil }
+
+function CFG.hash(s)            -- FNV-1a 32 位，十六进制
+    local h = 0x811c9dc5
+    for i = 1, #s do h = ((h ~ s:byte(i)) * 0x01000193) & 0xffffffff end
+    return string.format("%08x", h)
+end
+
+function CFG.num(v) return string.format("%.6g", v) end
+function CFG.short(n)       -- 招式名缩写：GA_Hun_X_C → ~X，GA_X_C → ^X
+    local m = n:match("^GA_Hun_(.+)_C$")
+    if m then return "~" .. m end
+    m = n:match("^GA_(.+)_C$")
+    if m then return "^" .. m end
+    return n
+end
+function CFG.long(s)
+    if s:sub(1, 1) == "~" then return "GA_Hun_" .. s:sub(2) .. "_C" end
+    if s:sub(1, 1) == "^" then return "GA_" .. s:sub(2) .. "_C" end
+    return s
+end
+function CFG.fallback(name, fam, edge)     -- 表里没有这招时的系数（和 BAL.moveScale 一样的兜底）
+    local f = name:match("^GA_Hun_(%w+)_")
+    local v = f and fam[f] or 1.0
+    if LO.isEdgeAttack(name) then v = v * edge end
+    return v
+end
+
+-- 现在本机用着的这份（STD / BAL / LO.EDGE_SCALE）
+function CFG.snapshot()
+    local c = { attr = {}, lv = STD.LEVEL, tal = {}, tree = {}, fam = {}, mv = {}, edge = LO.EDGE_SCALE }
+    for k, v in pairs(STD.ATTR) do c.attr[k] = v end
+    for _, n in ipairs(STD.TALENT_GE) do c.tal[#c.tal + 1] = n end
+    for _, n in ipairs(STD.TREE_GE) do c.tree[#c.tree + 1] = n end
+    for k, v in pairs(BAL.FAMILY) do c.fam[k] = v end
+    for k, v in pairs(BAL.MOVE) do c.mv[k] = v end
+    return c
+end
+
+-- 规范化成一行（排好序，同样的内容哈希一样）。单招只发和兜底不一样的
+function CFG.encode(c)
+    local function sortedKV(t, fmtKey)
+        local ks = {}
+        for k in pairs(t) do ks[#ks + 1] = k end
+        table.sort(ks)
+        local o = {}
+        for _, k in ipairs(ks) do o[#o + 1] = (fmtKey and fmtKey(k) or k) .. ":" .. CFG.num(t[k]) end
+        return table.concat(o, ",")
+    end
+    local mv = {}
+    for k, v in pairs(c.mv) do
+        if math.abs(v - CFG.fallback(k, c.fam, c.edge)) > 1e-6 then mv[k] = v end
+    end
+    local tal, tree = {}, {}
+    for _, n in ipairs(c.tal) do tal[#tal + 1] = n end
+    for _, n in ipairs(c.tree) do tree[#tree + 1] = n end
+    table.sort(tal); table.sort(tree)
+    return table.concat({ "v=1", "a=" .. sortedKV(c.attr), "lv=" .. CFG.num(c.lv), "t=" .. table.concat(tal, ","),
+        "tr=" .. table.concat(tree, ","), "e=" .. CFG.num(c.edge), "f=" .. sortedKV(c.fam), "m=" .. sortedKV(mv, CFG.short) }, "|")
+end
+
+-- 解析 + 白名单；不对返回 nil, 原因
+function CFG.decode(s)
+    local p = {}
+    for part in (s or ""):gmatch("[^|]+") do
+        local k, v = part:match("^(%w+)=(.*)$")
+        if k then p[k] = v end
+    end
+    if p.v ~= "1" then return nil, "版本不认识：" .. tostring(p.v) end
+    local okAttr, okTal, okTree = {}, {}, {}
+    for _, a in ipairs(STD.ORDER) do okAttr[a] = true end
+    for _, n in ipairs(CFG.file_.tal) do okTal[n] = true end
+    for _, n in ipairs(CFG.file_.tree) do okTree[n] = true end
+    local function pairsOf(str, fn)
+        for item in (str or ""):gmatch("[^,]+") do
+            local k, v = item:match("^([^:]+):([%-%d%.eE+]+)$")
+            v = tonumber(v)
+            if not (k and v) then return false, "坏项 " .. item end
+            local ok, why = fn(k, v)
+            if not ok then return false, why end
+        end
+        return true
+    end
+    local c = { attr = {}, tal = {}, tree = {}, fam = {}, mv = {} }
+    local ok, why = pairsOf(p.a, function(k, v)
+        if not okAttr[k] then return false, "属性不认识 " .. k end
+        if v < 1 or v > 100000 then return false, "属性超范围 " .. k end
+        c.attr[k] = v; return true
+    end)
+    if not ok then return nil, why end
+    for _, a in ipairs(STD.ORDER) do if not c.attr[a] then return nil, "缺属性 " .. a end end
+    c.lv = tonumber(p.lv)
+    if not (c.lv and c.lv >= 1 and c.lv <= 30) then return nil, "等级超范围" end
+    for n in (p.t or ""):gmatch("[^,]+") do
+        if not okTal[n] then return nil, "天赋不认识 " .. n end
+        c.tal[#c.tal + 1] = n
+    end
+    for n in (p.tr or ""):gmatch("[^,]+") do
+        if not okTree[n] then return nil, "天赋树效果不认识 " .. n end
+        c.tree[#c.tree + 1] = n
+    end
+    c.edge = tonumber(p.e)
+    if not (c.edge and c.edge >= 0 and c.edge <= 5) then return nil, "影之武装系数超范围" end
+    ok, why = pairsOf(p.f, function(k, v)
+        if not k:match("^%w+$") or v < 0 or v > 5 then return false, "族系数不对 " .. k end
+        c.fam[k] = v; return true
+    end)
+    if not ok then return nil, why end
+    ok, why = pairsOf(p.m, function(k, v)
+        local n = CFG.long(k)
+        if not n:match("^GA_[%w_]+$") or v < 0 or v > 5 then return false, "单招系数不对 " .. k end
+        c.mv[n] = v; return true
+    end)
+    if not ok then return nil, why end
+    -- 没列出来的招按兜底：把兜底不是 1 的那些招也补成表里的数，解出来和 snapshot 一样完整
+    for k in pairs(CFG.file_.mv) do
+        if c.mv[k] == nil then c.mv[k] = CFG.fallback(k, c.fam, c.edge) end
+    end
+    return c
+end
+
+-- 让 STD / BAL 用这一份
+function CFG.use(c)
+    STD.ATTR, STD.LEVEL = {}, c.lv
+    for k, v in pairs(c.attr) do STD.ATTR[k] = v end
+    STD.TARGET_MULT = STD.mult(STD.LEVEL)
+    STD.TALENT_GE, STD.TREE_GE = {}, {}
+    for _, n in ipairs(c.tal) do STD.TALENT_GE[#STD.TALENT_GE + 1] = n end
+    for _, n in ipairs(c.tree) do STD.TREE_GE[#STD.TREE_GE + 1] = n end
+    BAL.FAMILY, BAL.MOVE = {}, {}
+    for k, v in pairs(c.fam) do BAL.FAMILY[k] = v end
+    for k, v in pairs(c.mv) do BAL.MOVE[k] = v end
+    LO.EDGE_SCALE = c.edge
+end
+
+-- 本机的基准：大厅服务器给过的那份（联机程序缓存在 net/srvcfg.txt，§158 服务器下发）优先，没有 / 坏了用模组目录里的文件
+function CFG.init()
+    CFG.file_ = CFG.snapshot()      -- 模组文件里的（也是解码时的白名单）
+    CFG.pick()
+end
+
+function CFG.pick()
+    local base, src = CFG.file_, "模组文件"
+    local t = fileReadKV(NET_DIR .. "/srvcfg.txt")
+    CFG.srvHash, CFG.srvAt = t and t.h, now()
+    if t and t["end"] and t.h and t.s then
+        if CFG.hash(t.s) ~= t.h then
+            out("!! 数值表：srvcfg.txt 哈希对不上（%s ≠ %s），不用", CFG.hash(t.s), t.h)
+        else
+            local c, why = CFG.decode(t.s)
+            if c then base, src = c, "大厅服务器" else out("!! 数值表：大厅服务器那份不认（%s），用模组文件", tostring(why)) end
+        end
+    end
+    CFG.local_ = CFG.decode(CFG.encode(base))       -- 复制一份（下面测试开关会改）
+    -- 测试用：net 目录里有 cfg_test.txt 就按它改本地这份（双开两份共用一个模组目录，造"两边表不一样"）。hp=血上限，mv=招名:系数
+    local tt = fileReadKV(NET_DIR .. "/cfg_test.txt")
+    if tt then
+        if tonumber(tt.hp) then CFG.local_.attr.Health_Max = tonumber(tt.hp) end
+        local mk, mvv = (tt.mv or ""):match("^([%w_]+):([%d%.]+)$")
+        if mk then CFG.local_.mv[mk] = tonumber(mvv) end
+        out("!! 数值表：测试用 cfg_test.txt 改了本地这份（hp=%s mv=%s）", tostring(tt.hp), tostring(tt.mv))
+    end
+    CFG.use(CFG.local_)
+    CFG.localStr = CFG.encode(CFG.local_)
+    CFG.localHash = CFG.hash(CFG.localStr)
+    CFG.localSrc = src
+    out("数值表（标准数值基准 + 武器平衡）：本地 %s，%d 字节，来自%s", CFG.localHash, #CFG.localStr, src)
+end
+
+-- 对局外每 15 秒看一下联机程序有没有从服务器拿到新的（只读 srvcfg.txt 的哈希那一行变没变）
+function CFG.refresh(tn)
+    if tn - (CFG.srvAt or -100) < 15 or MATCH.state ~= "idle" then return end
+    CFG.srvAt = tn
+    local t = fileReadKV(NET_DIR .. "/srvcfg.txt")
+    if (t and t.h) ~= CFG.srvHash then
+        out("数值表：srvcfg.txt 变了（%s → %s），重新挑", tostring(CFG.srvHash), tostring(t and t.h))
+        CFG.pick()
+    end
+end
+
+-- 状态包里报的哈希
+function CFG.wire()
+    CFG.refresh(now())
+    return CFG.localHash or ""
+end
+
+-- 收到对方状态包（我是客机时才管）
+function CFG.onPacket(h, tn)
+    CFG.rHash = (h and h ~= "") and h or nil
+    if (MATCH.session and MATCH.session.role) ~= "client" or not CFG.rHash then return end
+    if CFG.rHash == CFG.localHash or CFG.rHash == CFG.haveHash then return end
+    if tn - CFG.reqAt < CFG.REQ_EVERY then return end
+    CFG.reqAt = tn
+    CFG.rel.send("cfgreq", CFG.rHash)
+end
+
+-- 主机：把本地这份拆块发出去
+function CFG.sendAll()
+    local s, h = CFG.localStr, CFG.localHash
+    local n = math.ceil(#s / CFG.CHUNK)
+    for i = 1, n do CFG.rel.send("cfg", string.format("%s %d %d %s", h, i, n, s:sub((i - 1) * CFG.CHUNK + 1, i * CFG.CHUNK))) end
+    out("数值表：发给对方 %s，%d 块", h, n)
+end
+
+-- 客机：收一块
+function CFG.onChunk(rest)
+    local h, i, n, data = rest:match("^(%x+) (%d+) (%d+) (.*)$")
+    i, n = tonumber(i), tonumber(n)
+    if not (h and i and n and n >= 1 and n <= 200 and i >= 1 and i <= n) then out("!! 数值表：坏块 %s", rest:sub(1, 40)); return end
+    if CFG.partsHash ~= h then CFG.parts, CFG.partsHash = {}, h end
+    CFG.parts[i] = data
+    for k = 1, n do if not CFG.parts[k] then return end end
+    local s = table.concat(CFG.parts, "", 1, n)
+    CFG.parts, CFG.partsHash = nil, nil
+    if CFG.hash(s) ~= h then out("!! 数值表：收齐了但哈希对不上（%s ≠ %s），不用", CFG.hash(s), h); return end
+    local c, why = CFG.decode(s)
+    if not c then out("!! 数值表：主机那份不认（%s），不用", tostring(why)); return end
+    CFG.have, CFG.haveHash = c, h
+    out("数值表：收到主机的 %s（%d 字节）", h, #s)
+end
+
+-- 每场第 1 回合倒计时：定下这一场用哪份
+function CFG.begin()
+    local role = MATCH.role
+    CFG.srcNote = nil
+    if role == "client" and CFG.rHash and CFG.rHash ~= CFG.localHash then
+        if CFG.haveHash == CFG.rHash then
+            CFG.use(CFG.have)
+            out("数值表：这一场用主机的 %s", CFG.rHash)
+        else
+            CFG.use(CFG.local_)
+            CFG.srcNote = "本地"
+            out("!! 数值表：主机的 %s 还没收到 / 不认，这一场用本地的 %s（伤害可能不对称）", CFG.rHash, CFG.localHash)
+        end
+    else
+        CFG.use(CFG.local_)
+    end
+end
+
+-- 回到自由活动：换回本地
+function CFG.finish()
+    CFG.use(CFG.local_)
+    CFG.srcNote = nil
+end
+CFG.init()
 -- §110 武林盟主（排位）固定规则：联机程序在 lobby.txt 里给 rk=1（当前连接方式是 ranked）和 rkrules=bo=3;dm=150;med=0;bal=1;ctr=1;ab=0
 -- （服务器下发）。这时上面的 NET.bestOf / dmgPct / allBlock / flag 一律按 rkrules 返回，主机、客机一样，不看本机 rules.txt / 主机状态包；
 -- 开局 / 跟随时定下 MATCH.* 的地方调的就是它们，不用改。规则还没拿到（rk=1 但 rkrules 空）时不拿本机设置冒充：主机不让开局
@@ -1990,6 +2859,7 @@ local NOT_ATTACK_PART = { "Passive", "Stance", "Buff", "Drink", "Jump", "Sprint"
                           "Deflect", "Dodge", "Switch", "Tutorial", "_UI", "GEd", "GEx", "_Base" }
 local function isAttackAbility(n)
     if LO.isEdgeAttack(n) then return true end      -- v0.17.4：影之武装（GA_<武装>_*，路径在 ShachiAbility/ 下）
+    if CHG.VEHICLE.names[n] then return true end    -- §143 泥头车撞人
     local fam, rest = n:match("^GA_Hun_(%w+)_(.+)_C$")
     if not fam then return false end
     if NOT_ATTACK_FAM[fam] then return false end
@@ -2240,8 +3110,8 @@ local function addResult(kind, attackId, value, tn)
     NET.resId = NET.resId + 1
     NET.results[#NET.results + 1] = { id = NET.resId, atk = attackId, kind = kind, v = value or 0, at = tn }
     NET.judged[kind] = (NET.judged[kind] or 0) + 1
-    out("判定 远端#%d → %s%s", attackId, RES_NAME[kind] or kind,
-        (value or 0) > 0 and string.format(" -%.0f", value) or "")
+    out("判定 远端#%d → %s%s%s", attackId, RES_NAME[kind] or kind,
+        (value or 0) > 0 and string.format(" -%.0f", value) or "", (value or 0) > 0 and NET.pupAtkNote() or "")
     return NET.results[#NET.results]
 end
 
@@ -2447,6 +3317,9 @@ local function netJudge(p1, tn)
     if #NET.judges == 0 and not NET.pendDef and not NET.lastHit then return end
     local hp = hpOf(p1)
     local m = montageOf(p1)
+    -- §155 回过血（回合开始补满 / 喝药）→ 上一招的多段累加到此为止；倒地动作里掉的血（摔死 / 锁血钳住）不算任何一招打的
+    if hp and NET.judgeHp and hp > NET.judgeHp + 0.5 then NET.lastHit = nil end
+    if m:find("_Dead", 1, true) then NET.judgeHp = hp; NET.lastHit = nil; return end
     local newDeflect = m:find("Deflect") ~= nil and m ~= NET.judgeMontage   -- 只认"刚切到格挡动画"那一帧
     local mPrev = NET.judgeMontage
     NET.judgeMontage = m
@@ -2475,7 +3348,7 @@ local function netJudge(p1, tn)
         -- 这里把后面的掉血累加进同一条结果；结果还在重发期内，对方会看到数值变大
         local r = NET.lastHit.r
         r.v = r.v + (NET.judgeHp - hp)
-        out("判定 远端#%d → 中招 追加 -%.0f（这招累计 -%.0f）", r.atk, NET.judgeHp - hp, r.v)
+        out("判定 远端#%d → 中招 追加 -%.0f（这招累计 -%.0f）%s", r.atk, NET.judgeHp - hp, r.v, NET.pupAtkNote())
         NET.lastHit.at = tn        -- v0.27.1 从最后一段算起：炽刃大招十几段、拖 1.8 秒，从第一段算会把后面的段漏掉
     elseif #NET.judges > 0 and newDeflect then
         if NET.pendDef then finishDeflect(p1, tn) end
@@ -3361,8 +4234,8 @@ CHG = { DUR = 5.0, QUIET = 0.6, AB_EVERY = 0.1, LOGS = 40, SPEC_LOGS = 8, EV_MAX
 --        §87.2 妖锯 FastHeavyAttack、双钩 PerfectDodge_HeavyAttack 返回 false，都是这一类
 --   PRE：放之前先给（灵蛇 Potential 是升级被动 GA_SlitheringSword_Passive 攒"潜能"后放的；替身只有光秃秃的 Potential，
 --        一放就结束，18:31:11 / 18:48:49 动作 0.02 秒就没了）。放的时候记一下被动上的潜能值（前 POT_LOGS 次）
-function CHG.ge(dir, name)            -- 升级 GE 的类路径（主代码块 local 已满，挂在 CHG 上）
-    return "/PBZCombatAsset/ActorData/Players/Hun/Weapon/" .. dir .. "/UpgradeData/" .. name .. "." .. name .. "_C"
+function CHG.ge(dir, name, sub)       -- 升级 GE 的类路径（主代码块 local 已满，挂在 CHG 上）；sub 默认 UpgradeData（§159 双月 / 破军是 WeaponUpgrade）
+    return "/PBZCombatAsset/ActorData/Players/Hun/Weapon/" .. dir .. "/" .. (sub or "UpgradeData") .. "/" .. name .. "." .. name .. "_C"
 end
 CHG.UPG = {
     GA_Hun_BronzeSword_B_Hold_C = { CHG.ge("BronzeSword", "GE_Weapon_BronzeSword_BHold") },
@@ -3374,7 +4247,12 @@ CHG.UPG = {
     GA_Hun_YuuBlade_FastHeavyAttack_C = { CHG.ge("YuuBlade", "GE_YaoJu_Upgrade_FastHeavyAttack") },
     GA_Hun_DualHook_PerfectDodge_HeavyAttack_C = { CHG.ge("DualHook", "GE_DualHook_Evolution") },
     GA_Hun_DualHook_PerfectDodge_GEx_C = { CHG.ge("DualHook", "GE_DualHook_Evolution") },
+    -- §159 进阶冲刺：双月的要 CharacterState.WeaponUpgrade.ShuangYue.CanSwiftDash（升级 GE 在 WeaponUpgrade/，不在 UpgradeData/）；
+    -- 玉双环的名字表里有 Jade.EnableDA（DefaultDash / GhostDash 两个升级都给，取 DefaultDash）
+    GA_Hun_AdvancedDash_ShuangYue_C = { CHG.ge("ShuangYue", "GE_ShuangYue_ChargeSpeed_CanSwiftDash", "WeaponUpgrade") },
+    GA_Hun_AdvancedDash_Double_Jade_C = { CHG.ge("JadeDualChakram", "GE_Jade_Upgrade_DefaultDash") },
 }
+CHG.DASH_CD = "/PBZCombatAsset/Prototypes/GameplayEffects/GE_DashCooldown.GE_DashCooldown_C"     -- §159
 CHG.PRE = {
     GA_Hun_SlitheringSword_Potential_C = { CHG.ge("SlitheringSword", "GE_SlitheringSword_GrantPotential"),
                                            CHG.ge("SlitheringSword", "GE_SlitheringSword_EnablePotentialEnergy") },
@@ -3529,8 +4407,11 @@ end
 -- 替身的蓄力动作播到 at 秒（自己出招之前）就暂停，对方松手的秒数到了（或换了动作 / SELF_MAX 秒）再继续。
 -- 只对发 rel= 的新版对方（旧版永远等不到松手）。只管出招时机：蓄力等级（炽刃 ChargeCount C1–C3、风雷剑 End_Success / End_Fail）
 -- 是技能里按 IsHolding 算的，替身没有输入组件，暂停改变不了，还是最低一级（HANDOVER §92.8）
+-- §139.5 独眼弓 R2：替身的技能拉弓 1.7 秒自己射（10:08 蓄力探针 Charge → 1.70 Shoot_Normal，那时 2 根箭），
+-- 拉弓到 1.55 秒停住等对方松手（BOWN 先播瞄准动作、松手再放的做法替身手里没弓，已关）
 CHG.SELF = { GA_Hun_ChiRen_C_C = { mon = "Hun_ZhiRen_Unique_Skill_01_Montage", at = 0.75 },
-             GA_Hun_FengLeiJian_B_Hold_C = { mon = "Hun_BaiShanDual_Hold_B_02_Montage", at = 1.45 } }
+             GA_Hun_FengLeiJian_B_Hold_C = { mon = "Hun_BaiShanDual_Hold_B_02_Montage", at = 1.45 },
+             GA_DuYan_Bow_Normal_C = { mon = "AM_Hun_UnnamedBow_Charge", at = 1.55 } }
 CHG.selfN = 0
 
 function CHG.selfLog(fmt, ...)
@@ -3546,6 +4427,7 @@ function CHG.selfStep(pup, id, f, tn)
     local _, _, m, pos = LAT.activeMontage(pup)
     if f.paused then
         if due or m ~= sc.mon or tn - f.at > CHG.SELF_MAX then
+            if f.name == BOWN.NAME then BOWN.aimNow(pup, tn) end     -- §139.5 R2：松手射之前转到对方的镜头朝向
             local ok = G.montagePause(pup, false)
             f.paused, f.selfOff = false, true
             CHG.selfLog("蓄力等松手：远端#%d %s 替身停了 %.2f 秒，%s → 继续 %s", id, f.name, tn - f.pausedAt,
@@ -3563,11 +4445,489 @@ function CHG.selfStep(pup, id, f, tn)
     end
 end
 
+-- §139 独眼弓激光（GA_DuYan_Bow_Laser_C，L1 + R2 / 先按住右键再按 Ctrl）：光束每段 2 秒（CostBulletInstanceDuration），
+-- 技能变量 CostBulletRemainTime 倒数到 0 时看还按没按着，按着就再耗一段接着照。替身没有输入，第一段照完（约 2.6 秒）就收——
+-- 2026-11-07 01:41 实测：替身和我的技能变量一模一样（0.7 秒时 LaserRiseCurrentDuration 0.69 / 0.72、RemainTime 1.31 / 1.28），
+-- 只是我按了 3.8 秒、替身照 2 秒；每发只吃到一段伤害。（之前试过补播光束动作 / 调 SpawnLoopLaserNS：不加伤害；光柱后来按 §139.1 补回来）
+-- 做法：对方还按着时，替身激光技能的 CostBulletRemainTime 低于 LOW 就写回 FILL，倒数到不了 0；对方松手到点写 0，让它照常收
+-- 01:47 实测：续 RemainTime 读回都对，替身技能还是 2.6 秒收——另一个计时是 LaserRiseCurrentDuration（光束升起，LaserRiseDuration
+-- = 2.0）：我自己按 3.8 秒时它涨到 3.8，替身到 2 秒左右没按着就收。所以它也往回拨（超过 RISE_HI 写回 RISE_TO）。
+-- 替身身上的动作：对方进光束时照播 AM_Hun_UnnamedBow_Loop（sub=，同 §111 紫冥剑召唤的技能内动作），松手那一箭照播 Shoot_Normal
+-- 04:30 实验 3 之后：续计时 / 造输入状态都走不通（§140），改成替身每照完一段、对方还按着就再放一次：每段前面有约 0.7 秒拉弓，
+-- 伤害一段一段的。剩下不到 RECAST_MIN 秒不再续；一发最多续 RECAST_MAX 次
+-- §143 泥头车（马车）：替身没有按键，GA_HorseCart_Charge_C 永远等不到松手——15:12 实测替身一直挂着这个技能、悬在半空
+-- （AM_DriveHorseCart 播完车没了人还在驾车状态），之后的招全部返回 false，对方看着就是"飞天、出招看不见、打不到"。
+-- 对方松手到点（rel=）就把替身的这个技能 K2_CancelAbility、放回走路；旧版对方没有 rel=：放出 MAX 秒还挂着也取消。
+-- 撞人：这招不在 pbz_abilities 表里、名字又带 Charge_C，以前不算攻击招 → 撞到你不开判定窗口，伤害不算（isAttackAbility 认它）
+CHG.VEHICLE = { names = { GA_HorseCart_Charge_C = 1 }, MAX = 8.0, logN = 0 }
+
+function CHG.vehicleOff(pup, id, f, tn, why)
+    if f.vehOff then return end
+    f.vehOff = true
+    local gone = G.cancelAbilities(pup, function(n) return n == f.name end)
+    local landed = #gone > 0 and G.hover(pup, false)
+    if CHG.VEHICLE.logN < 30 then
+        CHG.VEHICLE.logN = CHG.VEHICLE.logN + 1
+        out("马车：远端#%d %s 放出 %.2f 秒，%s → 替身取消技能 %s%s", id, f.name, tn - f.at, why,
+            #gone > 0 and table.concat(gone, ",") or "（已经没在放）", landed and "，放回走路" or "")
+    end
+end
+
+CHG.LASER = { name = "GA_DuYan_Bow_Laser_C", var = "CostBulletRemainTime", LOW = 0.6, FILL = 1.0, EVERY = 0.1, max = 15.0, logN = 0,
+              RECAST_MIN = 1.2, RECAST_MAX = 8, BEAM_AT = 0.6, beamLogN = 0,
+              rise = "LaserRiseCurrentDuration", RISE_HI = 1.6, RISE_TO = 1.2,
+              loop = "AM_Hun_UnnamedBow_Loop", shoot = "AM_Hun_UnnamedBow_Shoot_Normal" }
+
+-- 发：我这一帧的动作 m（上一帧 prev）要不要当激光的技能内动作发：进光束、光束后松手那一箭
+function CHG.isLaserSub(m, prev)
+    return m == CHG.LASER.loop or (m == CHG.LASER.shoot and prev == CHG.LASER.loop)
+end
+
+-- 收：sub= 里的动作是不是激光的
+function CHG.isLaserIn(m)
+    return m == CHG.LASER.loop or m == CHG.LASER.shoot
+end
+
+-- §140 输入状态同步第 1 步：只读探针（玩家进光束时、替身放激光 0.3 秒时各记一次，最多 PROBE_MAX 次；函数表只在头一次）
+CHG.LASER.probeN, CHG.LASER.PROBE_MAX = 0, 14
+function CHG.holdProbe(actor, who)
+    if CHG.LASER.probeN >= CHG.LASER.PROBE_MAX then return end
+    CHG.LASER.probeN = CHG.LASER.probeN + 1
+    for _, l in ipairs(G.holdTaskProbe(actor, who, CHG.LASER.probeN <= 2) or {}) do out("输入探针：%s", l) end
+end
+
+-- §140 第 2 步实验：替身放名单里的招之前给它"按着"对应的键（G.inputEnsure / inputHold），对方松手到点松开。
+-- 关掉：net/inp_off.txt。实验开着时激光不再续计时（看替身自己会不会照到松手）
+-- 04:30 实验 3：组件、技能变量、Controller、按住都接上了，替身的等松手任务还是不建（多半要玩家控制器），实验先关（KEYS 空）
+INP = { KEYS = {},     -- 实验时：GA_DuYan_Bow_Laser_C = "/PBZInput/InputActions/IA_ShachiAbility_Hold.IA_ShachiAbility_Hold"
+        OFF_FILE = (NET_DIR or "net") .. "/inp_off.txt", logN = 0, held = {} }
+
+function INP.log(fmt, ...)
+    INP.logN = INP.logN + 1
+    if INP.logN <= 60 then out(fmt, ...) end
+end
+
+function INP.off()
+    local f = io.open(INP.OFF_FILE, "r")
+    if f then f:close(); return true end
+    return false
+end
+
+-- 放之前：名单里的招 → 替身按住这招的键。返回 是否按上了
+function INP.press(pup, name, id)
+    local ia = INP.KEYS[name]
+    if not ia or INP.off() then return false end
+    local comp, how = G.inputEnsure(pup)
+    if how ~= "已有" then INP.log("输入实验：替身输入组件 %s", tostring(how)) end
+    if not comp then return false end
+    local r, isH = G.inputHold(comp, ia, true, G.worldTime(pup) or 0.0)     -- 值 = 按下时的世界时间（同玩家）
+    INP.held[id] = { comp = comp, ia = ia }
+    INP.log("输入实验：远端#%d %s 放之前替身按住 %s：%s，IsHolding → %s", id, name, ia:match("([%w_]+)$"), r, tostring(isH))
+    return isH == true
+end
+
+-- 对方松手到点 → 替身松开
+function INP.release(id, why)
+    local h = INP.held[id]
+    if not h then return end
+    INP.held[id] = nil
+    local r, isH = G.inputHold(h.comp, h.ia, false)
+    INP.log("输入实验：远端#%d 替身松开（%s）：%s，IsHolding → %s", id, why, r, tostring(isH))
+end
+
+function CHG.laserLog(fmt, ...)
+    CHG.LASER.logN = CHG.LASER.logN + 1
+    if CHG.LASER.logN <= 40 then out(fmt, ...) end
+end
+
+-- 这一招最多等多久（判定窗口 / 记录保留）
+function CHG.maxAge(name)
+    return name == CHG.LASER.name and CHG.LASER.max or CHG.JUDGE_MAX
+end
+
+-- 替身还在播光束动作（Loop 自己不停）就收掉
+function CHG.laserStopLoop(pup)
+    if valid(pup) and montageOf(pup) == CHG.LASER.loop then return cutMontage(pup) end
+    return nil
+end
+
+-- 每帧（隔 EVERY 秒读一次）：替身放的激光，对方还按着就续，松手到点收
+function CHG.laserStep(pup, id, f, tn)
+    local L = CHG.LASER
+    if f.name ~= L.name or f.laserDone or tn < (f.laserAt or 0) then return end
+    f.laserAt = tn + L.EVERY
+    for oid, of in pairs(CHG.fired) do if oid > id and of.name == f.name then f.laserDone = true; return end end  -- 已经放了下一发
+    local inst = valid(pup) and LO.activeInstance(pup, L.name)
+    local secs = CHG.rel[id]
+    -- 对方那边已经射出光束后那一箭（松手或暗源用完都会）也算到点：暗源先用完、键还按着时 rel= 会晚到
+    local over = (secs and tn >= f.at + secs) or f.shotAt ~= nil or tn - f.at > L.max
+    if inst then
+        f.seen = true
+        if over then                       -- 对方松手到点：本段照完前收掉
+            local ok = pcall(function() inst[L.var] = 0.0 end)
+            f.laserDone = true
+            CHG.laserStopLoop(pup)
+            CHG.laserLog("独眼弓激光：远端#%d 对方%s → 替身光束收（%s 写 0 %s，%.2f 秒，续放 %d 次）", id,
+                secs and string.format("按了 %.2f 秒", secs) or "按太久", L.var, ok and "成功" or "失败", tn - f.at, f.recastN or 0)
+        elseif not CHG.laserBeamAlive(f) and tn - (f.waitAt or f.at) >= L.BEAM_AT then
+            CHG.laserBeamOn(pup, id, f, inst)      -- §139.1 这一段拉弓完了：补上弓射出的光柱
+        end
+        return
+    end
+    -- 技能没了：对方还按着、剩下的够再照一段 → 再放一次（§140 实验 3 结论：替身走不了"按着"那条路，只能一段一段续）
+    local left = secs and (f.at + secs - tn) or (L.max - (tn - f.at))
+    if f.seen and not over and left >= L.RECAST_MIN and (f.recastN or 0) < L.RECAST_MAX then
+        f.recastN = (f.recastN or 0) + 1
+        local okR = activateOnPuppet(pup, f.name, NET.sub, "远端#" .. id .. " 激光续放")
+        CHG.laserLog("独眼弓激光：远端#%d 替身照完一段（%.2f 秒），对方还按着（%s）→ 续放第 %d 次 %s", id, tn - f.at,
+            secs and string.format("一共按 %.2f 秒，还剩 %.2f", secs, left) or "还没松手", f.recastN, okR and "成功" or "失败")
+        if okR then f.seen, f.waitAt = false, tn; return end
+    end
+    if over then CHG.laserStopLoop(pup) end
+    if f.seen or tn - (f.waitAt or f.at) > 1.0 then        -- 刚放出来时技能可能还没挂上，等 1 秒
+        f.laserDone = true
+        if f.recastN then CHG.laserLog("独眼弓激光：远端#%d 替身激光结束（%.2f 秒，续放 %d 次）", id, tn - f.at, f.recastN) end
+    end
+end
+
+-- §139.1 激光柱：真人的激光 = 弓射出的一道持续光柱 + 两只眼睛按节奏打；替身只有眼睛（伤害也是眼睛打的）。
+-- 每段拉弓完让替身的激光技能自己调 SpawnLoopLaserNS 生成光柱（01:40 试过：调用成功、光柱一直挂着不收——技能在光柱自己的
+-- RemoveLaserNS 之前就结束了），所以光柱归这一发管：每帧对准你（锁定点），对方松手 / 下一发 / 结束时模组自己收掉。
+-- 段与段之间光柱还在就接着用，不重复生成
+CHG.LASER.beams = {}
+
+function CHG.laserBeamAlive(f)
+    for _, c in ipairs(f.beam or {}) do if valid(c) then return true end end
+    return false
+end
+
+-- 光柱对准的点：你的锁定点（别人锁你时镜头 / 子弹对着的点），没有就你身上往上 50
+function CHG.laserAimAt()
+    local p1 = getP1()
+    if not valid(p1) then return nil end
+    local comp = rawProp(p1, "LockViewTarget")
+    local a = valid(comp) and try("laser aim", function() return comp:K2_GetComponentLocation() end)
+    if a then return a end
+    local l = try("laser aim", function() return p1:K2_GetActorLocation() end)
+    return l and { X = l.X, Y = l.Y, Z = l.Z + 50 } or nil
+end
+
+function CHG.laserBeamOn(pup, id, f, inst)
+    local L = CHG.LASER
+    local comps, info = G.laserBeamSpawn(inst)
+    L.beamLogN = L.beamLogN + 1
+    local names = {}
+    for _, c in ipairs(comps or {}) do names[#names + 1] = shortName(full(c)) end
+    if not comps or #comps == 0 then
+        f.beam = {}
+        if L.beamLogN <= 20 then out("独眼弓激光：远端#%d 替身光柱生成失败（%s）", id, comps and "没找到组件" or tostring(info)) end
+        return
+    end
+    f.beam = comps
+    L.beams[id] = f
+    local n = BOWAIM.aimBeam(pup, comps)
+    if L.beamLogN <= 20 then
+        out("独眼弓激光：远端#%d 替身光柱 %s（%s），转向 %d/%d", id, table.concat(names, ","), tostring(info), n, #comps)
+    end
+    CHG.laserEmitOn(pup, id, f, inst)        -- §139.7 光柱的伤害
+end
+
+-- §139.7 光柱的伤害：替身技能的子弹数据 CreateBullet 生成伤害发射器（见 G.laserEmitterSpawn），每帧跟着光柱挪 / 转，
+-- 收光柱时一起收。关掉：net/emit_off.txt
+CHG.LASER.EMIT_OFF = (NET_DIR or "net") .. "/emit_off.txt"
+CHG.LASER.emitLogN = 0
+
+function CHG.laserEmitLog(fmt, ...)
+    CHG.LASER.emitLogN = CHG.LASER.emitLogN + 1
+    if CHG.LASER.emitLogN <= 40 then out(fmt, ...) end
+end
+
+-- 光柱现在的位置和朝向（第一根光柱组件；朝向 = 对方镜头 / 对准你）
+function CHG.laserBeamPose(pup, f)
+    local c = f.beam and f.beam[1]
+    local at = c and valid(c) and try("beam loc", function() return c:K2_GetComponentLocation() end)
+    local r = not NET.rlk and BOWAIM.peer(now())
+    if not r and at then
+        local me = CHG.laserAimAt()
+        if me then
+            local dx, dy, dz = me.X - at.X, me.Y - at.Y, me.Z - at.Z
+            r = { Pitch = math.deg(math.atan(dz, math.sqrt(dx * dx + dy * dy))), Yaw = math.deg(math.atan(dy, dx)) }
+        end
+    end
+    return at, r or { Pitch = 0, Yaw = 0 }
+end
+
+function CHG.laserEmitOn(pup, id, f, inst)
+    local fh = io.open(CHG.LASER.EMIT_OFF, "r")
+    if fh then fh:close(); return end
+    local at, r = CHG.laserBeamPose(pup, f)
+    local e, how = G.laserEmitterSpawn(inst, pup, at, r)
+    f.emitter = e
+    CHG.laserEmitLog("独眼弓激光：远端#%d 替身光柱伤害发射器 %s（%s）", id, e and G.emitterInfo(e) or "没生成", tostring(how))
+    CHG.laserEyesOn(pup, id, f, inst)        -- §139.8
+end
+
+-- §139.8 眼睛：激光技能资产引用子弹数据 BD_DuYan_Bow_Eye 和武器升级标签 CharacterState.WeaponUpgrade.DuYanBow.LaserEyes
+-- （用户：光柱出来后召唤两只眼睛按节奏打）。替身照发射器的办法用它生成（CreateBullet + Initialize + Start），收光柱时一起收。
+-- 日志记你和替身有没有这个标签（11:30 都读不到，先不按它开关）
+CHG.LASER.EYE_BD = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/DuYanBow/BD_DuYan_Bow_Eye.BD_DuYan_Bow_Eye"
+CHG.LASER.EYE_TAG = "CharacterState.WeaponUpgrade.DuYanBow.LaserEyes"
+CHG.LASER.EYES = 2
+
+function CHG.hasTag(actor, tag)
+    if not valid(actor) then return false end
+    for _, t in ipairs(tagsOf(actor) or {}) do if t == tag then return true end end
+    return false
+end
+
+-- 12:03 实测：2 只生成在同一点，叠成一只；约 2 秒就结束（状态 3）而光柱还在照 → 一左一右（替身右手方向 ±EYE_SIDE、往上 EYE_UP）生成，
+-- 都没了而光柱还在就再生成（CHG.laserBeamStep）。返回 最后一次的说明
+-- 12:1x 用户：往上 110 时眼睛约 4 米高、比原版高太多（眼睛自己还往上飘）→ 往下 60（替身位置是胶囊中心，约在腰）
+CHG.LASER.EYE_SIDE, CHG.LASER.EYE_UP = 90.0, -60.0
+
+function CHG.laserEyesSpawn(pup, f, inst, bd)
+    local L = CHG.LASER
+    local loc = try("pup loc", function() return pup:K2_GetActorLocation() end)
+    if not loc then return "读不到替身位置" end
+    local _, r = CHG.laserBeamPose(pup, f)
+    local y = math.rad(r.Yaw or 0)
+    local rx, ry = -math.sin(y), math.cos(y)
+    local how
+    for i = 1, L.EYES do
+        local side = (i == 1) and 1 or -1
+        local at = { X = loc.X + rx * L.EYE_SIDE * side, Y = loc.Y + ry * L.EYE_SIDE * side, Z = loc.Z + L.EYE_UP }
+        local e, h = G.laserEmitterSpawn(inst, pup, at, r, bd)
+        if e then f.eyes[#f.eyes + 1] = e end
+        how = h
+    end
+    f.eyeBD = bd
+    return how
+end
+
+-- 眼睛都没了（无效或状态不是 2）
+function CHG.laserEyesGone(f)
+    for _, e in ipairs(f.eyes or {}) do
+        if valid(e) and rawProp(e, "BulletStatus") == 2 then return false end
+    end
+    return true
+end
+
+-- §139.9 对方的光柱有没有眼睛（点没点 LaserEyes 升级）：对方进光柱 1 秒后数自己名下的眼睛子弹，状态包 eye=1 / 0（还没数过 "-"）。
+-- 替身：eye=0 不生成、已经生成的收掉；eye=1 / 没有这个字段（旧版 / 还没数过）照生成
+BOWEYE = { CLS = "BP_DuYanBow_Bullet_Eye_C", AFTER = 1.0 }
+
+-- 发
+function BOWEYE.wire(p1, tn)
+    if NET.hrPrev == CHG.LASER.loop then
+        BOWEYE.loopAt = BOWEYE.loopAt or tn
+        if not BOWEYE.checked and tn - BOWEYE.loopAt >= BOWEYE.AFTER and valid(p1) then
+            BOWEYE.checked = true
+            local was = NET.myEyes
+            NET.myEyes = G.countBullets(BOWEYE.CLS, p1) > 0
+            if was ~= NET.myEyes then out("独眼弓：我的光柱%s眼睛（发 eye=%s）", NET.myEyes and "有" or "没有", NET.myEyes and "1" or "0") end
+        end
+    else
+        BOWEYE.loopAt, BOWEYE.checked = nil, false
+    end
+    if NET.myEyes == nil then return "-" end
+    return NET.myEyes and "1" or "0"
+end
+
+-- 收
+function BOWEYE.recv(v)
+    if v == "1" then NET.reye = true elseif v == "0" then NET.reye = false else NET.reye = nil end
+end
+
+function CHG.laserEyesOn(pup, id, f, inst)
+    local L = CHG.LASER
+    if NET.reye == false then
+        CHG.laserEmitLog("独眼弓激光：远端#%d 对方的光柱没有眼睛（eye=0）→ 替身不生成", id)
+        return
+    end
+    local hasP, hasMe = CHG.hasTag(pup, L.EYE_TAG), CHG.hasTag(getP1(), L.EYE_TAG)
+    -- 11:30 实测：你和替身都读不到这个标签，可你自己放激光时有眼睛 → 标签读法 / 开关不对，先不看标签、每次都生成
+
+    local bd = LO.geClass(L.EYE_BD)
+    if not bd then CHG.laserEmitLog("独眼弓激光：远端#%d 眼睛子弹数据加载不了", id); return end
+    -- 11:4x 用户：只出来 1 只（真人 2 只）、朝天上射（同 §119 火枪：替身瞄准组件没锁目标）→ 生成 2 只；
+    -- 眼睛在的时候替身瞄准组件锁你（对方没锁你时光柱收了就撤，同火枪）
+    local tn = now()
+    ZMX.p1Lock(false, "独眼弓眼睛"); ZMX.p1LockUntil = tn + L.max
+    local tc = LO.targetingComp(pup)
+    if tc then ZMX.tcLock(tc); if not NET.rlk then ZMX.tcUnlockAt = tn + L.max end end
+    f.eyes, f.eyesAt = {}, tn
+    local how = CHG.laserEyesSpawn(pup, f, inst, bd)
+    CHG.laserEmitLog("独眼弓激光：远端#%d 替身眼睛 %d/%d 只（%s；瞄准组件%s；你%s眼睛升级）", id, #f.eyes, L.EYES, tostring(how),
+        tc and "锁你" or "没有", hasMe and "有" or "没有")
+end
+
+function CHG.laserEmitOff(id, f, why)
+    if f.eyes and not NET.rlk then ZMX.p1LockUntil, ZMX.tcUnlockAt = 0, now() end   -- §139.8 眼睛收了：撤掉锁你
+    for _, e in ipairs(f.eyes or {}) do G.destroyActor(e) end      -- §139.8
+    f.eyes = nil
+    if not f.emitter then return end
+    local info = G.emitterInfo(f.emitter)
+    local ok = G.destroyActor(f.emitter)
+    f.emitter = nil
+    CHG.laserEmitLog("独眼弓激光：远端#%d 收伤害发射器（%s）%s：收之前 %s", id, why, ok and "成功" or "失败", info)
+end
+
+function CHG.laserBeamOff(id, f, why)
+    local L = CHG.LASER
+    local n = G.destroyComps(f.beam)
+    CHG.laserEmitOff(id, f, why)             -- §139.7
+    f.beam, L.beams[id] = nil, nil
+    L.beamLogN = L.beamLogN + 1
+    if L.beamLogN <= 20 then out("独眼弓激光：远端#%d 替身光柱收（%s，收了 %d 个）", id, why, n) end
+end
+
+-- 每帧：光柱对准你；这一发收了 / 记录没了 / 替身没了就收光柱
+function CHG.laserBeamStep(pup)
+    local L = CHG.LASER
+    for id, f in pairs(L.beams) do
+        if CHG.fired[id] ~= f then CHG.laserBeamOff(id, f, "记录没了")
+        elseif f.laserDone or not valid(pup) then CHG.laserBeamOff(id, f, f.laserDone and "这一发收了" or "替身没了")
+        else
+            BOWAIM.aimBeam(pup, f.beam)
+            -- §139.9 对方说他的光柱没有眼睛：收掉
+            if f.eyes and NET.reye == false then
+                for _, e in ipairs(f.eyes) do G.destroyActor(e) end
+                f.eyes = nil
+                CHG.laserEmitLog("独眼弓激光：远端#%d 对方的光柱没有眼睛（eye=0）→ 收掉替身的眼睛", id)
+            end
+            -- §139.8 眼睛都没了、光柱还在 → 再生成一对（真人按着时一直有眼睛）
+            if f.eyes and f.eyeBD and now() - (f.eyesAt or 0) > 0.5 and CHG.laserEyesGone(f) then
+                local inst = LO.activeInstance(pup, CHG.LASER.name)
+                if inst then
+                    for _, e in ipairs(f.eyes) do G.destroyActor(e) end
+                    f.eyes, f.eyesAt = {}, now()
+                    f.eyesN = (f.eyesN or 1) + 1
+                    local how = CHG.laserEyesSpawn(pup, f, inst, f.eyeBD)
+                    if f.eyesN <= 3 then CHG.laserEmitLog("独眼弓激光：远端#%d 眼睛没了、光柱还在 → 第 %d 对 %d 只（%s）", id, f.eyesN, #f.eyes, tostring(how)) end
+                end
+            end
+            if f.emitter then                 -- §139.7 发射器跟着光柱（位置 + 朝向）
+                local at, r = CHG.laserBeamPose(pup, f)
+                local okM = G.moveEmitter(f.emitter, at, r)
+                if not okM and not f.emitMoveErr then f.emitMoveErr = true; CHG.laserEmitLog("独眼弓激光：远端#%d 发射器跟着光柱挪失败", id) end
+            end
+        end
+    end
+end
+
+-- §139.3 独眼弓的瞄准：09:16 实测真人的光柱朝向 = 镜头朝向（俯仰 / 左右都跟，P5 Y44 → P14 Y22 → P6 Y108…；角色左右也跟镜头）。
+-- 所以放独眼弓（我的动作带 UnnamedBow）时状态包带 aim=<俯仰>:<左右>（镜头），对方替身的光柱照这个朝向转、
+-- 替身控制器也转过去（R2 那一箭 / 眼睛按控制器朝向瞄）。没收到 aim=（旧版 / 没在放）就照旧对准你
+BOWAIM = { KEEP = 0.5 }
+
+function BOWAIM.norm(a) a = a % 360; if a > 180 then a = a - 360 end; return a end
+
+-- 发
+function BOWAIM.wire()
+    if not (type(NET.hrPrev) == "string" and NET.hrPrev:find("UnnamedBow", 1, true)) then return "-" end
+    local pc = getP1PC()
+    if not valid(pc) then return "-" end
+    local ok, r = pcall(function() return pc:GetControlRotation() end)
+    if not (ok and r) then return "-" end
+    return string.format("%.1f:%.1f", BOWAIM.norm(r.Pitch), BOWAIM.norm(r.Yaw))
+end
+
+-- 收
+function BOWAIM.recv(v, tn)
+    local p, y = tostring(v or ""):match("^(%-?[%d.]+):(%-?[%d.]+)$")
+    if p then NET.raim, NET.raimAt = { Pitch = tonumber(p), Yaw = tonumber(y) }, tn end
+end
+
+-- 对方的瞄准（KEEP 秒内收到过的）
+function BOWAIM.peer(tn)
+    if NET.raim and tn - (NET.raimAt or -99) <= BOWAIM.KEEP then return NET.raim end
+    return nil
+end
+
+-- 光柱按对方镜头朝向转（替身控制器也转过去）；对方锁定着你（lk=1，真人的光柱对着锁定目标）或没收到 aim= 就对准你
+function BOWAIM.aimBeam(pup, comps)
+    local r = not NET.rlk and BOWAIM.peer(now())
+    if r then
+        if valid(pup) then G.setControlRot(pup, r) end
+        local n = G.rotateComps(comps, r)
+        -- 10:0x 用户：光柱连续了但不跟着扫。看写进去的朝向读回来对不对（对 = 特效本身不认组件朝向）
+        BOWAIM.diagN = (BOWAIM.diagN or 0) + 1
+        if BOWAIM.diagN % 30 == 1 and BOWAIM.diagN < 600 then
+            out("独眼弓瞄准：光柱写 (P%.0f Y%.0f) %d 个，读回 %s；替身朝向 %s", r.Pitch, r.Yaw, n,
+                G.compRotStr(comps[1]), G.compRotStr(pup))
+        end
+        return n
+    end
+    return G.aimComps(comps, CHG.laserAimAt())
+end
+
+-- §139.3 独眼弓 R2（GA_DuYan_Bow_Normal_C）：按住是瞄准（Combat Aiming=true、走路速度 300，09:16 探针），松手才射。
+-- 替身没有输入，一放就射。改成：对方按住期间替身只播瞄准动作，收到对方松手（rel=）再放这招，放之前控制器转到对方的镜头朝向
+BOWN = { NAME = "GA_DuYan_Bow_Normal_C", AIM_MON = "AM_Hun_UnnamedBow_Charge", MAX = 6.0, wait = {}, logN = 0, ON = false,
+         REL_FN = "OnRelease_613C82514C82F322FA98A9B9A7C5EC90", REL_TRY = false }
+-- 10:0x 用户：R2 按得越久箭越多（1 → 3 根），替身每次只射 1 根。技能变量里没有档位（09:16 探针），多半是松手事件
+-- OnRelease_<guid>(TimeHeld) 按按住时长定几根；替身走的是 OnAlreadyRelease。实验：替身放出来后马上调 OnRelease(对方按的秒数)
+-- 09:55 实测：调用成功，但一根箭都没了（不调时 1 根、能打中）→ 先关掉（REL_TRY），箭数另查
+
+function BOWN.log(fmt, ...)
+    BOWN.logN = BOWN.logN + 1
+    if BOWN.logN <= 40 then out(fmt, ...) end
+end
+
+-- AIR.fire 一开头问：这一发要不要先等松手（要等就记下、播瞄准动作，返回 true）
+-- fire = AIR.fire（AIR 在后面才定义，这里拿不到）
+function BOWN.defer(pup, e, tn, fire)
+    if not BOWN.ON or e.name ~= BOWN.NAME or e.bownGo or not CHG.peerRel or CHG.rel[e.id] then return false end
+    BOWN.wait[e.id] = { e = e, at = tn, fire = fire }
+    local ok = playNamed(pup, BOWN.AIM_MON)
+    BOWN.log("独眼弓 R2：远端#%d 对方按住瞄准 → 替身先播瞄准动作 %s，等松手再射", e.id, ok and "成功" or "失败")
+    return true
+end
+
+-- §139.5 替身转到对方的镜头朝向（对方锁定着你就不转，锁定会对准你）
+function BOWN.aimNow(pup, tn)
+    local r = not NET.rlk and BOWAIM.peer(tn)
+    if r and valid(pup) then G.setControlRot(pup, r); setYaw(pup, r.Yaw) end
+    BOWN.log("独眼弓 R2：替身松手射，瞄 %s", r and string.format("P%.0f Y%.0f", r.Pitch, r.Yaw) or (NET.rlk and "对方锁定着你" or "没收到 aim="))
+end
+
+function BOWN.step(p1, pup, tn)
+    for id, w in pairs(BOWN.wait) do
+        local secs = CHG.rel[id]
+        if secs or tn - w.at > BOWN.MAX or not valid(pup) then
+            BOWN.wait[id] = nil
+            if valid(pup) then
+                if montageOf(pup) == BOWN.AIM_MON then cutMontage(pup) end
+                local r = not NET.rlk and BOWAIM.peer(tn)
+                if r then G.setControlRot(pup, r); setYaw(pup, r.Yaw) end
+                w.e.bownGo = true
+                local ok = w.fire(p1, pup, w.e, tn)
+                local rel = "没调"
+                if ok and secs and BOWN.REL_TRY then
+                    local inst = LO.activeInstance(pup, BOWN.NAME)
+                    if inst then
+                        local okR, errR = LO.callArgs(inst, BOWN.REL_FN, secs)
+                        rel = okR and string.format("调 OnRelease(%.2f) 成功", secs) or ("调 OnRelease 失败 " .. tostring(errR):sub(-80))
+                    else rel = "技能已经没在放" end
+                end
+                BOWN.log("独眼弓 R2：远端#%d %s → 替身射 %s（瞄 %s；%s）", id,
+                    secs and string.format("对方按了 %.2f 秒", secs) or "等太久", ok and "成功" or "失败",
+                    r and string.format("P%.0f Y%.0f", r.Pitch, r.Yaw) or (NET.rlk and "对方锁定着你" or "没收到 aim="), rel)
+            end
+        end
+    end
+end
+
 -- 每帧：替身按对方的秒数松手；"一直等松手"的招还在蓄力动作上就停掉
 function CHG.pupStep(pup, tn)
     for id, f in pairs(CHG.fired) do
         CHG.selfStep(pup, id, f, tn)
+        CHG.laserStep(pup, id, f, tn)       -- §139
         local secs = CHG.rel[id]
+        if CHG.VEHICLE.names[f.name] and valid(pup) then
+            if secs and tn >= f.at + secs then CHG.vehicleOff(pup, id, f, tn, string.format("对方按了 %.2f 秒", secs))
+            elseif not secs and tn - f.at > CHG.VEHICLE.MAX then CHG.vehicleOff(pup, id, f, tn, "没等到松手") end
+        end
         if not f.done and secs and tn >= f.at + secs then
             f.done = true
             if CHG.WAIT[f.name] and valid(pup) then
@@ -3581,7 +4941,7 @@ function CHG.pupStep(pup, tn)
                     end
                 end
             end
-        elseif f.at and tn - f.at > CHG.JUDGE_MAX + 2 then CHG.fired[id] = nil end
+        elseif f.at and tn - f.at > CHG.maxAge(f.name) + 2 then CHG.fired[id] = nil end
     end
 end
 
@@ -3590,11 +4950,12 @@ function CHG.keepJudge(j, tn, pupM)
     local age = tn - j.at
     local late = j.name and CHG.LATE[j.name]
     if late and age < late then return true end
-    if not (j.name and CHG.isHold(j.name)) or age > CHG.JUDGE_MAX then return false end
+    if not (j.name and CHG.isHold(j.name)) or age > CHG.maxAge(j.name) then return false end
     local f = CHG.fired[j.id]
     if f and pupM and pupM ~= "" and f.mon[pupM] then return true end     -- 替身还在播这一招的动作（蓄力 / 出招）
     local secs = CHG.rel[j.id]
     if secs then return age < secs + JUDGE_WIN end
+    if j.name == CHG.LASER.name then return CHG.peerRel end               -- §139 激光对方按多久照多久（maxAge 封顶）
     return CHG.peerRel and age < CHG.NO_REL_WAIT                          -- 新版对方：还没松手，接着等
 end
 
@@ -3615,9 +4976,132 @@ function CHG.finish(w, tn, why)
         w.spec0 ~= nil and CHG.spec(w.spec0) or "（没查）", w.spec1 ~= nil and CHG.spec(w.spec1) or "（没查）", tn - w.at, why)
 end
 
+-- §139.2 只读探针（独眼弓两招）：你和替身放独眼弓激光 / R2 普通招时，每 0.5 秒记一次技能变量、子弹和光柱朝向、你的镜头朝向，
+-- 查：光柱伤害从哪来、单发激光的眼睛、光柱朝向怎么定、R2 蓄力的档位存在哪。最多 BOWP.MAX 行，函数表每招只在头一次
+BOWP = { NAMES = { "GA_DuYan_Bow_Laser_C", "GA_DuYan_Bow_Normal_C" }, EVERY = 0.5, MAX = 160, n = 0, at = 0, fn = {},
+         PROPS = { "Bullet", "Laser", "Lazer", "Charge", "Hold", "Time", "Level", "Damage", "Eye", "Summon", "Aim", "Niagara", "Cost", "Rise", "Count", "Stage" },
+         OBJS = { "BulletInstance", "BulletData", "LaserNS", "LazerNSSystem" }, since = {} }
+
+function BOWP.rot(o)
+    local ok, r = pcall(function() return o:K2_GetComponentRotation() end)
+    if not (ok and r) then ok, r = pcall(function() return o:K2_GetActorRotation() end) end
+    return ok and r and string.format("(P%.0f Y%.0f)", r.Pitch, r.Yaw) or "?"
+end
+
+function BOWP.str(v) return type(v) == "table" and table.concat(v, " ") or tostring(v) end
+
+function BOWP.one(actor, who, tn)
+    for _, name in ipairs(BOWP.NAMES) do
+        local inst = valid(actor) and LO.activeInstance(actor, name)
+        local key = who .. name
+        if not inst then BOWP.since[key] = nil
+        else
+            BOWP.since[key] = BOWP.since[key] or tn
+            BOWP.n = BOWP.n + 1
+            if not BOWP.fn[name] then
+                BOWP.fn[name] = true
+                out("独眼弓探针：%s 技能函数 %s", name, BOWP.str(LO.funcsLike(inst, ".")))
+            end
+            local objs = {}
+            for _, k in ipairs(BOWP.OBJS) do
+                local v = rawProp(inst, k)
+                if v ~= nil then objs[#objs + 1] = k .. "=" .. (valid(v) and (shortName(full(v)) .. BOWP.rot(v)) or "空") end
+            end
+            local cam = ""
+            if who == "我" then
+                local okR, r = pcall(function() return getP1PC():GetControlRotation() end)
+                cam = okR and r and string.format("，镜头 (P%.0f Y%.0f)", r.Pitch, r.Yaw) or ""
+            end
+            out("独眼弓探针：%s %s %.1f 秒：%s；%s；角色朝向 %s%s", who, name, tn - BOWP.since[key],
+                BOWP.str(LO.propsLike(inst, name == "GA_DuYan_Bow_Normal_C" and { "" } or BOWP.PROPS)), table.concat(objs, " "), BOWP.rot(actor), cam)
+        end
+    end
+end
+
+-- 光柱伤害发射器（我自己按住时的 BulletInstance = BP_PBZ_ProjectileEmitter_C）的类链、函数、全部变量：看怎么给替身也生成一个
+function BOWP.dumpEmitter(bi)
+    BOWP.biDone = true
+    local chain, c = {}, nil
+    local okC, cls = pcall(function() return bi:GetClass() end)
+    c = okC and cls or nil
+    for _ = 1, 8 do
+        if not valid(c) then break end
+        chain[#chain + 1] = full(c)
+        local okS, sup = pcall(function() return c:GetSuperStruct() end)
+        c = okS and sup or nil
+    end
+    out("独眼弓探针：发射器 %s 类链 %s", full(bi), table.concat(chain, " < "))
+    out("独眼弓探针：发射器函数 %s", BOWP.str(LO.funcsLike(bi, ".")))
+    out("独眼弓探针：发射器变量 %s", BOWP.str(LO.propsLike(bi, { "" })))
+    for _, k in ipairs({ "Owner", "Instigator", "BulletData", "Data", "OwnerAbility", "Ability", "Target", "AttachParent" }) do
+        local v = rawProp(bi, k)
+        if v ~= nil then out("独眼弓探针：发射器 %s = %s", k, valid(v) and full(v) or tostring(v)) end
+    end
+end
+
+-- 10:08 实测：160 行全被替身的激光用完，轮到你自己按住时已经不记了 → 读发射器不受行数限制，替身最多 PUP_MAX 行
+BOWP.PUP_MAX, BOWP.pupN = 20, 0
+
+function BOWP.emitterCheck(p1)
+    local inst = valid(p1) and LO.activeInstance(p1, "GA_DuYan_Bow_Laser_C")
+    local bi = inst and rawProp(inst, "BulletInstance")
+    if valid(bi) then BOWP.dumpEmitter(bi) end
+end
+
+function BOWP.step(p1, pup, tn)
+    if (BOWP.n >= BOWP.MAX and BOWP.biDone and BOWP.subDone and (BOWP.scanN or 0) >= 60) or tn < BOWP.at then return end
+    -- 只在有独眼弓的招时读：我这边看 netSend 已经记下的当前动作（不另读），替身看在记的远端招
+    local mine = type(NET.hrPrev) == "string" and NET.hrPrev:find("UnnamedBow", 1, true) ~= nil
+    local his = false
+    for _, f in pairs(CHG.fired) do if f.name and f.name:find("GA_DuYan_Bow", 1, true) then his = true end end
+    if not (mine or his or next(BOWP.since)) then return end
+    BOWP.at = tn + BOWP.EVERY
+    -- 探针出错不能拖垮这一帧后面的驱动（09:01 concat 报错每 0.5 秒打断一次 tick）
+    local ok, err = pcall(function()
+        if not BOWP.biDone and mine then BOWP.emitterCheck(p1) end
+        if not BOWP.subDone and his then      -- §139.6 子弹数据（BD_GA_DuYanBow_Laser_Emitter）的全部函数和参数类型（只记一次）
+            local inst = valid(pup) and LO.activeInstance(pup, "GA_DuYan_Bow_Laser_C")
+            local bd = inst and rawProp(inst, "BulletData")
+            if valid(bd) then
+                BOWP.subDone = true
+                for _, l in ipairs(G.bulletSubsysProbe(bd) or {}) do out("独眼弓探针：%s", l) end
+                -- §139.7 10:46：CreateBullet 生成的发射器所有者空、状态 0 → 看子弹接口 BulletInterface 有哪些函数（初始化 / 开始）
+                for _, l in ipairs(G.bulletSubsysProbe(G.findObj("/Script/SGameCombatSystem.BulletInterface"), true) or {}) do out("独眼弓探针：接口 %s", l) end
+                for _, l in ipairs(G.bulletSubsysProbe(G.findObj("/Script/SGameCombatSystem.BulletActorBase"), true) or {}) do out("独眼弓探针：基类 %s", l) end
+            end
+        end
+        -- §139.7 11:00 替身的发射器 Initialize + Start 后状态 2、所有者对，还是不打人，位置每发都一样 → 对比两边场上的子弹
+        if (BOWP.scanN or 0) < 60 then
+            BOWP.scanN = (BOWP.scanN or 0) + 1
+            local function who(o)
+                if valid(o) and sameObj(o, p1) then return "我" end
+                if valid(o) and valid(pup) and sameObj(o, pup) then return "替身" end
+                return nil
+            end
+            local li = valid(p1) and LO.activeInstance(p1, "GA_DuYan_Bow_Laser_C")
+            local bi = li and rawProp(li, "BulletInstance")
+            local myLoc = valid(p1) and try("p1 loc", function() return p1:K2_GetActorLocation() end)
+            out("独眼弓子弹：%s%s", G.bulletScan(who), valid(bi) and string.format("；我的发射器 %s，我在 (%.0f, %.0f, %.0f)",
+                G.bulletWhere(bi), myLoc and myLoc.X or 0, myLoc and myLoc.Y or 0, myLoc and myLoc.Z or 0) or "")
+        end
+        if BOWP.n < BOWP.MAX then
+            BOWP.one(p1, "我", tn)
+            if BOWP.pupN < BOWP.PUP_MAX then
+                local n0 = BOWP.n
+                BOWP.one(pup, "替身", tn)
+                BOWP.pupN = BOWP.pupN + (BOWP.n - n0)
+            end
+        end
+    end)
+    if not ok then BOWP.n = BOWP.n + 10; out("独眼弓探针出错：%s", tostring(err)) end
+end
+
 -- 每帧调（netStep 驱动替身之后）。没有在记的条目、没有等着松手的替身招时什么都不读
 function CHG.step(p1, pup, tn)
+    BOWP.step(p1, pup, tn)                 -- §139.2 只读探针
+    if next(BOWN.wait) then BOWN.step(p1, pup, tn) end   -- §139.3 R2 等对方松手再射
     if next(CHG.fired) then CHG.pupStep(pup, tn) end
+    if next(CHG.LASER.beams) then CHG.laserBeamStep(pup) end    -- §139.1 激光柱对准你 / 到点收
     if #CHG.list == 0 then return end
     if not CHG.probed and valid(pup) then
         CHG.probed = true
@@ -3724,17 +5208,25 @@ end
 
 -- 远端一个出招事件在替身身上放出来（以前直接写在 netRecv 里；排队的空中招到时也走这里，判定窗口从真放出来时开）
 function AIR.fire(p1, pup, e, tn)
+    if BOWN.defer(pup, e, tn, AIR.fire) then return true end      -- §139.3 独眼弓 R2：等对方松手再射
     if ULT.isUlt(e.name) then ULT.topUp(pup) end        -- v0.27.2 对方放成功了才会发来：替身充能至少 1 格
     local before = select(3, LAT.activeMontage(pup))
     if CHG.PRE[e.name] then CHG.upgrade(pup, e.name, CHG.PRE[e.name]); CHG.potDiag(pup, "放之前") end    -- §92.7
     if LO.isEdgeAttack(e.name) then ST.pupEdgeAt = tn end      -- v0.23.7 影之武装伤害系数
     -- §106 武器平衡：放之前就把这招的系数写进替身攻击力（以前等下一次驱动，前摇极短的招可能先出伤害）
     if isAttackAbility(e.name) and BAL.onFire(e.name, tn) then LO.rescale(pup, tn) end
+    local inp = INP.press(pup, e.name, e.id)                -- §140 实验：先按住键
     local ok = activateOnPuppet(pup, e.name, NET.sub, "远端#" .. e.id)
-    if isAttackAbility(e.name) then openJudge(p1, e.id, tn, e.name); ST.pupAtkAt = tn end
+    -- §155 替身根本没放出来的招不开判定窗口（11-08 双开：替身悬在虚空放不出招，我摔死掉的血全被记成这招打中），直接回报落空
+    if isAttackAbility(e.name) then
+        if ok then openJudge(p1, e.id, tn, e.name); ST.pupAtkAt = tn else addResult("miss", e.id, 0, tn) end
+    end
     if ok and not CHG.isHold(e.name) then LAT.afterFire(pup, e, before, tn) end     -- v0.27.0 追帧（§92 蓄力招不追：跳前摇会把蓄力段跳乱）
     if ok then ANIM.afterFire(pup, e, before, tn) end     -- §100 放成功却没换动作 → 补
     if ok and CHG.isHold(e.name) then CHG.onFire(pup, e, tn) end        -- §92 替身按对方的松手时刻松手
+    if CHG.fired[e.id] then CHG.fired[e.id].inp = inp end
+    if ok and inp then INP.log("输入实验：远端#%d 替身技能接上 Ability Input Component：%s", e.id, G.linkAbilityInput(pup, e.name)) end
+    if not ok and inp then INP.release(e.id, "没放出来") end
     if ok then ZMX.onFire(pup, e, tn) end                               -- §119 紫冥剑 DB：起手停住等对方召唤
     if ok and CHG.watched(e.name) then CHG.watch(pup, "替身", e.name, tn, e.id) end
     if ok and e.name:find("_Jump", 1, true) then AIR.jumpGAAt = tn end
@@ -4136,7 +5628,7 @@ local function netSend(p1, tn)
     end
     NOMED.frame(p1, tn)
     -- §111 技能里面按键换的动作（紫冥剑召唤）：换成新的一个时次数 +1，发 sub=<次数>:<动作名>，对方替身照播
-    if hm ~= NET.hrPrev and LO.isSubMontage(hm) then
+    if hm ~= NET.hrPrev and (LO.isSubMontage(hm) or CHG.isLaserSub(hm, NET.hrPrev)) then    -- §139 加独眼弓激光
         NET.subN, NET.subT = (NET.subN or 0) + 1, hm
     end
     -- §118 闪避动作（往哪边翻）：换成新的一个时次数 +1，发 dg=<次数>:<动作名>，对方替身翻同一个方向
@@ -4178,7 +5670,8 @@ local function netSend(p1, tn)
     fileWrite(F_LOCAL, string.format(
         "v=2\nseq=%d\nmap=%s\nx=%.1f\ny=%.1f\nz=%.1f\nyaw=%.1f\nvx=%.1f\nvy=%.1f\nw=%s\nev=%s\nhp=%.1f\nhpm=%.1f\nres=%s\n"
         .. "mt=%s\narena=%s\ndead=%d\nrdy=%d\nquit=%d\natt=%s\nwc=%s\narm=%d\npas=%s\nwcs=%s\nbrk=%d:%s\nhr=%d:%s\nlk=%d\nsh=%.1f\nshm=%.1f\n",
-        NET.seq, mapName(p1), loc.X, loc.Y, loc.Z, rot.Yaw, vx, vy, ST.p1Weapon or "", table.concat(evs, ","),
+        NET.seq, mapName(p1), loc.X, loc.Y, loc.Z, rot.Yaw, vx, vy, ST.p1Weapon or STD.idOf(NET.wcStr) or "",     -- §155 没切过武器时按手上配置
+        table.concat(evs, ","),
         hp or -1, hpm or -1, table.concat(res, ","), MATCH.wire.mt, MATCH.wire.arena, MATCH.wire.dead,
         MATCH.wire.rdy, MATCH.wire.quit, NET.attStr or "", NET.wcStr or "", LO.armed(p1) and 1 or 0, NET.pasStr or "", NET.wcsStr or "", NET.brkN or 0, NET.brkM or "-", NET.hrN or 0, NET.hrT or "-",
         NET.myLk(p1),                    -- v0.23.3 lk=1：我锁定着对手（对方据此让替身出招时追着他）；§132 也问瞄准组件
@@ -4192,6 +5685,8 @@ local function netSend(p1, tn)
         .. "bal=" .. NET.flagCfg.bal .. "\n"   -- §106.5 我的"武器平衡"设置（只有主机的算数）
         .. "medok=" .. NET.flagCfg.med .. "\n"   -- §108 我的"血瓶"设置（只有主机的算数；med= 已经是喝药动作）
         .. "npos=" .. NET.flagCfg.npos .. "\n"  -- §128.2 我的"对手位置严格跟随"设置（只有主机的算数）
+        .. "std=" .. NET.flagCfg.std .. "\n"    -- §144 我的"标准数值"设置（只有主机的算数）
+        .. "cfgh=" .. CFG.wire() .. "\n"       -- §158 我的数值表哈希（只有主机的算数；客机对不上就来要）
         .. "ult0=" .. NET.resCfg.ult0 .. "\nsp0=" .. NET.resCfg.sp0 .. "\nresm=" .. NET.resCfg.resm .. "\n"   -- §113 我的开局精纯杀气 / 暗源 / 每场每局（只有主机的算数）
         .. "ultx=" .. NET.resCfg.ultx .. "\n"   -- §113.4 我的精纯杀气获取倍率 %（只有主机的算数）
         .. "med=" .. (NET.medN or 0) .. ":" .. (NET.medT or "-") .. "\n"   -- §103 喝药动作（次数:动作名）
@@ -4201,6 +5696,9 @@ local function netSend(p1, tn)
         .. "gd=" .. (BLK.on and 1 or 0) .. "\n"                            -- §104 我在不在格挡（对方据此预测替身的反应）
         .. "tc=" .. TOUCH.wire(tn) .. "\n"                                 -- §107 我哪几招在本机碰到了替身（本地 AI 据此回报）
         .. "td=" .. TOUCH.wireDmg() .. "\n"                                -- §115 这几招在本机打出的伤害（已乘系数，本地 AI 按它扣血）
+        .. "aim=" .. BOWAIM.wire() .. "\n"                                 -- §139.3 放独眼弓时我的镜头朝向（俯仰:左右）
+        .. "eye=" .. BOWEYE.wire(p1, tn) .. "\n"                              -- §139.9 我的光柱有没有眼睛（1 / 0 / - 还没数过）
+        .. "wlv=" .. STD.wireLv() .. "\n"                                 -- §148 我手上武器 / 影之武装的等级（对方替身按它补等级倍率）
         .. (NET.ofStr ~= "" and ("of=" .. NET.ofStr .. "\n") or "")        -- §109 我的皮肤（行名:肤色:帽子）
         .. LAT.wire(tn, NET.events)        -- v0.27.0 ts= / tse= / evt=：测往返和包龄
         .. CHG.wire(tn))                   -- §92 rel=<招式号>:<按了几秒>：蓄力招松手
@@ -4211,7 +5709,14 @@ end
 local function netRecv(p1, tn)
     local list = PIPE and PIPE.recv()
     if not list then list = { fileReadKV(F_REMOTE) } end
-    for _, t in ipairs(list) do NET.recvOne(p1, tn, t) end
+    for _, t in ipairs(list) do
+        -- §141 观战：主机转发来的两路包（src=h / src=c）交给观战代码，不当成对手
+        if t.src then
+            if ST.spec then ST.spec.feed(t, tn) end
+        else
+            NET.recvOne(p1, tn, t)
+        end
+    end
 end
 
 function NET.recvOne(p1, tn, t)
@@ -4254,6 +5759,8 @@ function NET.recvOne(p1, tn, t)
     LAT.onVel(NET.vel, vel, tn)                                                -- v0.27.0 急转 → 暂不外推
     NET.vel = vel
     NET.rmt, NET.rarena, NET.rdead = t.mt, t.arena, tonumber(t.dead) or 0     -- M4 对局字段，matchStep 处理
+    BOWAIM.recv(t.aim, tn)
+    BOWEYE.recv(t.eye)                                                         -- §139.9 对方的光柱有没有眼睛                                                     -- §139.3 对方放独眼弓时的镜头朝向
     NET.rlk = t.lk == "1"                                                      -- v0.23.3 对方锁定着我（旧版没有这个字段 = 不追）
     NET.rai = t.ai == "1"                                                      -- v0.26.0 对方是 AI（本地 AI / 测试假对手）：回合倒计时才强制归位
     NET.rnm = t.nm                                                             -- §85.5 对方昵称（联机程序加的 nm=）：AI 换人看它变没变
@@ -4289,15 +5796,18 @@ function NET.recvOne(p1, tn, t)
     local sn, sm = (t.sub or ""):match("^(%d+):([%w_%-]+)$")
     sn = tonumber(sn)
     if sn then
-        if NET.subIn and sn > NET.subIn and LO.isSubMontage(sm) and not REP.on then
+        local laser = CHG.isLaserIn(sm)                  -- §139 独眼弓激光的光束 / 松手那一箭
+        if NET.subIn and sn > NET.subIn and (laser or LO.isSubMontage(sm)) and not REP.on then
             local pupS = puppet()
             montageByName(sm, true)
-            local called, how = ZMX.onSub(pupS, sm, tn)   -- §119 让替身的技能自己召唤；调成了就不再照播动作
+            local called, how
+            if not laser then called, how = ZMX.onSub(pupS, sm, tn) end   -- §119 让替身的技能自己召唤；调成了就不再照播动作
             local okS = called or playNamed(pupS, sm)
             if okS then
-                local fid
-                for id, f in pairs(CHG.fired) do if f.name == "GA_Hun_ZiMingJian_New_DB_C" and (not fid or id > fid) then fid = id end end
+                local want, fid = laser and CHG.LASER.name or "GA_Hun_ZiMingJian_New_DB_C", nil
+                for id, f in pairs(CHG.fired) do if f.name == want and (not fid or id > fid) then fid = id end end
                 if fid then CHG.fired[fid].mon[sm] = true end
+                if fid and laser and sm == CHG.LASER.shoot then CHG.fired[fid].shotAt = tn end   -- §139 对方光束照完（松手 / 暗源用完）
             end
             out("  对方技能内动作 %s%s → 替身 %s", sm, sn > NET.subIn + 1 and string.format("（中间漏了 %d 个）", sn - NET.subIn - 1) or "",
                 called and how or okS and "已播" or "播放失败（本机没有这个动作）")
@@ -4329,6 +5839,8 @@ function NET.recvOne(p1, tn, t)
     end
     if t.arm == "1" then NET.rarm = true elseif t.arm == "0" then NET.rarm = false else NET.rarm = nil end
     NET.rwcs = (t.wcs and t.wcs ~= "") and t.wcs or nil -- v0.17.4 对方当前的影之武装
+    local lvW, lvS = (t.wlv or ""):match("^([^:]*):(.*)$")  -- §148 对方那两把的等级；旧版本 / 本地 AI 没有 = nil，不补
+    NET.rlvW, NET.rlvS = tonumber(lvW), tonumber(lvS)
     NET.rwge = t.wge                                    -- §118 对方的武器效果；旧版本 = nil，不动替身
     NET.rpas = t.pas                                    -- v0.17.2 对方的天赋 / 饰品被动；没有这个字段（旧版本）= nil，不动替身
     NET.rof = LO.decodeOutfit(t.of)                     -- §109 对方的皮肤；没有这个字段（旧版本 / 本地 AI）= nil，不动替身
@@ -4437,6 +5949,7 @@ function NET.recvOne(p1, tn, t)
         if (MATCH.session and MATCH.session.role) == "client" and rb then out("对手血条：主机设为 %d（2 血量+杀气 / 1 只显示血 / 0 不显示）", rb) end
         NET.rbar = rb
     end
+    CFG.onPacket(t.cfgh, now())     -- §158 主机的数值表哈希：对不上就经可靠通道要一份
     local rbo = tonumber(t.bo)      -- v0.26.3 对方的局数设置（我是客机时按它走）
     if rbo ~= NET.rbo then
         if (MATCH.session and MATCH.session.role) == "client" and rbo then out("局数：主机设为 %d 局（先赢 %d 回合）", rbo, NET.toWin(rbo)) end
@@ -5478,6 +6991,7 @@ end
 function SAFE.step()
     local g = SAFE.guard
     if not g then return end
+    if ST.spec and ST.spec.on then SAFE.guard = nil; return end      -- §141 观战时角色藏着、冻着，不挪它
     if now() > g.till or not valid(g.actor) then SAFE.guard = nil; return end
     local loc = try("safe guard", function() return g.actor:K2_GetActorLocation() end)
     if loc and loc.Z < g.z - SAFE_FALL then
@@ -6054,10 +7568,14 @@ local function matchRows(tn)
         if MATCH.flags and MATCH.flags.ctr == false then rules[#rules + 1] = T("无红蓝光反击", "NO RED/BLUE COUNTERS") end   -- §105.3
         if MATCH.flags and MATCH.flags.bal then rules[#rules + 1] = T("武器平衡", "WEAPON BALANCE") end                     -- §106.5
         if MATCH.flags and MATCH.flags.med == false then rules[#rules + 1] = T("禁用血瓶", "NO POTIONS") end                -- §108
+        if STD.active() then rules[#rules + 1] = T("标准数值", "STANDARD STATS") end                                         -- §144
+        if CFG.srcNote and (STD.active() or (MATCH.flags and MATCH.flags.bal)) then
+            rules[#rules + 1] = T("数值表用本地（和主机不一致）", "LOCAL TABLES (HOST MISMATCH)")                               -- §158
+        end
         if MATCH.res then   -- §113 / §113.2
             local tx = NET.resText("resm", MATCH.res.resm or 0)
             rules[#rules + 1] = string.format(T("精纯杀气 %d · 暗源 %d（%s）", "ULT %d · EDGE %d (%s)"), MATCH.res.ult0, MATCH.res.sp0, T(tx[1], tx[2]))
-            if (MATCH.res.ultx or 100) ~= 100 then rules[#rules] = rules[#rules] .. string.format(T(" · 杀气获取 %d%%", " · ULT GAIN %d%%"), MATCH.res.ultx) end   -- §113.4
+            if (MATCH.res.ultx or 100) ~= 100 then rules[#rules] = rules[#rules] .. string.format(T(" · 精纯杀气获取 %d%%", " · ULT GAIN %d%%"), MATCH.res.ultx) end   -- §113.4（§142 用户：写全"精纯杀气"，"杀气"是另一样东西）
         end
         if #rules > 0 then rows[#rows + 1] = { c = table.concat(rules, " · "), col = COL_ORANGE } end
         local rkRow = NET.rkScoreRow()     -- §110 武林盟主：我的积分 / 名次
@@ -6198,6 +7716,9 @@ local function enter(p1, s, tn, why)
             MATCH.state = "idle"
         end
         refill(p1)
+        if MATCH.round == 1 then CFG.begin() end                    -- §158 这一场用主机的数值表（客机收齐了）还是本地的
+        if MATCH.round == 1 then STD.lv, STD.eq.at = {}, -100 end   -- §148 两场之间可能升过级 / 换过配装：等级缓存每场重读
+        STD.apply(p1, "第 " .. MATCH.round .. " 回合倒计时")         -- §144 标准数值（先于 §113：精纯杀气 / 暗源的上限由它定）
         NET.resApply(p1, "第 " .. MATCH.round .. " 回合倒计时")      -- §113
         if MATCH.round == 1 then NET.attrDiffLog(p1) end             -- §116.2 只读：我和替身的属性差在哪
         out("== 第 %d 回合 倒计时 %.0f 秒（我 %d : %d 对方）；我是%s，%s ==",
@@ -6214,6 +7735,7 @@ local function enter(p1, s, tn, why)
         REL.send("mend", string.format("%d %d %d", MATCH.id, MATCH.me, MATCH.op))
     end
     if s == "fight" then
+        STD.apply(p1, "第 " .. MATCH.round .. " 回合开打")           -- §144
         NET.resApply(p1, "第 " .. MATCH.round .. " 回合开打")        -- §113 倒计时里的回满效果可能补满了它们，开打再写一次
         out("== 第 %d 回合 开打 ==", MATCH.round)
     elseif s == "rend" then
@@ -6226,6 +7748,8 @@ local function enter(p1, s, tn, why)
         -- v0.17.10：对局外不再锁血（见下面"陪练保护"），对局一结束就解锁，不管还连没连着
         if not LO.IDLE_LOCK or tn - NET.lastRecvAt > 1.0 then unlockSelf(p1, why or "对局结束") end
         standUp(p1); standUp(puppet())
+        STD.restore(p1)          -- §144 先还原血上限等，再回满
+        CFG.finish()             -- §158 数值表换回本地
         refill(p1)
         NET.resRestore(p1)       -- §113 还原对局前的精纯杀气 / 暗源
         MATCH.res = nil
@@ -6302,6 +7826,7 @@ local MAPGO = { pending = nil, armAt = nil, guardTill = nil, warned = nil }
 local MAPGO_ARM_SEC = 5        -- 第一次按 F1 后多少秒内再按算确认
 local MAPGO_TIMEOUT = 120      -- 发起后这么久（os.time 秒）还没到目标地图 = 失败
 local MAPGO_GUARD = 20         -- 到达后防掉落检查的秒数
+local MAPGO_NEAR = 5000        -- §156 同一张地图、离主机这么近（50 米）就不传送；远了先提示，F1 连按两次确认再传
 local MAPGO_FALL = 1500.0      -- 比主机低这么多算掉出地图
 local MAPGO_LIFT = 150.0       -- 落点抬高，别卡进地面
 MAPGO.TIMEOUT = MAPGO_TIMEOUT  -- 切图冻结（驱动段，M4 外面）用
@@ -6344,13 +7869,19 @@ function MAPGO.logName(level, pos)
 end
 
 -- 现在能不能去主机的地图："ok" 或原因（same / host / match / pp / lost / pending / nomap / notstory）。p1 不给 = 玩家1
+-- §141 观战者也能"前往主机所在地图"：观战收到的主机包（src=h）不进 NET.recvOne，SP.feed 只填 NET.rmap / pos / yaw 和 NET.specAt
+function NET.since()
+    return now() - ((sessionRole() == "spec") and (NET.specAt or -100) or NET.lastRecvAt)
+end
+
 function MAPGO.check(p1)
     local target = NET.rmap
     if not target or target == "" or target == mapName(p1 or getP1()) then return "same" end
-    if sessionRole() ~= "client" then return "host" end
+    local role = sessionRole()
+    if role ~= "client" and role ~= "spec" then return "host" end
     if MATCH.role then return "match" end
     if PP.on then return "pp" end
-    if now() - NET.lastRecvAt >= 1.0 then return "lost" end
+    if NET.since() >= 1.0 then return "lost" end
     if MAPGO.pending then return "pending" end
     if not NET.pos then return "nomap" end
     if not G.isStoryMap(target) then return "notstory" end
@@ -6439,6 +7970,32 @@ function MAPGO.step(p1, myMap)
     return arrived
 end
 
+-- §156 同一张地图离主机多远（米）；读不到 = nil
+function MAPGO.dist(p1)
+    local loc = NET.pos and try("mapgo dist", function() return p1:K2_GetActorLocation() end)
+    if not loc then return nil end
+    local dx, dy = loc.X - NET.pos.X, loc.Y - NET.pos.Y
+    return math.sqrt(dx * dx + dy * dy) / 100.0
+end
+
+-- §156 同地图但离得远：传送到主机身边要确认（11-08 双开：两边存档进度不同，主机脚下那块地在客机的世界里是虚空，自动传送直接摔死）。
+-- confirmed = 面板按钮；F1 要连按两次。传过去后照样有 MAPGO_GUARD 秒防掉落
+function MAPGO.toHost(p1, confirmed)
+    if MATCH.role then out("!! 对局中不能传送"); return false end
+    local tc = os.time()
+    if not confirmed and not (MAPGO.farArmAt and tc - MAPGO.farArmAt <= MAPGO_ARM_SEC) then
+        MAPGO.farArmAt = tc
+        out("== 传送到主机身边（离主机 %.0f 米）：%d 秒内再按一次 F1 确认 ==", MAPGO.dist(p1) or -1, MAPGO_ARM_SEC)
+        return false
+    end
+    MAPGO.farArmAt = nil
+    local pos = MAPGO.besideHost(p1)
+    MAPGO.far, MAPGO.guardTill = nil, tc + MAPGO_GUARD
+    if pos then out("== 传送到主机身边 (%.0f, %.0f) ==", pos.X, pos.Y)
+    else out("== 主机身边放不下，留在原地（自己走过去）==") end
+    return true
+end
+
 -- 地图不同时只提示一次（日志）；屏幕提示在 idleRows
 function MAPGO.notice(myMap)
     if MAPGO.warned == NET.rmap then return end
@@ -6453,7 +8010,7 @@ end
 
 -- 屏幕提示（idleRows 在两边地图不同时用）
 function MAPGO.rows(tn)
-    local client = sessionRole() == "client"
+    local client = sessionRole() == "client" or sessionRole() == "spec"
     local why = MAPGO.check()
     local title = client and T("主机在另一张地图", "HOST IS ON ANOTHER MAP") or T("对方在另一张地图", "OPPONENT IS ON ANOTHER MAP")
     local mapUp = MAPGO.label(NET.rmap, NET.pos)
@@ -6505,9 +8062,17 @@ local function matchStart()
         wireUpdate()
         return
     end
+    if sessionRole() == "spec" then      -- §141 观战者：F1 只用来前往主机所在地图
+        if MAPGO.check(p1) ~= "same" then MAPGO.go(p1) else out("观战中：F1 不用来准备") end
+        return
+    end
     if tn - NET.lastRecvAt > 1.0 then out("!! 还没连上对手"); return end
     if sessionRole() == "client" and MAPGO.check(p1) ~= "same" then    -- v0.24.1 地图不同：F1 = 前往主机所在地图
         MAPGO.go(p1)
+        return
+    end
+    if sessionRole() == "client" and MAPGO.far and not MATCH.role then     -- §156 同地图但离得远：F1 = 传送到主机身边
+        MAPGO.toHost(p1)
         return
     end
     if (hpOf(p1) or 0) <= 0 and not MATCH.lock then
@@ -6583,6 +8148,13 @@ REL.on.rend = function(rest)      -- 主机：第几回合谁赢、比分（客�
     if id then out("  主机回报：对局 #%s 第 %s 回合 %s，比分 主机 %s : %s 客机", id, rd, w == "d" and "平局" or (w == "h" and "主机赢" or "客机赢"), hs, cs) end
 end
 REL.on.chat = function(rest) CHAT.recv(rest) end      -- §112 房内聊天（CHAT 在联机面板段）
+REL.on.cfgreq = function(rest)    -- §158 客机要我的数值表
+    if (MATCH.session and MATCH.session.role) == "client" then return end
+    out("数值表：对方要 %s（我现在是 %s）", tostring(rest), tostring(CFG.localHash))
+    CFG.sendAll()
+end
+REL.on.cfg = function(rest) CFG.onChunk(rest) end     -- §158 主机发来的数值表（一块）
+CFG.rel = REL     -- §158 CFG 段在 REL 前面定义，看不到这个 local
 REL.on.mend = function(rest)      -- 主机：对局打完了、最终比分
     local id, hs, cs = rest:match("^(%d+) (%d+) (%d+)$")
     id = tonumber(id)
@@ -6594,12 +8166,19 @@ end
 
 local function lobbyStep(p1, tn, lost)
     SAFE.step()     -- v0.26.2 放下后掉出地图 → 放回原处（§79）
+    if ST.spec then pcall(ST.spec.Q.tick, tn) end      -- §141.7 对手不准备超时 → 换下一位
     HOV.step(tn)    -- §99 悬空等地形加载（客机放到主机身边、替身瞬移到远处）
     if ST.ticks % 30 == 0 then
         local kv = fileReadKV(SESSION_FILE)
         local was = MATCH.session and MATCH.session.role
+        local wasRelay = MATCH.session and MATCH.session.relay
+        -- §141.8 主机回来打：收起观战（主机下场时收到的两路包已经停了）
+        if kv and wasRelay == "1" and kv.relay ~= "1" and ST.spec and ST.spec.on then ST.spec.stop("主机回来打") end
         MATCH.session = kv
-        if kv and kv.role ~= was then out("联机会话：%s（对端 %s）", tostring(kv.role), tostring(kv.peer)) end
+        if kv and kv.role ~= was then
+            out("联机会话：%s（对端 %s）", tostring(kv.role), tostring(kv.peer))
+            if ST.spec then ST.spec.onRole(was, kv.role) end      -- §141 换了会话：观战可以重新自动开；§141.7 上场 / 下场
+        end
     end
     local fresh = lost < 1.0
     -- §116.1 对手断开超过 LOST_SEC 秒就忘掉"上一个对手是 AI / 叫什么"：不然下一个连接被当成 AI 房间换人（§85.5 按昵称变没变）。
@@ -6632,16 +8211,33 @@ local function lobbyStep(p1, tn, lost)
     if PP.on and not MATCH.role then MATCH.ready = false; return end     -- 不传送、不开局
     -- 客机：连上后瞬移到主机身边（同一张地图时）；地图不同就提示，玩家确认后切图（v0.24.1，MAPGO 段）
     local myMap = mapName(p1)
-    if sessionRole() == "client" then MAPGO.step(p1, myMap) end
+    if sessionRole() == "client" or sessionRole() == "spec" then MAPGO.step(p1, myMap) end
+    -- §141 观战者：主机在别的地图就提示（观战代码这时不摆替身）
+    if sessionRole() == "spec" and NET.rmap and NET.rmap ~= myMap and NET.since() < 1.0 then MAPGO.notice(myMap) end
     if sessionRole() == "client" and not MATCH.joined and NET.pos then
         if NET.rmap and NET.rmap ~= myMap then
             MAPGO.notice(myMap)
         else
-            local pos = MAPGO.besideHost(p1)
+            -- §156 不再自动传送：近就不动，远就提示（F1 连按两次 / 面板按钮）
+            local d = MAPGO.dist(p1)
             MATCH.joined = true
-            if pos then out("== 已加入主机：传送到主机身边 (%.0f, %.0f) ==", pos.X, pos.Y)
-            else out("== 已加入主机：主机身边放不下，留在原地（自己走过去）==") end
+            if MAPGO.guardTill then     -- 刚切图过来（落在主机脚下）：照旧放到主机身边，防掉落继续管
+                local pos = MAPGO.besideHost(p1)
+                if pos then out("== 已加入主机：传送到主机身边 (%.0f, %.0f) ==", pos.X, pos.Y)
+                else out("== 已加入主机：主机身边放不下，留在原地（自己走过去）==") end
+            elseif d and d <= MAPGO_NEAR / 100.0 then
+                out("== 已加入主机：离主机 %.0f 米，不传送 ==", d)
+            else
+                MAPGO.far = true
+                out("== 已加入主机：离主机 %s 米，对局外连按两次 F1（或联机面板\"传送到主机身边\"）过去 ==", d and string.format("%.0f", d) or "?")
+            end
         end
+    end
+    -- §156 自己走近了就不再提示（不是客机了也清掉）
+    if MAPGO.far and sessionRole() ~= "client" then MAPGO.far = nil end
+    if MAPGO.far and sessionRole() == "client" then
+        local d = MAPGO.dist(p1)
+        if d and d <= MAPGO_NEAR / 100.0 then MAPGO.far = nil; out("== 已走到主机附近（%.0f 米），不用传送了 ==", d) end
     end
     -- 主机：双方都准备好就开局
     if not MATCH.role and sessionRole() ~= "client" and MATCH.ready and (NET.rrdy or 0) == 1 then
@@ -6668,6 +8264,8 @@ NETUI.BUSY_SEC = 5.0
 NETUI.BUSY = {
     host = { "正在创建房间", "CREATING THE ROOM" }, ai = { "正在开始 AI 对战", "STARTING THE AI BATTLE" },
     join = { "正在加入", "JOINING" }, stop = { "正在断开", "DISCONNECTING" }, mode = { "正在切换连接方式", "SWITCHING" },
+    spectate = { "正在进入观战", "JOINING AS SPECTATOR" }, rotate = { "正在换人", "ROTATING" }, tospec = { "正在下场", "STEPPING DOWN" },
+    hostdown = { "正在下场", "STEPPING DOWN" }, hostup = { "正在回来", "COMING BACK" },
 }
 for _, c in ipairs({ "name", "port", "upnp", "relay", "server", "secret", "lang", "ailevel", "aiload", "airoom", "airoommode" }) do
     NETUI.BUSY[c] = { "正在保存", "SAVING" }
@@ -6772,7 +8370,7 @@ end
 -- pbz_lobby_start 调一次：它只起一个后台线程（已经在跑就什么也不做），不碰 lua_State。没有这个 DLL / 载不进来 /
 -- 连着 2 次拉起后还没响应，退回启动 PBZLobby.exe（两者用同一个 net 目录的单实例锁，不会同时跑两份）
 local function netuiLaunchDll()
-    if NETUI.dllOff then return false end
+    if NETUI.dllOff then return false end     -- §153 第二份也用 DLL（DLL 自己判断用 net2）
     local dll = (ROOT .. "/pbz_lobby.dll"):gsub("/", "\\")
     local f = io.open(dll, "rb")
     if not f then NETUI.dllOff = true; return false end
@@ -6811,6 +8409,7 @@ local function netuiLaunch()
     end
     local dir = ROOT:gsub("/", "\\")
     local cmd = string.format('cmd /c start "" "%s\\PBZLobby.exe" --bg', dir)
+    if INST.slot == 2 then cmd = cmd .. string.format(' --dir "%s"', NET_DIR:gsub("/", "\\")) end     -- §151
     local ok, r = pcall(os.execute, cmd)
     NETUI.launchErr = (not ok) and tostring(r) or nil
     out("联机面板：启动联机窗口 %s -> %s %s", cmd, ok and "已执行" or "失败", tostring(r))
@@ -6972,7 +8571,11 @@ local function editCommit()
     local s = (e.text or ""):gsub("[\r\n|]", " "):gsub("^%s+", ""):gsub("%s+$", "")
     editEnd("回车")
     if s == "" then return end
-    if e.kind == "chat" then CHAT.send(s); return end      -- §112（CHAT.add 自己记日志）
+    if e.kind == "chat" then             -- §112（CHAT.add 自己记日志）；§150 只输一个数字 = 第几句快捷短语
+        local n = tonumber(s:match("^[1-9]$") or "")
+        if n then CHAT.sendPhrase(n) else CHAT.send(s) end
+        return
+    end
     out("联机面板：输入「%s」→ %s", e.kind == "secret" and "***" or s, e.kind)   -- 密码不进日志
     if e.kind == "join" then NETUI.sel = 1; netuiCmd("join", "target=" .. s .. "\n")
     elseif e.kind == "name" then netuiCmd("name", "name=" .. s .. "\n")
@@ -7026,14 +8629,14 @@ local function roomLabel(kind, label)
         local r = MAPGO.PLACES and MAPGO.PLACES.regions[string.lower(lv)]
         return pre .. (r and T(r[1], r[2]) or lv)
     end)
-    if kind == "full" then
+    if kind == "full" or kind == "watch" then     -- §141 watch = 满了但能观战
         label = T("[已满] ", "[FULL] ") .. label:gsub(T("  已满", "  full"), "", 1)
     end
     return label
 end
 
--- 能点"加入"的房间：kind = full（已满的房间）和 nohost（§123 在玩但没开房的 Steam 好友）列出来但不算"可加入"
-local function roomOpen(t) return t.kind ~= "full" and t.kind ~= "nohost" end
+-- 能点"加入"的房间：kind = full（已满的房间）、watch（§141 满了、能观战）和 nohost（§123 在玩但没开房的 Steam 好友）列出来但不算"可加入"
+local function roomOpen(t) return t.kind ~= "full" and t.kind ~= "nohost" and t.kind ~= "watch" and t.kind ~= "watchf" end
 
 -- lobby.txt 里的加入目标分两类：剪贴板 / 最近（快捷加入，放主页）和房间（局域网房间、开房的 Steam 好友、服务器 / Steam 大厅的房间、
 -- Tailscale 节点，放房间列表页）。kind = full 是已满的房间（v0.19.1 起联机程序单独标），列出来但选不中
@@ -7063,6 +8666,11 @@ end
 -- inList = 房间列表页：不加"加入"前缀，多留几个字给末尾的房间号
 local function joinItem(t, inList)
     if t.kind == "full" then return { label = clipText(t.label, 40), target = t.target } end   -- 已满：说明行（灰、跳过）
+    -- §141 满了、主机认观战的局域网房间（联机程序标 watch）/ 开房的 Steam 好友（watchf）：点了以观战者身份连进去
+    if t.kind == "watch" or t.kind == "watchf" then
+        return { label = clipText(T("观战 ", "WATCH ") .. t.label, 40), target = t.target,
+                 act = function() netuiCmd("spectate", "target=" .. t.target .. "\n") end }
+    end
     if t.kind == "nohost" then     -- §123 没开房的好友：能点，但只提示，不发起注定超时的连接
         return { label = clipText(t.label, 40), target = t.target,
                  act = function() netuiFlash(T("对方还没开房", "THEY ARE NOT HOSTING YET"), COL_ORANGE) end }
@@ -7551,7 +9159,11 @@ local function netuiItems(lb, tn)
         if not netuiStarting() then
             items[#items + 1] = { label = T("重新启动联机程序", "RESTART THE ONLINE HELPER"),
                                   act = function() NETUI.tries = 0; netuiLaunch() end }
-            items[#items + 1] = { label = T("（还不行：手动打开 Mods\\PBZ_MP\\PBZLobby.exe）", "(STILL NOT: OPEN Mods\\PBZ_MP\\PBZLobby.exe)") }
+            -- §122 起发布包没有 PBZLobby.exe（联机程序是游戏里的 pbz_lobby.dll）：只有 exe 真在时才叫人手动打开它
+            local exe = io.open((ROOT .. "/PBZLobby.exe"):gsub("/", "\\"), "rb")
+            if exe then exe:close() end
+            items[#items + 1] = { label = exe and T("（还不行：手动打开 Mods\\PBZ_MP\\PBZLobby.exe）", "(STILL NOT: OPEN Mods\\PBZ_MP\\PBZLobby.exe)")
+                                              or T("（还不行：重启游戏；原因在 Mods\\PBZ_MP\\net\\lobby_errors.log）", "(STILL NOT: RESTART THE GAME; SEE Mods\\PBZ_MP\\net\\lobby_errors.log)") }
         end
         return items
     end
@@ -7560,7 +9172,7 @@ local function netuiItems(lb, tn)
     -- v0.27.21 感谢名单（设置里的一页）：参与测试并反馈了 bug 的玩家
     if NETUI.page == "thanks" then
         items[#items + 1] = { label = T("参与测试并反馈了 bug 的玩家（B 站）：", "PLAYERS WHO TESTED AND REPORTED BUGS (BILIBILI):") }
-        for _, n in ipairs({ "成步堂芦苇", "谦逊的刘恒宇", "亦如黎明中的花朵_" }) do items[#items + 1] = { label = "  " .. n } end
+        for _, n in ipairs({ "成步堂芦苇", "谦逊的刘恒宇", "亦如黎明中的花朵_", "絡訸", "化境", "一一清风以及他的小伙伴们" }) do items[#items + 1] = { label = "  " .. n } end
         items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
         return items
     end
@@ -7572,6 +9184,7 @@ local function netuiItems(lb, tn)
     if NETUI.page == "rankkey" then NETUI.rankKeyItems(lb, tn, items, page); return items end
     if NETUI.page == "aiload" then NETUI.aiLoadItems(lb, items, page); return items end     -- §114 AI 装备
     if NETUI.page == "aipick" then NETUI.aiPickItems(lb, items, page); return items end
+    if NETUI.page == "phrases" and CHAT.phraseItems(lb, items, page) then return items end    -- §150 快捷短语
     -- 房间设置页（用户 2026-11-06"单独出个页面放房间设置"）：主机 / 没联机时点了换值，客机只看主机定的；都是下一局生效
     if NETUI.page == "room" then
         -- v0.25.0 对手血条档位（房间设置，HANDOVER §73）：主机 / 没联机时点一下换下一档；客机只看主机定的
@@ -7603,7 +9216,9 @@ local function netuiItems(lb, tn)
                 items[#items + 1] = { label = T("全部可格挡：", "ALL MOVES BLOCKABLE: ") .. onOff(rk.ab == 1), act = fixed }
                 for _, k in ipairs(NET.FLAG_KEYS) do
                     local nm = NET.FLAG_NAME[k]
-                    items[#items + 1] = { label = T(nm[1] .. "：", nm[2] .. ": ") .. onOff(rk[k] == 1), act = fixed }
+                    if not NET.FLAG_LOCKED[k] then
+                        items[#items + 1] = { label = T(nm[1] .. "：", nm[2] .. ": ") .. onOff(rk[k] == 1), act = fixed }
+                    end
                 end
                 for _, k in ipairs(NET.RES_KEYS) do     -- §113
                     local nm = NET.RES_NAME[k]
@@ -7655,7 +9270,9 @@ local function netuiItems(lb, tn)
         for _, k in ipairs(NET.FLAG_KEYS) do
             local nm = NET.FLAG_NAME[k]
             local function lbl(on) return T(nm[1] .. "：", nm[2] .. ": ") .. (on and T("开", "ON") or T("关", "OFF")) end
-            if lb.role == "client" then
+            if NET.FLAG_LOCKED[k] then
+                -- §144.1 锁住的不显示
+            elseif lb.role == "client" then
                 items[#items + 1] = { label = lbl(NET.flag(k)) .. T("（主机设置）", " (HOST'S SETTING)"),
                                       act = function() netuiFlash(T(nm[1] .. "由主机设置", "THE HOST DECIDES THIS RULE")) end }
             else
@@ -7683,6 +9300,7 @@ local function netuiItems(lb, tn)
                                       end }
             end
         end
+        if ST.spec then ST.spec.Q.items(items, T, lb.role == "client" or lb.role == "spec", netuiFlash, lb, netuiCmd) end   -- §141.7 排队规矩
         items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
         return items
     end
@@ -7711,7 +9329,10 @@ local function netuiItems(lb, tn)
         items[#items + 1] = { label = T("房间设置…", "ROOM RULES..."), act = page("room") }
         items[#items + 1] = { label = T("语言：中文", "LANGUAGE: ENGLISH"),
                               act = function() netuiCmd("lang", "lang=" .. (LANG.zh and "en" or "zh") .. "\n") end }
-        items[#items + 1] = { label = T("打开电脑上的联机窗口", "OPEN THE DESKTOP WINDOW"), act = function() netuiCmd("show") end }
+        -- §122 游戏里的 pbz_lobby.dll 没有窗口（lobby.txt win=0），只有退回 exe 时才有这个按钮；旧版联机程序不写 win，照旧显示
+        if lb.win ~= "0" then
+            items[#items + 1] = { label = T("打开电脑上的联机窗口", "OPEN THE DESKTOP WINDOW"), act = function() netuiCmd("show") end }
+        end
         items[#items + 1] = { label = T("感谢名单…", "THANKS..."), act = page("thanks") }
         items[#items + 1] = { label = T("返回", "BACK"), act = page("main") }
         return items
@@ -7833,9 +9454,15 @@ local function netuiItems(lb, tn)
             items[#items + 1] = { label = T("前往主机所在地图（会自动存档）", "GO TO THE HOST'S MAP (AUTO-SAVES)"),
                                   act = function() MAPGO.go(getP1(), true) end }
         end
+        if MAPGO.far and sessionRole() == "client" and not MATCH.role then     -- §156
+            items[#items + 1] = { label = T("传送到主机身边", "TELEPORT TO THE HOST"), act = function() MAPGO.toHost(getP1(), true) end }
+        end
         if CHAT.can(lb) then       -- §112
             items[#items + 1] = { label = T("聊天…（Delete）", "CHAT... (DELETE)"), act = function() CHAT.open(true) end }
+            items[#items + 1] = { label = T("快捷短语…", "QUICK PHRASES..."),
+                                  act = function() CHAT.loadPhrases(); page("phrases")() end }      -- §150
         end
+        if ST.spec then ST.spec.Q.panel(items, T, lb, netuiCmd, netuiFlash) end      -- §141.7 换下一位 / 我下去观战 / 排第几
         items[#items + 1] = { label = T("断开", "DISCONNECT"), act = function() netuiCmd("stop") end }
         if lb.role == "host" then items[#items + 1] = copy end      -- 客机复制自己的地址没用
         NETUI.upnpInfo(lb, items)       -- §129
@@ -7930,6 +9557,7 @@ local function netuiRows(tn)
               or NETUI.page == "thanks" and T("联机 · 感谢名单", "ONLINE · THANKS")
               or NETUI.page == "aiload" and T("联机 · AI 装备", "ONLINE · AI LOADOUT")
               or NETUI.page == "aipick" and T("联机 · AI 装备 · 选择", "ONLINE · AI LOADOUT · PICK")
+              or NETUI.page == "phrases" and T("联机 · 快捷短语", "ONLINE · QUICK PHRASES")
               or NETUI.page == "rankkey" and T("联机 · 排位账号", "ONLINE · RANKED ACCOUNT") or T("联机", "ONLINE")
     if NETUI.page == "rank" then        -- §110 排行榜：页码在翻页栏（鼠标面板）/ 标题行（文字面板）
         local sh = NETUI.rankShown or {}
@@ -8257,6 +9885,64 @@ function CHAT.send(s)
     CHAT.add(T("我", "ME"), s, "me")
 end
 
+-- §150 快捷短语（用户 2026-11-08："聊天不是不能输入中文么，可以增加一个定式短语的功能么"）。
+-- 聊天输入框里只输一个数字 1–9 回车 = 发第几句；面板"快捷短语…"页点一下也发。短语在 PBZ_MP\phrases.txt（UTF-8，一行一句，
+-- # 开头的是注释，最多 9 句）；没有这个文件时按当前语言写一份默认的，以后用户改的不覆盖。只在打开聊天 / 这一页时读（不每帧读盘）
+CHAT.PHRASE_MAX = 9
+CHAT.PHRASE_DEF = {
+    { "你好，请多指教", "HI, GOOD LUCK" }, { "好打！", "NICE ONE!" }, { "GG", "GG" },
+    { "再来一局？", "REMATCH?" }, { "等我一下", "WAIT A SEC" }, { "准备好了", "READY" },
+    { "我这边网有点卡", "LAGGING ON MY SIDE" }, { "抱歉", "SORRY" }, { "谢谢", "THANKS" },
+}
+
+function CHAT.phraseFile() return ROOT .. "/phrases.txt" end
+
+function CHAT.loadPhrases()
+    local list, path = {}, CHAT.phraseFile()
+    local f = io.open(path, "r")
+    if f then
+        for line in f:lines() do
+            line = line:gsub("^\239\187\191", "")         -- 记事本存的 UTF-8 带 BOM
+            if not line:match("^%s*#") then
+                local s = CHAT.clean(line)
+                if s ~= "" and #list < CHAT.PHRASE_MAX then list[#list + 1] = s end
+            end
+        end
+        f:close()
+    else
+        local w = io.open(path, "w")
+        if w then
+            w:write(T("# 快捷短语：一行一句，最多 9 句，从上到下是 1–9。用记事本改完存成 UTF-8，下次打开聊天生效\n",
+                      "# Quick phrases: one per line, up to 9 (numbered 1-9 from the top). Save as UTF-8; applies next time chat opens\n"))
+            for _, p in ipairs(CHAT.PHRASE_DEF) do w:write(T(p[1], p[2]), "\n") end
+            w:close()
+            out("聊天：写了一份默认快捷短语 %s", path)
+        end
+    end
+    if #list == 0 then for _, p in ipairs(CHAT.PHRASE_DEF) do list[#list + 1] = T(p[1], p[2]) end end
+    CHAT.phrases = list
+    return list
+end
+
+-- 发第 n 句；正在聊天输入框里就先关掉它（按 Delete 开的会顺带关面板）
+function CHAT.sendPhrase(n)
+    local s = (CHAT.phrases or CHAT.loadPhrases())[n]
+    if NETUI.edit and NETUI.edit.kind == "chat" then editEnd("快捷短语") end
+    if s then CHAT.send(s) end
+end
+
+-- 面板"快捷短语…"页（NETUI.page = "phrases"）；按 Delete 开聊天时也翻到这页，边打字边看编号
+function CHAT.phraseItems(lb, items, page)
+    if not CHAT.can(lb) then NETUI.page = "main"; return false end
+    items[#items + 1] = { label = T("点一下发送；聊天框里输数字 1–9 回车也行", "CLICK TO SEND, OR TYPE 1-9 + ENTER IN CHAT") }
+    for i, s in ipairs(CHAT.phrases or CHAT.loadPhrases()) do
+        items[#items + 1] = { label = i .. ". " .. clipText(s, 40), act = function() CHAT.sendPhrase(i) end }
+    end
+    items[#items + 1] = { label = T("（自己改：Mods\\PBZ_MP\\phrases.txt）", "(EDIT: Mods\\PBZ_MP\\phrases.txt)") }
+    items[#items + 1] = { label = T("返回", "BACK"), act = page("main") }
+    return true
+end
+
 -- 对方发来的一句（REL.on.chat 在 REL.on.mend 旁边，转到这里）
 function CHAT.recv(rest)
     local s = CHAT.clean(rest)
@@ -8311,7 +9997,11 @@ function CHAT.step(tn)
         CHAT.pending = nil
         if NETUI.open and not NETUI.edit then
             -- 游戏关了输入法（2026-11-06 实测：点了输入框也切不到中文），中文只能在别处打好再粘贴
-            editStart("chat", T("说点什么（发给对方；中文请在别处打好后 Ctrl+V 粘贴）", "SAY SOMETHING TO YOUR OPPONENT"), "",
+            -- §150 同时把面板翻到快捷短语页（每次开聊天重读 phrases.txt），输数字 1–9 回车发那一句
+            CHAT.loadPhrases()
+            NETUI.page, NETUI.sel = "phrases", 1
+            editStart("chat", T("说点什么，或输数字 1–9 回车发快捷短语（中文请在别处打好后 Ctrl+V 粘贴）",
+                                "SAY SOMETHING, OR TYPE 1-9 + ENTER FOR A QUICK PHRASE"), "",
                       T("回车发送，Esc 取消", "ENTER TO SEND, ESC TO CANCEL"))
         end
     end
@@ -8536,6 +10226,11 @@ local function netuiKey(what)
         if what == "enter" then editCommit() elseif what == "esc" then editEnd("Esc") end
         return
     end
+    -- §141 观战中、面板关着：PgDn / PgUp 换下一个 / 上一个视角（用户 2026-11-07："有些人没小键盘"）
+    if not NETUI.open and (what == "up" or what == "down") and ST.spec and ST.spec.on then
+        ST.spec.stepCam(what == "down" and 1 or -1)
+        return
+    end
     if not NETUI.open then return end
     -- 鼠标面板开着时游戏收不到 Esc（UIOnly），Esc 关面板；文字面板时 Esc 是游戏的菜单键，不管
     if what == "esc" then if GUI.on then netuiSetOpen(false, "Esc") end; return end
@@ -8584,9 +10279,18 @@ local function idleRows(tn)
         if tn < MATCH.toast.till then return MATCH.toast.rows end
         MATCH.toast = nil
     end
+    -- §141 观战者：主机在别的地图时显示"前往主机所在地图"的提示
+    if sessionRole() == "spec" and NET.since() < 1.0 and NET.rmap and NET.rmap ~= mapName(getP1()) then return MAPGO.rows(tn) end
     if now() - NET.lastRecvAt >= 1.0 then return nil end
     if PP.on then return PP.rows() end     -- 只在我们的对手连着时提示（只玩 Phantom Pact 的人不受打扰）
     if NET.rmap and NET.rmap ~= mapName(getP1()) then return MAPGO.rows(tn) end   -- v0.24.1 切图提示（MAPGO 段）
+    if MAPGO.far and sessionRole() == "client" and not MATCH.role then         -- §156 同地图离得远
+        local d = MAPGO.dist(getP1())
+        local sub = (MAPGO.farArmAt and os.time() - MAPGO.farArmAt <= MAPGO_ARM_SEC)
+            and T("再按一次 F1 确认", "PRESS F1 AGAIN TO CONFIRM") or T("按 F1 传送到主机身边", "F1: TELEPORT TO THE HOST")
+        return { { c = string.format(T("离主机 %s 米", "%s M FROM THE HOST"), d and string.format("%.0f", d) or "?"), col = COL_ORANGE, size = 1.3 },
+                 { c = sub, col = COL_LABEL } }
+    end
     local function readyOf(b) return b and T("已准备", "READY") or T("未准备", "NOT READY"), b and COL_GREEN or COL_RED end
     local s1, c1 = readyOf(MATCH.ready)
     local s2, c2 = readyOf((NET.rrdy or 0) == 1)
@@ -8660,6 +10364,7 @@ local function matchStep(p1, tn)
                 enter(p1, "cd", tn)
             end
         elseif MATCH.state == "end" and tn - MATCH.t0 >= END_SEC then
+            if ST.spec then pcall(ST.spec.matchOver, MATCH.me >= (MATCH.toWin or 2)) end   -- §141.7 打完换人
             enter(p1, "idle", tn, "打完了")
         end
     elseif lost < 1.0 and not PP.on then
@@ -8681,7 +10386,7 @@ local function matchStep(p1, tn)
                 out("陪练中被打倒（血量 %.2f），补满", hp)
                 refill(p1)
             end
-        elseif MATCH.lock and (not LO.IDLE_LOCK or lost > LOST_SEC or not valid(puppet())) then
+        elseif MATCH.lock and (not LO.IDLE_LOCK or lost > LOST_SEC or not valid(puppet())) and not (ST.spec and ST.spec.on) then   -- §141 观战时留着自己的锁血
             unlockSelf(p1, not LO.IDLE_LOCK and "对局外不锁血" or (valid(puppet()) and "对手断开" or "替身已移除"))
         end
     end
@@ -9518,8 +11223,52 @@ local function zhanmaCheck()
         c.hp0 or -1, hp1 or -1, (hp1 or 0) - (c.hp0 or 0), c.php0 or -1, php1 or -1, (php1 or 0) - (c.php0 or 0))
 end
 
+-- §154 测试用"自动出招"：真人对真人测伤害时，由外部工具让本机角色贴近对手、面向它、放指定招 N 次（双开时两份各自执行，
+-- 不用电脑控制走位）。只在模组目录有 autohit.on 时才开（加载时看一次）；开着时每秒读一次 <net>/autohit.txt：
+--   id=任意（换了才算新任务）  move=技能名（如 GA_Hun_WoodenSword_A_C）  n=次数  gap=间隔秒  close=1 先瞬移到对手面前 dist 远
+local AUTOHIT = { on = false, id = nil, job = nil, readAt = -100 }
+do local f = io.open(ROOT .. "/autohit.on", "r"); if f then f:close(); AUTOHIT.on = true end end
+local function autoHitStep()
+    if not AUTOHIT.on then return end
+    local tn = now()
+    if tn - AUTOHIT.readAt >= 1.0 then
+        AUTOHIT.readAt = tn
+        local kv = fileReadKV(NET_DIR .. "/autohit.txt")
+        if kv and kv.id and kv.id ~= AUTOHIT.id then
+            AUTOHIT.id = kv.id
+            AUTOHIT.job = { move = kv.move or "", n = tonumber(kv.n) or 3, gap = tonumber(kv.gap) or 2.0,
+                            close = kv.close == "1", dist = tonumber(kv.dist) or 180.0, i = 0, at = tn }
+            out("== 自动出招 %s：%s × %d，间隔 %.1f 秒%s ==", kv.id, AUTOHIT.job.move, AUTOHIT.job.n, AUTOHIT.job.gap,
+                AUTOHIT.job.close and "，先贴到对手面前" or "")
+        end
+    end
+    local j = AUTOHIT.job
+    if not j or tn < j.at then return end
+    local p1, pup = getP1(), puppet()
+    if not valid(p1) or not valid(pup) then out("!! 自动出招：没有玩家或对手，停"); AUTOHIT.job = nil; return end
+    local a = try("ah loc", function() return p1:K2_GetActorLocation() end)
+    local b = try("ah pup", function() return pup:K2_GetActorLocation() end)
+    if not a or not b then return end
+    local dx, dy = a.X - b.X, a.Y - b.Y
+    local d = math.sqrt(dx * dx + dy * dy)
+    if j.close and d > j.dist + 60 then
+        local k = d > 1 and j.dist / d or 0
+        local to = { X = b.X + dx * k, Y = b.Y + dy * k, Z = b.Z }
+        pcall(function() p1:K2_SetActorLocation(to, false, {}, true) end)
+        a, d = to, j.dist
+    end
+    setYaw(p1, math.deg(math.atan(b.Y - a.Y, b.X - a.X)))
+    local cls
+    for _, x in ipairs(abilitiesOf(p1) or {}) do if x.name == j.move then cls = x.cls end end
+    local ok, r = false, "玩家身上没有这个技能"
+    if cls then ok, r = pcall(function() return ascOf(p1):TryActivateAbilityByClass(cls, true) end) end
+    j.i = j.i + 1
+    out("== 自动出招 %d/%d：%s -> %s（离对手 %.0f）==", j.i, j.n, j.move, tostring(r), d)
+    if j.i >= j.n then out("== 自动出招 %s 完成 ==", AUTOHIT.id); AUTOHIT.job = nil else j.at = tn + j.gap end
+end
+
 return { step = matchStep, start = matchStart, saveArena = saveArena, place = placeTextFrame, medProbe = medProbe,
-         zhanmaTest = zhanmaTest, zhanmaCheck = zhanmaCheck,
+         zhanmaTest = zhanmaTest, zhanmaCheck = zhanmaCheck, autoHitStep = autoHitStep,
          npcExperiment = npcExperiment, uiProbe = function(tag) MATCH.uiProbe(tag) end,
          respawnRecover = respawnRecover, medProbe2 = medProbe2, shareProbe = shareProbe, swapTest = swapTest,
          refillPotions = function() refillPotions("F2 手动") end, netui = netuiKey,
@@ -9527,6 +11276,11 @@ return { step = matchStep, start = matchStart, saveArena = saveArena, place = pl
          ppOn = function() return PP.on end, T = T,
          -- 2026-11-05 切图冻结（驱动段，在这个函数外面）要用：MAPGO 是这里的局部表，导出同一张表
          mapgo = MAPGO,
+         -- §141 观战代码（pbz_spec.lua，在这个函数外面）要用：给联机程序发命令、面板闪一行字（2026-11-07 19:03 实测：
+         -- 以前在外面直接写 netuiCmd / netuiFlash 拿到的是 nil，观战断开 / 排队换人 / 准备超时的命令都没发出去）
+         cmd = netuiCmd, flash = netuiFlash, panelOpen = function() return NETUI.open end,
+         -- §149.1 读档换世界时清掉落地保护记着的旧角色（SAFE 是这里的局部表，M4.forgetWorld 在外面看不到）
+         forgetSafe = function() SAFE.guard = nil end,
          peerName = function() local lb = netuiRead(now()) or {}; return (lb.peername or "") ~= "" and lb.peername or nil end }
 end)()
 
@@ -9879,7 +11633,10 @@ end
 
 local function onTick()
     ST.ticks = ST.ticks + 1
+    local okC, errC = pcall(CFG.refresh, now())     -- §158 联机程序从大厅服务器拿到新数值表了没有（对局外、15 秒看一次）
+    if not okC and errC ~= CFG.err then CFG.err = errC; out("!! 数值表刷新出错：%s", tostring(errC)) end
     local p1 = getP1()
+    if valid(p1) and not STD.cleaned and ST.stableTicks > 30 then STD.cleanup() end     -- §144 上次没还原的强制配装
     if not valid(p1) then
         if ST.stableTicks > 0 then out("玩家角色不可用（读档/切图？），暂停") end
         ST.stableTicks = 0
@@ -9914,6 +11671,8 @@ local function onTick()
     end
     M4.step(p1, now())
     M4.zhanmaCheck()
+    local okH, errH = pcall(M4.autoHitStep)     -- §154 测试用自动出招（没有 autohit.on 时直接返回）
+    if not okH and errH ~= ST.ahErr then ST.ahErr = errH; out("!! 自动出招出错：%s", tostring(errH)) end
     local okS, errS = pcall(SUMMON.step, p1, puppet(), now())
     if not okS and errS ~= SUMMON.err then SUMMON.err = errS; out("!! 替身召唤物出错：%s", tostring(errS)) end
     local okC, errC = pcall(CHAT.step, now())     -- §112 聊天
@@ -9966,6 +11725,22 @@ function M4.mapgo.freeze(target, from)
     OPPBAR.actor, OPPBAR.bar, OPPBAR.last, OPPBAR.nameAt = nil, nil, {}, nil
     ST.travel = { at = os.time(), target = target, from = from, loadedAt = nil, ok = 0 }
     out("== 切图冻结：替身已藏起，加载完之前模组不碰游戏对象 ==")
+end
+
+-- §149 2026-11-08 08:51:34 崩溃：菜单里读档换了世界（不走上面的冻结），蓄力探针 CHG.list 里还留着上一个世界的替身
+-- （对方 08:49:45 掉线时那一招没记完，CHG.step 只在驱动替身时跑），重新连上后 CHG.step → montageSection(w.actor) 读已销毁
+-- 角色的 Mesh → UE4SS 里访问违例。加载钩子来了就把所有"跨帧记着的角色"丢掉；只清 Lua 状态，不碰任何游戏对象。
+-- 旧世界的对象别指望 valid() 兜住：UE4SS 的 IsValid 也要先读对象自己的内存（序号），对象已释放时读到的是别的数据
+function M4.forgetWorld()
+    ST.secondPC, ST.secondPawn, ST.abList, ST.abIdx, ST.pupWeapon, ST.bareTest = nil, nil, nil, 0, nil, nil
+    ST.watch.pup = {}
+    ST.npcStore, ST.npcCtl, ST.p1pc, ST.testMonster = nil, nil, nil, nil
+    MATCH.autoPup, MATCH.hold = nil, {}
+    OPPBAR.actor, OPPBAR.bar, OPPBAR.last, OPPBAR.nameAt = nil, nil, {}, nil
+    CHG.list, CHG.fired, CHG.LASER.beams, BOWN.wait = {}, {}, {}, {}
+    LAT.pend, ANIM.pend, ZMX.cur = nil, nil, nil
+    M4.forgetSafe()
+    HOV.list, ULT.pend, SUMMON.mine = {}, {}, {}
 end
 
 -- 驱动每次调：true = 冻结中（这次什么都不做）
@@ -10089,6 +11864,7 @@ end
 local function startWatchdog()
     if type(LoopAsync) ~= "function" then return end
     LoopAsync(2000, function()
+        INST.beat()                    -- §147 双开：告诉第二份"我还在"
         local last = ST.lastTickAt or 0
         -- 切图加载时游戏线程本来就停着，这时重启驱动只会在加载中多跑一个循环（09:07:33 重启后 1 秒就崩了）
         if ST.travel then return false end
@@ -10147,6 +11923,8 @@ for _, nm in ipairs({ "RegisterLoadMapPostHook", "RegisterInitGameStatePostHook"
             local c = os.clock()
             if not ST.mapLoadAt or c - ST.mapLoadAt > 2 then ST.mapLoads = ST.mapLoads + 1 end
             ST.mapLoadAt = c
+            if ST.spec then ST.spec.onMapLoad() end      -- §141 观战原型：旧世界的替身 / 镜头作废（只清 Lua 状态）
+            M4.forgetWorld()       -- §149 菜单读档也换世界，不只是我们自己切图
         end)
         out("挂加载钩子 %s：%s", nm, okH and "成功" or ("失败 " .. tostring(errH)))
         if okH then M4.mapgo.loadHook = nm end
@@ -10314,6 +12092,25 @@ end, "移除替身")
 bind(Key.HOME, function() M4.netui("toggle") end, "联机面板")
 -- §112 聊天：Delete（输入框里按 Delete 是删字，CHAT.open 自己跳过）
 bind(Key.DEL, function() CHAT.open(false) end, "聊天")
+-- §141 观战：小键盘 * 换镜头（侧面中点 / 跟 A / 跟 B / 自由视角）。代码在 pbz_spec.lua；
+-- 小键盘数字和 + - 是 PBZ_MC 的。包一层函数：主代码块的 local 已满 200 个
+ST.spec = (function()
+    local ok, mk = pcall(require, "pbz_spec")
+    if not ok then ok, mk = pcall(dofile, ROOT .. "/Scripts/pbz_spec.lua") end
+    if not (ok and type(mk) == "function") then out("!! 加载 pbz_spec.lua 失败：%s", tostring(mk)); return nil end
+    return mk({ out = out, ST = ST, MATCH = MATCH, G = G, activate = activateOnPuppet, isAttack = isAttackAbility,
+                loadRecording = loadRecording, recDir = REC_DIR, LO = LO,
+                replayable = replayable, playNamed = playNamed, netCmd = M4.cmd, readKV = fileReadKV, writeFile = fileWrite,
+                rulesFile = NET.RULES_FILE, flash = M4.flash, NET = NET,
+                mapGo = function() local p1 = getP1(); if M4.mapgo.check(p1) == "ok" then M4.mapgo.go(p1, true) end end })
+end)()
+if ST.spec then
+    pcall(ST.spec.Q.load)       -- §141.7 排队规矩（net/rules.txt 的 rot= / rotw=）
+    -- 用户 2026-11-07："观战只需要保留视角快捷键就可以吧"：进出观战走联机面板（满员房间点"观战"、"断开"离开），
+    -- 原型的小键盘 / 开关、. 换动作来源（AI 对打 / 录像包）不再绑；要测原型时临时加回：
+    --   bind(Key.DIVIDE, ST.spec.toggle, "观战原型 开 / 关")；bind(Key.DECIMAL, ST.spec.nextSrc, "观战原型 换动作来源")
+    bind(Key.MULTIPLY, function() if not M4.panelOpen() then ST.spec.nextCam() end end, "观战 换镜头")     -- 面板开着时不换（同 PgUp / PgDn；NETUI 是 M4 里的）
+end
 -- v0.18.6：回车 / Esc 只在游戏内输入框打开时有用（确定 / 取消），平时直接忽略
 for _, kb in ipairs({ { "PAGE_UP", "up" }, { "PAGE_DOWN", "down" }, { "END", "ok" }, { "RETURN", "enter" }, { "ESCAPE", "esc" } }) do
     bind(Key[kb[1]], function() M4.netui(kb[2]) end, "联机面板 " .. kb[2], true)

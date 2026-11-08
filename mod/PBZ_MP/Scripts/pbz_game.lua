@@ -21,9 +21,19 @@ local abilitiesOf           -- 前置声明：定义在下面"技能列表"段
 
 -- ============================================================ UObject 小工具（UE4SS 对象：GetFullName / IsValid / 属性读取 / TArray 遍历）
 
+-- §145 2026-11-07 16:28:53 崩溃（和 11-05 09:07:34 同一处 PBZ.exe+0x144c660）：对已销毁的对象调 GetFullName，UE4SS 去读
+-- 它的类指针 → 访问违例，外面的 pcall 接不住（不是 Lua 错误）。调 GetFullName 前先问 IsValid（查 GUObjectArray，不读类指针）。
+-- 只有 IsValid 明确返回 false 才算失效：结构体 / 属性 / RemoteUnrealParam 这类没有 IsValid 的包装照旧走 GetFullName
+-- 【适配】UObject:IsValid() == false
+local function dead(o)
+    local ok, v = pcall(function() return o:IsValid() end)
+    return ok and v == false
+end
+
 -- 【适配】UObject:GetFullName()（失效对象返回 <invalid>）
 local function full(o)
     if o == nil then return "<nil>" end
+    if dead(o) then return "<invalid>" end
     local ok, r = pcall(function() return o:GetFullName() end)
     if ok and r ~= nil then return r end
     return "<invalid>"
@@ -75,7 +85,7 @@ end
 
 -- 【适配】按 GetFullName 比较两个 UObject 是不是同一个
 local function sameObj(a, b)
-    if a == nil or b == nil then return false end
+    if a == nil or b == nil or dead(a) or dead(b) then return false end     -- §145 失效对象不调 GetFullName
     local ok1, x = pcall(function() return a:GetFullName() end)
     local ok2, y = pcall(function() return b:GetFullName() end)
     return ok1 and ok2 and x ~= nil and x == y
@@ -797,6 +807,25 @@ function LO.config(path)
     return (ok and yes) and cfg or nil
 end
 
+-- §144 方案 A+：只换某个角色某一格的武器配置（和替身换装同一个调用，不碰背包 / 存档；11-08 实测切武器后保留）。返回 成功, 说明
+-- 【适配】Character Weapons Component:SetSlotWeapon(槽, 序号, WeaponConfig)
+function LO.setSlot(actor, slot, idx, path)
+    local cwc = rawProp(actor, "Character Weapons Component")
+    if not valid(cwc) then return false, "没有武器组件" end
+    local cfg = LO.config(path)
+    if not cfg then return false, "配置加载不了 " .. tostring(path) end
+    local ok, err = pcall(function() cwc:SetSlotWeapon(slot, idx, cfg) end)
+    return ok, ok and nil or tostring(err)
+end
+
+-- 【适配】Character Weapons Component:GetCurrentWeaponIndex(槽, false)；读不到 = nil
+function LO.curIndex(actor, slot)
+    local cwc = rawProp(actor, "Character Weapons Component")
+    if not valid(cwc) then return nil end
+    local ok, r = pcall(function() return cwc:GetCurrentWeaponIndex(slot or LO.slot(), false) end)
+    return (ok and type(r) == "number") and r or nil
+end
+
 -- ============================================================ 外观（皮肤）：UPBZAppearanceComponent（§109）
 -- PBZ.exe 字符串：System/Player/PBZAppearanceComponent.cpp，蓝图子类 BP_AppearanceComp；函数 GetEffectiveOutfit /
 -- GetEffectiveSkinColor / IsEffectiveHatHidden / ApplyOutfitVisual / BP_ApplySkinColor / EquipOutfit / SetSkinColor …
@@ -1051,20 +1080,22 @@ function LO.geClass(path)
     return valid(cls) and cls or nil
 end
 
--- 【适配】ASC:BP_ApplyGameplayEffectToSelf(GE 类, 1, ASC:MakeEffectContext())
-function LO.applyGE(actor, path, label)
+-- 【适配】ASC:BP_ApplyGameplayEffectToSelf(GE 类, 等级（默认 1）, ASC:MakeEffectContext())；返回成没成功
+function LO.applyGE(actor, path, label, lv)
     local cls, asc = LO.geClass(path), ascOf(actor)
-    if not (cls and valid(asc)) then out("  %s：%s", label, cls and "没有 ASC" or "找不到 GE"); return end
-    local ok, r = pcall(function() return asc:BP_ApplyGameplayEffectToSelf(cls, 1, asc:MakeEffectContext()) end)
+    if not (cls and valid(asc)) then out("  %s：%s", label, cls and "没有 ASC" or "找不到 GE"); return false end
+    local ok, r = pcall(function() return asc:BP_ApplyGameplayEffectToSelf(cls, lv or 1, asc:MakeEffectContext()) end)
     out("  %s：BP_ApplyGameplayEffectToSelf %s", label, ok and "成功" or ("失败 " .. tostring(r)))
+    return ok
 end
 
--- 【适配】ASC:RemoveActiveGameplayEffectBySourceEffect(GE 类, nil, -1)
+-- 【适配】ASC:RemoveActiveGameplayEffectBySourceEffect(GE 类, nil, -1)。label 为 nil 时不记日志（§159 冲刺冷却每次都清）；返回调用成没成功
 function LO.removeGE(actor, path, label)
     local cls, asc = LO.geClass(path), ascOf(actor)
-    if not (cls and valid(asc)) then return end
+    if not (cls and valid(asc)) then return false end
     local ok, r = pcall(function() asc:RemoveActiveGameplayEffectBySourceEffect(cls, nil, -1) end)
-    out("  %s：RemoveActiveGameplayEffectBySourceEffect %s", label, ok and "成功" or ("失败 " .. tostring(r)))
+    if label then out("  %s：RemoveActiveGameplayEffectBySourceEffect %s", label, ok and "成功" or ("失败 " .. tostring(r))) end
+    return ok
 end
 
 -- §118 身上生效的武器效果 GE：武器升级（白影 GE_Baiying_FrozenReinforced_Lv1–3 / LockFrozenWhileBlocked 加冰冻积累、
@@ -1092,8 +1123,10 @@ function LO.weaponEffects(actor)
             local okM = eachArr(rawProp(def, "Modifiers"), function() n = n + 1 end)
             LO.wgeMods[id] = okM and n or -1         -- 读不到 Modifiers = 不知道，不发
         end
-        -- 只要升级和增益（名字带 Buff）；同目录下还有挨打方身上的效果（白影 GameplayEffects/GE_BaiYing_AssaultTriggered），不发
-        local isUpg = id:find("/UpgradeData/", 1, true) or (id:match("([^/]+)$") or ""):find("Buff", 1, true)
+        -- 只要升级和增益（名字带 Buff）；同目录下还有挨打方身上的效果（白影 GameplayEffects/GE_BaiYing_AssaultTriggered），不发。
+        -- §159 升级 GE 多数在 UpgradeData/，双月 / 破军的在 WeaponUpgrade/（双月进阶冲刺要的 CanSwiftDash 就在这里，以前漏了）
+        local isUpg = id:find("/UpgradeData/", 1, true) or id:find("/WeaponUpgrade/", 1, true)
+            or (id:match("([^/]+)$") or ""):find("Buff", 1, true)
         if LO.wgeMods[id] == 0 and isUpg then list[#list + 1] = id end
     end)
     if not okE then return nil end
@@ -1341,6 +1374,14 @@ function LO.lockCandidates(actor)
     return list
 end
 
+-- §139.4 调对象上一个带参数的蓝图函数（R2 松手事件 OnRelease_<guid>(TimeHeld)）。返回 是否调用成功, 错误
+-- 【适配】obj:<函数名>(参数…)
+function LO.callArgs(obj, fname, ...)
+    if not valid(obj) then return false, "对象无效" end
+    local args = { ... }
+    return pcall(function() obj[fname](obj, table.unpack(args)) end)
+end
+
 -- §119 调对象上一个不带参数的蓝图函数。返回 是否调用成功, 错误
 -- 【适配】obj:<函数名>()
 function LO.callNoArg(obj, fname)
@@ -1356,6 +1397,306 @@ function LO.uiCompOf(actor)
         if ok and sameObj(owner, actor) then return c end
     end
     return nil
+end
+
+-- §139.1 替身的激光柱：真人的激光 = 弓上射出的一道持续光柱（SpawnLoopLaserNS 生成、挂在弓上）+ 两只眼睛按节奏打。
+-- 替身走"早松开了"那条路，只有眼睛、没有光柱。让它的激光技能自己调 SpawnLoopLaserNS，返回这次新生成的 Niagara 组件
+-- 【适配】技能实例:SpawnLoopLaserNS() + 技能变量 "Niagara Comps"（数组）/ LaserNS
+-- §139.4 照技能生成的那份光柱，自己再生成一份一样的（同特效、同父组件 / 插槽 / 偏移）。返回 组件 或 nil, 错误
+-- 【适配】NiagaraComponent:GetAsset / GetAttachParent / GetAttachSocketName / RelativeLocation + Default__NiagaraFunctionLibrary:SpawnSystemAttached
+local function ownBeamCopy(c, inst)
+    local lib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
+    if not valid(lib) then return nil, "找不到 NiagaraFunctionLibrary" end
+    local okA, sys = pcall(function() return c:GetAsset() end)
+    if not (okA and valid(sys)) then sys = rawProp(inst, "LazerNSSystem") end
+    local okP, parent = pcall(function() return c:GetAttachParent() end)
+    local okS, sock = pcall(function() return c:GetAttachSocketName() end)
+    if not (valid(sys) and okP and valid(parent)) then return nil, "读不到特效 / 父组件" end
+    local loc = { X = 0.0, Y = 0.0, Z = 0.0 }
+    pcall(function() local r = c.RelativeLocation; loc = { X = r.X, Y = r.Y, Z = r.Z } end)
+    local ok, r = pcall(function()
+        return lib:SpawnSystemAttached(sys, parent, okS and sock or FName("None"), loc, { Pitch = 0.0, Yaw = 0.0, Roll = 0.0 }, 0, false, true, 0, true)
+    end)
+    if ok and valid(r) then return r end
+    return nil, tostring(r)
+end
+
+-- §139.1 替身的激光柱（说明见上）：让技能调 SpawnLoopLaserNS 生成一份，换成自己生成的（§139.4）。返回 组件列表, 说明
+-- 【适配】技能实例:SpawnLoopLaserNS() + 技能变量 "Niagara Comps"（数组）/ LaserNS
+local function laserBeamSpawn(inst)
+    local function collect()
+        local list = {}
+        local function add(c)
+            if not valid(c) then return end
+            for _, o in ipairs(list) do if sameObj(o, c) then return end end
+            list[#list + 1] = c
+        end
+        eachArr(rawProp(inst, "Niagara Comps"), function(_, c) add(c) end)
+        add(rawProp(inst, "LaserNS"))
+        return list
+    end
+    local before = collect()
+    local ok, err = LO.callNoArg(inst, "SpawnLoopLaserNS")
+    if not ok then return nil, tostring(err) end
+    local after, new = collect(), {}
+    for _, c in ipairs(after) do
+        local old = false
+        for _, b in ipairs(before) do if sameObj(b, c) then old = true end end
+        if not old then new[#new + 1] = c end
+    end
+    if #new == 0 then new = after end          -- 技能复用了原来的组件
+    -- §139.4 技能的那份挂在技能变量上：技能每帧按替身的锁定目标 / AI 朝向转它（光柱一直对着你），一段照完还会把它关掉
+    -- （光柱一段一段断开）。换成自己生成的一份，技能的那份收掉；自己生成不了就还用技能的
+    local own, err = {}, nil
+    for _, c in ipairs(new) do
+        local o, e = ownBeamCopy(c, inst)
+        if o then
+            own[#own + 1] = o
+            pcall(function() c:Deactivate() end)
+            pcall(function() c:K2_DestroyComponent(c) end)
+        else own[#own + 1] = c; err = e end
+    end
+    return own, string.format("原有 %d 个，自己生成 %d/%d%s", #before, err and 0 or #own, #new, err and ("：" .. err:sub(-80)) or "")
+end
+
+-- 组件（光柱）朝向 to 点（同技能自己的 UpdateLaserRotation：FindLookAtRotation → SetWorldRotation）。返回 转了几个
+-- 【适配】SceneComponent:K2_GetComponentLocation / K2_SetWorldRotation
+local function aimComps(comps, to)
+    local n = 0
+    if not to then return 0 end
+    for _, c in ipairs(comps or {}) do
+        local okL, a = pcall(function() return c:K2_GetComponentLocation() end)
+        if valid(c) and okL and a then
+            local dx, dy, dz = to.X - a.X, to.Y - a.Y, to.Z - a.Z
+            local rot = { Pitch = math.deg(math.atan(dz, math.sqrt(dx * dx + dy * dy))), Yaw = math.deg(math.atan(dy, dx)), Roll = 0.0 }
+            if pcall(function() c:K2_SetWorldRotation(rot, false, {}, false) end) then n = n + 1 end
+        end
+    end
+    return n
+end
+
+-- 收掉组件（光柱）。返回 收了几个
+-- 【适配】NiagaraComponent:Deactivate + ActorComponent:K2_DestroyComponent
+local function destroyComps(comps)
+    local n = 0
+    for _, c in ipairs(comps or {}) do
+        if valid(c) then
+            pcall(function() c:Deactivate() end)
+            if pcall(function() c:K2_DestroyComponent(c) end) then n = n + 1 end
+        end
+    end
+    return n
+end
+
+-- §139.3 组件（光柱）直接转到 rot（对方发来的镜头朝向；真人的光柱就是镜头朝向）。返回 转了几个
+-- 【适配】SceneComponent:K2_SetWorldRotation
+local function rotateComps(comps, rot)
+    local n = 0
+    for _, c in ipairs(comps or {}) do
+        if valid(c) and pcall(function() c:K2_SetWorldRotation({ Pitch = rot.Pitch, Yaw = rot.Yaw, Roll = 0.0 }, false, {}, false) end) then n = n + 1 end
+    end
+    return n
+end
+
+-- §139.4 组件 / 角色的世界朝向，记日志用。返回 "(P.. Y..)" 或 "?"
+-- 【适配】SceneComponent:K2_GetComponentRotation / Actor:K2_GetActorRotation
+local function compRotStr(o)
+    if not valid(o) then return "?" end
+    local ok, r = pcall(function() return o:K2_GetComponentRotation() end)
+    if not (ok and r) then ok, r = pcall(function() return o:K2_GetActorRotation() end) end
+    return ok and r and string.format("(P%.0f Y%.0f)", r.Pitch, r.Yaw) or "?"
+end
+
+-- §139.7 光柱的伤害：真人按住激光时技能用子弹数据 BD_GA_DuYanBow_Laser_Emitter 的 CreateBullet(SpawnTransform, WorldContextObject)
+-- 生成发射器 BP_PBZ_ProjectileEmitter_C（10:22 / 10:32 探针），替身从来不生成 → 替身光柱没伤害。这里照样让替身技能的子弹数据生成一个：
+-- 位置 = 光柱的位置，朝向 = rot，世界上下文 = 替身；再 Initialize + Start（§139.7 下面）。返回 发射器 或 nil, 说明
+-- 朝向（度）→ 四元数，CreateBullet 的 Transform 要用
+-- 【适配】同 FRotator::Quaternion 的公式（纯计算）
+local function rotQuat(r)
+    local p, y, ro = math.rad(r.Pitch or 0) / 2, math.rad(r.Yaw or 0) / 2, math.rad(r.Roll or 0) / 2
+    local SP, CP, SY, CY, SR, CR = math.sin(p), math.cos(p), math.sin(y), math.cos(y), math.sin(ro), math.cos(ro)
+    return { X = CR * SP * SY - SR * CP * CY, Y = -CR * SP * CY - SR * CP * SY,
+             Z = CR * CP * SY - SR * SP * CY, W = CR * CP * CY + SR * SP * SY }
+end
+
+-- 场上所有光柱发射器
+-- 【适配】FindAllOf("BP_PBZ_ProjectileEmitter_C")
+local function emitterList()
+    local ok, l = pcall(function() return FindAllOf("BP_PBZ_ProjectileEmitter_C") end)
+    return ok and l or {}
+end
+
+-- §139.7 10:56 探针：子弹接口 BulletInterface 有 Initialize(Parent, OwnerAvatar, SourceAbility, Data, bDebug) / Start()。
+-- CreateBullet 只造出来（所有者空、状态 0），要再 Initialize(nil, 替身, 替身激光技能, 子弹数据, false) + Start()。返回 说明
+-- 【适配】发射器:Initialize(…) / Start()（BulletInterface）
+local function bulletInitStart(e, pup, inst, bd)
+    local okI, errI = pcall(function() e:Initialize(nil, pup, inst, bd, false) end)
+    local okS, errS = pcall(function() e:Start() end)
+    return string.format("Initialize %s，Start %s", okI and "成功" or ("失败 " .. tostring(errI):sub(-80)),
+        okS and "成功" or ("失败 " .. tostring(errS):sub(-80)))
+end
+
+-- 生成（说明见上）
+-- 【适配】技能实例.BulletData:CreateBullet(Transform, Object)（返回值是接口，拿不到时按新出现的找）
+local function laserEmitterSpawn(inst, pup, at, rot, bdOver)
+    local bd = bdOver or rawProp(inst, "BulletData")      -- §139.8 眼睛用另一份子弹数据 BD_DuYan_Bow_Eye
+    if not valid(bd) then return nil, "技能没有子弹数据" end
+    local loc = at
+    if not loc then
+        local ok, l = pcall(function() return pup:K2_GetActorLocation() end)
+        loc = ok and l or nil
+    end
+    if not loc then return nil, "读不到位置" end
+    local before = {}
+    for _, e in ipairs(emitterList()) do before[#before + 1] = e end
+    local tf = { Rotation = rotQuat(rot or {}), Translation = { X = loc.X, Y = loc.Y, Z = loc.Z }, Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 } }
+    -- 世界上下文给替身 / 技能实例都一样（所有者空、状态 0）：所有者等由下面 Initialize 填
+    local ok, r = pcall(function() return bd:CreateBullet(tf, pup) end)
+    if not ok then return nil, "CreateBullet 失败 " .. tostring(r):sub(-100) end
+    local e, how
+    local okR, robj = pcall(function() return r and r:GetObject() end)
+    if okR and valid(robj) then e, how = robj, "返回值" end
+    if not e and valid(r) and type(r) == "userdata" then
+        local okN = pcall(function() return r:GetFullName() end)
+        if okN then e, how = r, "返回值" end
+    end
+    if not e then
+        for _, x in ipairs(emitterList()) do
+            local old = false
+            for _, b in ipairs(before) do if sameObj(b, x) then old = true end end
+            if not old and valid(x) then e, how = x, "按新出现的找" end
+        end
+    end
+    if not e then return nil, "调用成功但没找到新的发射器（返回 " .. tostring(r) .. "）" end
+    return e, how .. "；" .. bulletInitStart(e, pup, inst, bd)
+end
+
+-- 发射器现在的状态（记日志）
+-- 【适配】发射器变量 BulletOwnerAvatar / BulletSourceAbility / BulletStatus + K2_GetActorLocation / Rotation
+local function emitterInfo(e)
+    if not valid(e) then return "无效" end
+    local o, a = rawProp(e, "BulletOwnerAvatar"), rawProp(e, "BulletSourceAbility")
+    local okL, l = pcall(function() return e:K2_GetActorLocation() end)
+    local okR, r = pcall(function() return e:K2_GetActorRotation() end)
+    return string.format("%s 所有者 %s 来源技能 %s 状态 %s 位置 %s 朝向 %s", shortName(full(e)),
+        valid(o) and shortName(full(o)) or "空", valid(a) and shortName(full(a)) or "空", tostring(rawProp(e, "BulletStatus")),
+        okL and l and string.format("(%.0f, %.0f, %.0f)", l.X, l.Y, l.Z) or "?",
+        okR and r and string.format("(P%.0f Y%.0f)", r.Pitch, r.Yaw) or "?")
+end
+
+-- 发射器转到 rot、挪到 at（光柱扫的时候跟着；11:03 实测发射器停在生成时的位置不动，打人的子弹从那儿出）。返回 是否成功
+-- 【适配】发射器:SetBulletTransform(Transform)（BulletInterface），不行退回 Actor:K2_SetActorLocationAndRotation
+local function moveEmitter(e, at, rot)
+    if not (valid(e) and at) then return false end
+    local tf = { Rotation = rotQuat(rot or {}), Translation = { X = at.X, Y = at.Y, Z = at.Z }, Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 } }
+    if pcall(function() e:SetBulletTransform(tf) end) then return true end
+    return pcall(function() e:K2_SetActorLocationAndRotation(at, { Pitch = rot.Pitch, Yaw = rot.Yaw, Roll = 0.0 }, false, {}, true) end)
+end
+
+-- 收掉发射器：先按子弹自己的 Deactivate(0)（11:03 只 K2_DestroyActor 时场上发射器一个没少），再删 actor。返回 是否成功
+-- 【适配】发射器:Deactivate(TimeToDestroy)（BulletInterface）+ Actor:K2_DestroyActor
+local function destroyActor(e)
+    if not valid(e) then return false end
+    local okD = pcall(function() e:Deactivate(0.0) end)
+    local okK = pcall(function() e:K2_DestroyActor() end)
+    return okD or okK
+end
+
+-- （obj 给了就列它全部函数：10:28 子系统里没有 CreateBullet，exe 里它挨着 GetBulletClass / NewData，多半是子弹数据自己的函数）
+-- §139.6 只读：子弹子系统（光柱伤害发射器 BP_PBZ_ProjectileEmitter_C < BulletActorBase 是它生成的）里名字带
+-- Bullet / Create / Spawn 的函数和参数（名字:类型）。返回 日志行列表
+-- 【适配】FindFirstOf("BulletSubsystem") / StaticFindObject + UStruct:ForEachFunction / UFunction:ForEachProperty
+local function bulletSubsysProbe(obj, isClass)
+    local lines = {}
+    local sub = obj
+    if not sub then
+        local ok, s1 = pcall(function() return FindFirstOf("BulletSubsystem") end)
+        sub = ok and s1 or nil
+    end
+    if not valid(sub) then return { "BulletSubsystem 找不到" } end
+    lines[1] = "对象 " .. full(sub)
+    local okC, c = pcall(function() return sub:GetClass() end)
+    c = okC and c or nil
+    if isClass then c = sub end         -- §139.7 直接给类（接口 /Script/SGameCombatSystem.BulletInterface）：只看它自己
+    for _ = 1, isClass and 1 or 6 do
+        if not valid(c) then break end
+        pcall(function()
+            c:ForEachFunction(function(f)
+                local n = fnameStr(f:GetFName())
+                if obj or n:find("Bullet") or n:find("Create") or n:find("Spawn") then
+                    local ps = {}
+                    pcall(function() f:ForEachProperty(function(pr)
+                        local t = "?"
+                        pcall(function() t = fnameStr(pr:GetClass():GetFName()) end)
+                        ps[#ps + 1] = fnameStr(pr:GetFName()) .. ":" .. t
+                    end) end)
+                    lines[#lines + 1] = n .. "(" .. table.concat(ps, ", ") .. ")"
+                end
+            end)
+        end)
+        local okS, sup = pcall(function() return c:GetSuperStruct() end)
+        c = okS and sup or nil
+    end
+    return lines
+end
+
+-- §139.7 只读：场上所有子弹按"所有者 / 类"数一下（看光柱发射器有没有再生成打人的子弹），who(owner) 返回 "我" / "替身" / nil
+-- 【适配】FindAllOf("BulletActorBase") + 子弹变量 BulletOwnerAvatar / BulletStatus
+local function bulletScan(who)
+    local ok, l = pcall(function() return FindAllOf("BulletActorBase") end)
+    if not (ok and l) then return "没有子弹" end
+    local cnt = {}
+    for _, b in ipairs(l) do
+        if valid(b) then
+            local w = who(rawProp(b, "BulletOwnerAvatar")) or "别人"
+            local k = w .. ":" .. shortName(full(b)):gsub("_%d+$", "") .. "/" .. tostring(rawProp(b, "BulletStatus"))
+            cnt[k] = (cnt[k] or 0) + 1
+        end
+    end
+    local out = {}
+    for k, n in pairs(cnt) do out[#out + 1] = k .. "×" .. n end
+    table.sort(out)
+    return #out > 0 and table.concat(out, " ") or "没有子弹"
+end
+
+-- §139.7 只读：子弹挂在哪（接口 GetBulletAttachParent）和位置
+-- 【适配】发射器:GetBulletAttachParent(ParentComp, Socket) / K2_GetActorLocation
+local function bulletWhere(b)
+    if not valid(b) then return "无效" end
+    local okL, l = pcall(function() return b:K2_GetActorLocation() end)
+    local par = "?"
+    pcall(function()
+        local outp = {}
+        local r = b:GetBulletAttachParent(outp, outp)
+        par = tostring(r) .. " " .. tostring(outp.ParentComp and full(outp.ParentComp) or "") .. " " .. tostring(outp.Socket or "")
+    end)
+    return string.format("位置 %s 挂在 %s", okL and l and string.format("(%.0f, %.0f, %.0f)", l.X, l.Y, l.Z) or "?", par)
+end
+
+-- §139.9 某个角色名下某类子弹（状态 2 = 在跑）有几颗：我的光柱有没有眼睛（BP_DuYanBow_Bullet_Eye_C）
+-- 【适配】FindAllOf(子弹类) + 子弹变量 BulletOwnerAvatar / BulletStatus
+local function countBullets(cls, owner)
+    local ok, l = pcall(function() return FindAllOf(cls) end)
+    local n = 0
+    for _, b in ipairs(ok and l or {}) do
+        if valid(b) and rawProp(b, "BulletStatus") == 2 and sameObj(rawProp(b, "BulletOwnerAvatar"), owner) then n = n + 1 end
+    end
+    return n
+end
+
+-- §139.7 按路径找对象（类 / 接口），找不到 nil
+-- 【适配】StaticFindObject
+local function findObj(path)
+    local ok, o = pcall(function() return StaticFindObject(path) end)
+    return ok and valid(o) and o or nil
+end
+
+-- §139.3 角色控制器的朝向（替身 = 它的 AI 控制器；技能瞄准 / 光柱没锁定目标时看 GetControlRotation）。返回 是否成功
+-- 【适配】Pawn:GetController():SetControlRotation
+local function setControlRot(actor, rot)
+    local ok, c = pcall(function() return actor:GetController() end)
+    if not (ok and valid(c)) then return false end
+    return pcall(function() c:SetControlRotation({ Pitch = rot.Pitch, Yaw = rot.Yaw, Roll = 0.0 }) end)
 end
 
 -- ============================================================ 地图名
@@ -1849,9 +2190,10 @@ local function bossBarHide(actor)
     return (pcall(function() hud:UnRegisterBossHPBar(actor) end))
 end
 
--- 刚注册、Init 还没跑时血条的 Character 是空的，allowBlank = true 时也认这种
+-- 刚注册、Init 还没跑时血条的 Character 是空的，allowBlank = true 时也认这种。
+-- skip = 已经认领了的血条（§141 观战两条血条都是空 Character，第二条要跳过第一条），空的那条不认它
 -- 【适配】PBZHUDLayout:GetBossHPBarInstances()（TArray，元素可能是弱引用要 :get()）里 Character 是 actor 的 WB_BossHPBar_C
-local function bossBarOf(actor, allowBlank)
+local function bossBarOf(actor, allowBlank, skip)
     local hud = hudLayout()
     if not (hud and valid(actor)) then return nil end
     local found, blank = nil, nil
@@ -1864,7 +2206,7 @@ local function bossBarOf(actor, allowBlank)
         local c = rawProp(b, "Character")
         if valid(c) then
             if sameObj(c, actor) then found = b end
-        elseif not blank then
+        elseif not blank and not (skip and sameObj(b, skip)) then
             blank = b
         end
     end)
@@ -2016,6 +2358,174 @@ local function attrModSet(actor, attr, value)
         return false, string.format("调用了但值是 %s（要 %s；%s，op=%s）", tostring(now), tostring(value), info.src, tostring(info.op))
     end
     return true, string.format("%s，op=%s", info.src, tostring(info.op))
+end
+
+-- §144 标准数值模式用的三个游戏接口（tools/stat_probe 15:55 实测签名；这版 UE4SS 读不出参数标志，输出参数要占位）
+
+-- 本机存档里某把武器 / 影之武装的等级（0 = 没有这把或读不到）。normal = true 主武器，false 影之武装
+-- 【适配】FindFirstOf("PBZBackPackSubsystem"):GetWeaponLevel(WeaponID:Name, bIsNormalWeapon:Bool) → Int
+local function weaponLevel(id, normal)
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return nil, "找不到 PBZBackPackSubsystem" end
+    local ok, r = pcall(function() return sub:GetWeaponLevel(FName(id), normal and true or false) end)
+    if not ok then return nil, tostring(r) end
+    return tonumber(r) or 0
+end
+
+-- 游戏自带的临时强制配装（11-07 18:1x 新档实测，HANDOVER §144）：只认背包里已有的主武器（没拿到的调用不报错但什么都不发生）；
+-- 套上后等级 / 铸魂 / 升级解锁效果全由游戏处理，存档会带 ForcedLoadoutActive / OrigLevel 标记，读回后 Restore 照样还原
+-- 【适配】FindFirstOf("PBZBackPackSubsystem"):ApplyForcedWeaponLoadout(WeaponID:Name, WeaponLevel:Int, bForceSnapSoul:Bool)
+local function forcedApply(id, lv, snap)
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return false, "找不到 PBZBackPackSubsystem" end
+    local ok, r = pcall(function() return sub:ApplyForcedWeaponLoadout(FName(id), lv, snap and true or false) end)
+    if not ok then return false, tostring(r) end
+    return true
+end
+-- 【适配】PBZBackPackSubsystem:RestoreForcedWeaponLoadout()
+local function forcedRestore()
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return false, "找不到 PBZBackPackSubsystem" end
+    local ok, r = pcall(function() return sub:RestoreForcedWeaponLoadout() end)
+    if not ok then return false, tostring(r) end
+    return true
+end
+-- 现在是不是在强制配装中；读不到 = nil
+-- 【适配】PBZBackPackSubsystem:HasForcedWeaponLoadout() → Bool
+local function forcedActive()
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return nil end
+    local ok, r = pcall(function() return sub:HasForcedWeaponLoadout() end)
+    if ok and type(r) == "boolean" then return r end
+    return nil
+end
+-- 这把铸魂过没有；读不到 = nil
+-- 【适配】PBZBackPackSubsystem:IsWeaponSnapSouled(WeaponID:Name, IsNormalWeapon:Bool) → Bool
+local function weaponSnapped(id, normal)
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return nil end
+    local ok, r = pcall(function() return sub:IsWeaponSnapSouled(FName(id), normal and true or false) end)
+    if ok and type(r) == "boolean" then return r end
+    return nil
+end
+
+-- §144 方案 B（11-07 20:27 二周目实测）：强制配装会把配装清空，用游戏的临时整套配装快照把武器组 / 影之武装装回去、逐格装回饰品；
+-- 还原时先 Pop 快照、再 Restore 强制配装（游戏从 ForcedLoadout* 备份恢复原配装）
+
+-- 返回的数组元素在这版 UE4SS 里是 RemoteUnrealParam：先 :get() 再 ToString
+-- 【适配】RemoteUnrealParam:get() → FName:ToString()
+local function nameOfElem(v)
+    local x = v
+    pcall(function() x = v:get() end)
+    local ok, s = pcall(function() return x:ToString() end)
+    if ok and type(s) == "string" then return s end
+    return type(x) == "string" and x or nil
+end
+-- 当前配装的主武器 / 影之武装 ID 列表（读不到 = nil）
+-- 【适配】PBZBackPackSubsystem:GetEquipmentNormalWeapons() / GetShaqiWeapons() → Array<Name>
+local function loadoutLists()
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return nil end
+    local function read(fn)
+        local ok, arr = pcall(function() return sub[fn](sub) end)
+        if not ok then return nil end
+        local t = {}
+        eachArr(arr, function(_, v) local n = nameOfElem(v); if n and n ~= "None" then t[#t + 1] = n end end)
+        return t
+    end
+    return read("GetEquipmentNormalWeapons"), read("GetShaqiWeapons")
+end
+-- 【适配】PBZBackPackSubsystem:PushEquippedWeapons(Array<Name>, Array<Name>, 主序号, 影武序号) / PopEquippedWeapons() / HasEquippedWeaponsSnapshot()
+local function loadoutPush(mains, shaqis, mi, si)
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return false, "找不到 PBZBackPackSubsystem" end
+    local a, b = {}, {}
+    for _, id in ipairs(mains) do a[#a + 1] = FName(id) end
+    for _, id in ipairs(shaqis) do b[#b + 1] = FName(id) end
+    local ok, r = pcall(function() return sub:PushEquippedWeapons(a, b, mi or 0, si or 0) end)
+    if not ok then return false, tostring(r) end
+    return true
+end
+-- 【适配】PBZBackPackSubsystem:PopEquippedWeapons()
+local function loadoutPop()
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return false, "找不到 PBZBackPackSubsystem" end
+    local ok, r = pcall(function() return sub:PopEquippedWeapons() end)
+    if not ok then return false, tostring(r) end
+    return true
+end
+-- 【适配】PBZBackPackSubsystem:HasEquippedWeaponsSnapshot() → Bool；读不到 = nil
+local function loadoutSnapshot()
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return nil end
+    local ok, r = pcall(function() return sub:HasEquippedWeaponsSnapshot() end)
+    if ok and type(r) == "boolean" then return r end
+    return nil
+end
+-- 这些饰品里装着的（按给的顺序）；装一件到第 idx 格
+-- 【适配】PBZBackPackSubsystem:IsEquipAccessory(ID) → Bool / AssembleAccessory(ID, Index)
+local function accEquipped(ids)
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return nil end
+    local t = {}
+    for _, id in ipairs(ids) do
+        local ok, on = pcall(function() return sub:IsEquipAccessory(FName(id)) end)
+        if ok and on == true then t[#t + 1] = id end
+    end
+    return t
+end
+-- 【适配】PBZBackPackSubsystem:AssembleAccessory(AccessoryID:Name, Index:Int)
+local function accAssemble(id, idx)
+    local okS, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
+    if not (okS and valid(sub)) then return false, "找不到 PBZBackPackSubsystem" end
+    local ok, r = pcall(function() return sub:AssembleAccessory(FName(id), idx) end)
+    if not ok then return false, tostring(r) end
+    return true
+end
+
+-- §144 诊断（21:07 崩溃 = 反复强制配装撑爆 UObject 上限）：现在有多少 Actor / ActorComponent，看换套新建的武器对象会不会被回收。
+-- FindAllOf 要遍历全部对象（几十毫秒），只在换套前后调
+-- 【适配】FindAllOf("Actor") / FindAllOf("ActorComponent")
+local function objCounts()
+    local function n(cls)
+        local ok, all = pcall(FindAllOf, cls)
+        if not (ok and all) then return 0 end
+        local k = 0
+        for _ in pairs(all) do k = k + 1 end
+        return k
+    end
+    return n("Actor"), n("ActorComponent")
+end
+
+-- 游戏自带的"否决存档"：on = true 进、false 出；同一个来源 ID 进出成对
+-- 【适配】FindFirstOf("PBZSaveLoadSubsystem"):EnterSaveVeto(SourceID:Name, Reason:Enum) / ExitSaveVeto(SourceID:Name)
+local function saveVeto(on, id)
+    local okS, sub = pcall(FindFirstOf, "PBZSaveLoadSubsystem")
+    if not (okS and valid(sub)) then return false, "找不到 PBZSaveLoadSubsystem" end
+    local ok, r
+    if on then ok, r = pcall(function() return sub:EnterSaveVeto(FName(id), 0) end)
+    else ok, r = pcall(function() return sub:ExitSaveVeto(FName(id)) end) end
+    if not ok then return false, tostring(r) end
+    local st
+    pcall(function() st = sub:GetManagerState() end)
+    return true, "存档管理状态 " .. tostring(st)
+end
+
+-- 角色身上生效的 GameplayEffect 短名集合（"GE_Talent_EnableTenacity" = true）；读不到返回 nil
+-- 【适配】ASC.ActiveGameplayEffects.GameplayEffects_Internal[i].Spec.Def（只读，同 LO.weaponEffects）
+local function geSet(actor)
+    local asc = ascOf(actor)
+    local arr = asc and rawProp(rawProp(asc, "ActiveGameplayEffects"), "GameplayEffects_Internal")
+    if arr == nil then return nil end
+    local set = {}
+    local ok = eachArr(arr, function(_, age)
+        local def = rawProp(rawProp(age, "Spec"), "Def")
+        if valid(def) then
+            local n = pathOf(def):match("/([%w_]+)%.[^/]*$")
+            if n then set[n] = true end
+        end
+    end)
+    return ok and set or nil
 end
 
 -- §113 直接写属性（setAttr）不走 ASC，HUD 的 W_WeaponUI 靠 WaitForAttributeChanged 听属性变化，收不到 → 精纯杀气 / 暗源的显示不动。
@@ -2364,6 +2874,231 @@ local function holdingInputs(actor)
     return names
 end
 
+-- §140 输入状态同步第 1 步（只读探针）：蓄力招的"等松手"是 C++ 任务 UAbilityTask_WaitSInputHold（PBZ.exe 字符串：OnAlreadyRelease /
+-- OnSuccessHold / OnEarlyRelease / OnSuccessRelease / RequiredTime，日志串"No InputAction available (CurrentInput=null, HoldInput=null)"）。
+-- 替身走 OnAlreadyRelease。要让替身"按着"，先看清：任务上有哪些属性（输入从哪来）、玩家的输入组件里有什么（CurrentInput？）、
+-- 组件有哪些函数。只反射 + 读，不调任何会改状态的函数
+-- 一个值写成日志里的一小段：数字 / 布尔 / 字符串照写，对象写短路径，FName 写字符串，容器写元素个数和前几个
+-- 【适配】UObject:IsValid / FName:ToString / TArray·TSet·TMap:ForEach（元素 :get()）
+local function valStr(v)
+    local t = type(v)
+    if t == "number" or t == "boolean" or t == "string" or v == nil then return tostring(v) end
+    if t ~= "userdata" then return t end
+    if valid(v) then return short(pathOf(v)) end
+    -- 容器（TArray / TSet / TMap）：ForEach 给 (下标, 元素) 或 (键, 值)；键值都写出来，值是结构体时列它的字段
+    local function elemStr(x)
+        local okG, g = pcall(function() return x:get() end)
+        if okG and g ~= nil then x = g end
+        if type(x) ~= "userdata" then return tostring(x) end
+        if valid(x) then return shortName(full(x)) or "?" end
+        local okS2, s2 = pcall(function() return x:ToString() end)
+        if okS2 and type(s2) == "string" then return s2 end
+        return "userdata"
+    end
+    local items, n = {}, 0
+    local okE = pcall(function() v:ForEach(function(a, b)
+        n = n + 1
+        if n <= 4 then items[#items + 1] = (type(a) == "number" and "" or (elemStr(a) .. "→")) .. (b ~= nil and elemStr(b) or "") end
+    end) end)
+    if okE then return string.format("[%d 个%s]", n, n > 0 and (" " .. table.concat(items, ",")) or "") end
+    local okS, sv = pcall(function() return v:ToString() end)
+    if okS and type(sv) == "string" then return '"' .. sv .. '"' end
+    return "userdata"
+end
+
+-- obj 类（含父类，最多 4 层）的全部属性 = 值，和带"pat"的函数（带参数名）
+-- 【适配】UObject:GetClass / UStruct:ForEachProperty / ForEachFunction / GetSuperStruct + obj[属性名]
+local function dumpObj(obj, fpat)
+    local props, funcs = {}, {}
+    local okC, c = pcall(function() return obj:GetClass() end)
+    c = okC and c or nil
+    for _ = 1, 4 do
+        if not valid(c) then break end
+        local cn = shortName(full(c)) or "?"
+        pcall(function()
+            c:ForEachProperty(function(pp)
+                local n = fnameStr(pp:GetFName())
+                props[#props + 1] = n .. "=" .. valStr(rawProp(obj, n))
+            end)
+        end)
+        if fpat then
+            pcall(function()
+                c:ForEachFunction(function(f)
+                    local n = fnameStr(f:GetFName())
+                    if n:find(fpat) then
+                        local ps = {}
+                        pcall(function() f:ForEachProperty(function(q) ps[#ps + 1] = fnameStr(q:GetFName()) end) end)
+                        funcs[#funcs + 1] = cn .. "." .. n .. "(" .. table.concat(ps, ",") .. ")"
+                    end
+                end)
+            end)
+        end
+        local okS, sup = pcall(function() return c:GetSuperStruct() end)
+        c = okS and sup or nil
+    end
+    return table.concat(props, " "), table.concat(funcs, " ")
+end
+
+-- 返回日志行。who 只用来标注；actor 的输入组件（GetSGameInputComponent）+ 场上所有 WaitSInputHold 任务
+-- 【适配】Default__SGameInputUtils:GetSGameInputComponent + FindAllOf("AbilityTask_WaitSInputHold") + 反射读属性
+local function holdTaskProbe(actor, who, withFuncs)
+    local lines = {}
+    local lib = StaticFindObject("/Script/SGameInputSystem.Default__SGameInputUtils")
+    local ok, comp = pcall(function() return lib:GetSGameInputComponent(actor) end)
+    if ok and valid(comp) then
+        local pr, fn = dumpObj(comp, withFuncs and "." or nil)
+        lines[#lines + 1] = string.format("%s 输入组件 %s 属性：%s", who, short(pathOf(comp)), pr)
+        if withFuncs then lines[#lines + 1] = "输入组件函数：" .. fn end
+    else
+        lines[#lines + 1] = string.format("%s 没有输入组件（%s）", who, ok and "返回空" or tostring(comp))
+    end
+    -- 激光用的是 WaitSInputRelease（OnRelease / OnAlreadyRelease），另外两个顺带看
+    for _, cls in ipairs({ "AbilityTask_WaitSInputRelease", "AbilityTask_WaitSInputHold", "AbilityTask_WaitSInputTrigger" }) do
+        local tasks = FindAllOf(cls) or {}
+        lines[#lines + 1] = string.format("场上 %s 任务 %d 个", cls, #tasks)
+        local k = 0
+        for _, t in pairs(tasks) do
+            if valid(t) and k < 3 then
+                k = k + 1
+                local pr, fn = dumpObj(t, (withFuncs and k == 1) and "." or nil)
+                lines[#lines + 1] = string.format("任务 %s 属性：%s", short(pathOf(t)), pr)
+                if fn ~= "" then lines[#lines + 1] = "任务函数：" .. fn end
+            end
+        end
+    end
+    -- 角色身上的蓝图组件"Ability Input Component"（玩家激光技能的同名变量指向它，替身的是空）
+    local aic = rawProp(actor, "Ability Input Component")
+    if valid(aic) then
+        local pr, fn = dumpObj(aic, withFuncs and "." or nil)
+        lines[#lines + 1] = string.format("%s 角色的 Ability Input Component = %s（%s）属性：%s", who, short(pathOf(aic)),
+            shortName(full(aic:GetClass())) or "?", pr)
+        if withFuncs and fn ~= "" then lines[#lines + 1] = "Ability Input Component 函数：" .. fn end
+    else
+        lines[#lines + 1] = string.format("%s 角色的 Ability Input Component = %s", who, valStr(aic))
+    end
+    -- 激光技能实例：名字带 Input 的属性 / 函数（SInputAbilityInterface 给技能"我认哪个键"？）
+    local asc = ascOf(actor)
+    local items = asc and rawProp(rawProp(asc, "ActivatableAbilities"), "Items")
+    eachArr(items, function(_, spec)
+        local ab = rawProp(spec, "Ability")
+        if not valid(ab) or not (shortName(full(ab:GetClass())) or ""):find("DuYan_Bow_Laser", 1, true) then return end
+        local inst
+        eachArr(rawProp(spec, "NonReplicatedInstances"), function(_, x) if valid(x) then inst = x end end)
+        local o = inst or ab
+        local list = {}
+        pcall(function()
+            local c = o:GetClass()
+            for _ = 1, 6 do
+                if not valid(c) then break end
+                local cn = shortName(full(c)) or "?"
+                c:ForEachProperty(function(pp)
+                    local n = fnameStr(pp:GetFName())
+                    if n:find("Input") then list[#list + 1] = cn .. "." .. n .. "=" .. valStr(rawProp(o, n)) end
+                end)
+                c:ForEachFunction(function(f)
+                    local n = fnameStr(f:GetFName())
+                    if n:find("Input") then list[#list + 1] = cn .. "." .. n .. "()" end
+                end)
+                c = c:GetSuperStruct()
+            end
+        end)
+        lines[#lines + 1] = string.format("%s 激光技能（%s）带 Input 的：%s；InputID=%s", who, inst and "实例" or "CDO",
+            #list > 0 and table.concat(list, " ") or "无", tostring(rawProp(spec, "InputID")))
+    end)
+    return lines
+end
+
+-- §140 第 2 步：给替身"按着键"。探针（02:16）：玩家的激光等松手任务 AbilityTask_WaitSInputRelease 属性 Input = IA_ShachiAbility_Hold、
+-- InputComponent = 角色自己的 PawnInputComponent0（SGameInputComponent，玩家控制时引擎建的）；替身 GetSGameInputComponent 返回空
+-- → 任务一开始就 OnAlreadyRelease。做法：替身没有就新建一个 SGameInputComponent 挂在它身上、写进 Pawn.InputComponent，
+-- 再往它的 HoldingInputs（键 = InputAction 的表）里加 / 删键。只给实验名单里的招用
+-- 【适配】Default__SGameInputUtils:GetSGameInputComponent + StaticConstructObject(SGameInputComponent, 角色) + Pawn.InputComponent
+local function inputEnsure(actor)
+    if not valid(actor) then return nil, "没有角色" end
+    local lib = StaticFindObject("/Script/SGameInputSystem.Default__SGameInputUtils")
+    if not valid(lib) then return nil, "找不到 SGameInputUtils" end
+    local ok, c = pcall(function() return lib:GetSGameInputComponent(actor) end)
+    if ok and valid(c) then return c, "已有" end
+    local cls = StaticFindObject("/Script/SGameInputSystem.SGameInputComponent")
+    if not valid(cls) then return nil, "找不到 SGameInputComponent 类" end
+    local okN, comp = pcall(function() return StaticConstructObject(cls, actor, FName("PBZMP_SInput")) end)
+    if not (okN and valid(comp)) then return nil, "建不出来 " .. tostring(comp) end
+    local okA = pcall(function() comp.AbilitySystem = ascOf(actor) end)
+    local okS = pcall(function() actor.InputComponent = comp end)
+    local ok2, c2 = pcall(function() return lib:GetSGameInputComponent(actor) end)
+    local got = (ok2 and valid(c2)) and (sameObj(c2, comp) and "就是新建的" or short(pathOf(c2))) or "还是空"
+    -- 02:28 探针：玩家角色的 AbilityInputComponent（蓝图变量名 "Ability Input Component"）SGameInput = PawnInputComponent0，
+    -- 替身的是空 → 一起接上
+    local aic = rawProp(actor, "Ability Input Component")
+    local okI = valid(aic) and pcall(function() aic.SGameInput = comp end)
+    return comp, string.format("新建 %s（写 AbilitySystem %s、Pawn.InputComponent %s、AbilityInputComponent.SGameInput %s；GetSGameInputComponent → %s）",
+        short(pathOf(comp)), okA and "成功" or "失败", okS and "成功" or "失败", okI and "成功" or "失败", got)
+end
+
+-- 现在的游戏世界时间（HoldingInputs 的值 = 按下那一刻的世界时间：02:28 玩家按着时 40.40，任务 StartTime 41.06）
+-- 【适配】Default__GameplayStatics:GetTimeSeconds(角色)
+local function worldTime(actor)
+    local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    local ok, t = pcall(function() return gs:GetTimeSeconds(actor) end)
+    return (ok and type(t) == "number") and t or nil
+end
+
+-- 02:28 探针：玩家的激光技能实例变量 "Ability Input Component" = 角色的 AbilityInputComponent，替身的是空（技能是模组直接激活的，
+-- 没经过输入组件），替身的等松手任务根本没建。把替身技能实例的这个变量接上角色自己的。返回说明
+-- 【适配】ASC.ActivatableAbilities 找激活中的实例（LO.activeInstance）+ 实例["Ability Input Component"] 写
+local function linkAbilityInput(actor, clsName)
+    local inst = LO.activeInstance(actor, clsName)
+    if not inst then return "技能实例没找到" end
+    local aic = rawProp(actor, "Ability Input Component")
+    if not valid(aic) then return "角色没有 Ability Input Component" end
+    -- §140 实验 3（02:48）：玩家组件的 Controller = 玩家控制器，替身的是空 → 接上替身自己的 AI 控制器
+    local ctlNote = ""
+    if not valid(rawProp(aic, "Controller")) then
+        local ctl = rawProp(actor, "Controller")
+        local okC = valid(ctl) and pcall(function() aic.Controller = ctl end)
+        ctlNote = string.format("；Controller 接 %s %s，读回 %s", valid(ctl) and short(pathOf(ctl)) or "（替身没控制器）",
+            okC and "成功" or "失败", valid(rawProp(aic, "Controller")) and "有" or "空")
+    end
+    local before = rawProp(inst, "Ability Input Component")
+    if valid(before) then return "已经有了" .. ctlNote end
+    local ok, err = pcall(function() inst["Ability Input Component"] = aic end)
+    local after = rawProp(inst, "Ability Input Component")
+    return string.format("写 %s，读回 %s%s", ok and "成功" or ("失败 " .. tostring(err)), valid(after) and "有" or "空", ctlNote)
+end
+
+-- 按住 / 松开 iaPath（InputAction 资产路径）。值的类型不知道：按住时先试 value（数字），出错就记下错误。返回 说明, IsHolding 读回
+-- 【适配】StaticFindObject(InputAction) + SGameInputComponent.HoldingInputs:Add / Remove + IsHolding(InputAction)
+local function inputHold(comp, iaPath, on, value)
+    if not valid(comp) then return "没有组件", nil end
+    local ia = StaticFindObject(iaPath)
+    if not valid(ia) then return "找不到 " .. iaPath, nil end
+    local h = rawProp(comp, "HoldingInputs")
+    if h == nil then return "读不到 HoldingInputs", nil end
+    local ok, err
+    if on then ok, err = pcall(function() h:Add(ia, value) end)
+    else ok, err = pcall(function() h:Remove(ia) end) end
+    local okH, isH = pcall(function() return comp:IsHolding(ia) end)
+    return (on and "加键 " or "删键 ") .. (ok and "成功" or ("失败 " .. tostring(err))), okH and isH or ("IsHolding 出错 " .. tostring(isH))
+end
+
+-- 角色 HoldingInputs 里每一项的 键 / 值类型（玩家按着时看值是什么，替身加键时照着写）
+-- 【适配】HoldingInputs:ForEach（键值 :get()）
+local function inputHoldDump(actor)
+    local lib = StaticFindObject("/Script/SGameInputSystem.Default__SGameInputUtils")
+    local ok, c = pcall(function() return lib:GetSGameInputComponent(actor) end)
+    if not (ok and valid(c)) then return "没有组件" end
+    local h = rawProp(c, "HoldingInputs")
+    local list = {}
+    local okE, err = pcall(function() h:ForEach(function(a, b)
+        local ka, kb = a, b
+        pcall(function() ka = a:get() end)
+        pcall(function() kb = b:get() end)
+        list[#list + 1] = string.format("%s → %s（%s）", valid(ka) and (shortName(full(ka)) or "?") or tostring(ka), tostring(kb), type(kb))
+    end) end)
+    if not okE then return "遍历失败 " .. tostring(err) end
+    return #list > 0 and table.concat(list, "；") or "空"
+end
+
 -- §92.8 暂停 / 继续角色当前的蒙太奇（替身"自己马上松手"的蓄力招：停在蓄力段，等对方松手再放）。返回 是否成功, 动作名
 -- 【适配】AnimInstance:Montage_Pause(当前蒙太奇) / Montage_Resume(当前蒙太奇)
 local function montagePause(actor, pause)
@@ -2441,8 +3176,9 @@ end
 
 return {
     tagsMatching = tagsMatching,
-    montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo,
-    teleportTo = teleportTo,
+    montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = holdTaskProbe, inputEnsure = inputEnsure, worldTime = worldTime, linkAbilityInput = linkAbilityInput, inputHold = inputHold, inputHoldDump = inputHoldDump,
+    teleportTo = teleportTo, laserBeamSpawn = laserBeamSpawn, aimComps = aimComps, destroyComps = destroyComps, rotateComps = rotateComps, setControlRot = setControlRot, compRotStr = compRotStr, bulletSubsysProbe = bulletSubsysProbe, findObj = findObj, countBullets = countBullets, bulletScan = bulletScan, bulletWhere = bulletWhere,
+    laserEmitterSpawn = laserEmitterSpawn, emitterInfo = emitterInfo, moveEmitter = moveEmitter, destroyActor = destroyActor,
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
     puppet = puppet, gstat = gstat, now = now, attrSetOf = attrSetOf, attrOf = attrOf, hpOf = hpOf,
@@ -2458,6 +3194,10 @@ return {
     activeMontage = activeMontage, montageSetPos = montageSetPos, montageNotifies = montageNotifies, attrAll = attrAll,
     bossBarShow = bossBarShow, bossBarHide = bossBarHide, bossBarOf = bossBarOf, bossBarSet = bossBarSet, bossBarDiag = bossBarDiag,
     bossBarShachiShow = bossBarShachiShow, weaponUiRefresh = weaponUiRefresh, attrModProbe = attrModProbe, attrModSet = attrModSet, attrDiff = attrDiff,
+    weaponLevel = weaponLevel, saveVeto = saveVeto, geSet = geSet,
+    forcedApply = forcedApply, forcedRestore = forcedRestore, forcedActive = forcedActive, weaponSnapped = weaponSnapped,
+    loadoutLists = loadoutLists, loadoutPush = loadoutPush, loadoutPop = loadoutPop, loadoutSnapshot = loadoutSnapshot,
+    accEquipped = accEquipped, accAssemble = accAssemble, objCounts = objCounts,
     LO = LO,
 }
 end

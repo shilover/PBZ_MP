@@ -13,6 +13,7 @@ namespace PbzLobby
         public static bool Listing { get { return false; } }
         public static Action<string> Log = delegate { };
         public static bool Host(string name) { return false; }
+        public static volatile bool AiRoom;
         public static void Update(string name, string map, bool full) { }
         public static void Join(ulong lobby) { }
         public static void Leave() { }

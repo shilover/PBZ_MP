@@ -61,6 +61,7 @@ namespace PbzLobby
         public int Port = Session.GamePort;
         public bool Upnp;
         public bool Relay;          // §102 服务器大厅：允许走服务器中转（默认关；服务器也得开 --relay）
+        public int MaxSpec = 4;     // §141 房间设置：观战 / 排队人数上限（0 = 不让观战；0 / 2 / 4 / 8）
         public int AiLevel = 1;     // §75 本地 AI 难度：0 简单 / 1 普通 / 2 困难（LocalAi.Levels）
         public LocalAi.Loadout AiLoad = new LocalAi.Loadout();   // §114 AI 装备（aiw= / aie= / aio= / aimed= / aiacc=；不合法的值不认，用默认）
         public bool AiRoom;                 // §85 AI 对战时同时开房等真人（开关）
@@ -83,6 +84,9 @@ namespace PbzLobby
             if (d.TryGetValue("port", out v) && int.TryParse(v, out n) && n > 0 && n < 65536) Port = n;
             if (d.TryGetValue("upnp", out v)) Upnp = v == "1";
             if (d.TryGetValue("relay", out v)) Relay = v == "1";
+            if (d.TryGetValue("maxspec", out v) && int.TryParse(v, out n) && n >= 0 && n <= 8) MaxSpec = n;
+            SpecCfg.Max = MaxSpec;
+            if (d.TryGetValue("specnoq", out v)) SpecCfg.NoQueue = v == "1";
             int lv;
             if (d.TryGetValue("ailevel", out v) && int.TryParse(v, out lv) && lv >= 0 && lv <= 2) AiLevel = lv;
             if (d.TryGetValue("aiw", out v)) AiLoad.SetWeapon(v);
@@ -131,6 +135,7 @@ namespace PbzLobby
             sb.Append("mode=").Append(Mode).Append('\n').Append("name=").Append(Name.Replace("\n", " ")).Append('\n')
               .Append("port=").Append(Port).Append('\n').Append("upnp=").Append(Upnp ? 1 : 0).Append('\n')
               .Append("relay=").Append(Relay ? 1 : 0).Append('\n').Append("steam=").Append(Steam ? 1 : 0).Append('\n')
+              .Append("maxspec=").Append(MaxSpec).Append('\n').Append("specnoq=").Append(SpecCfg.NoQueue ? 1 : 0).Append('\n')
               .Append("steamset=1\n")     // §136 这一版起 steam= 是认真的（见构造函数）
               .Append("server=").Append(Server.Replace("\n", " ")).Append('\n')
               .Append("secret=").Append(Secret.Replace("\n", " ")).Append('\n')

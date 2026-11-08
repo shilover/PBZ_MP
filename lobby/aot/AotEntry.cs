@@ -15,6 +15,8 @@ namespace PbzLobby
     static unsafe class AotEntry
     {
         static int running;
+        static Mutex slot1;     // §153 双开：第一份游戏的 DLL 一直拿着；拿不到 = 我是第二份，用 net2（和 main.lua 的 INST 一致）
+        static int slot;
 
         [DllImport("kernel32", SetLastError = true)] static extern bool GetModuleHandleExW(uint flags, IntPtr addr, out IntPtr module);
         [DllImport("kernel32", CharSet = CharSet.Unicode)] static extern uint GetModuleFileNameW(IntPtr module, char* buf, uint size);
@@ -55,12 +57,21 @@ namespace PbzLobby
             try
             {
                 Program.BaseDir = dir;
+                Program.InstanceSalt = "_p" + Environment.ProcessId;   // §152 锁 / 管道按游戏进程区分（沙盒双开）
                 NetLog.Build = "DLL（游戏进程里）";     // §130 net_conn.log 里写
                 Safe.OnError = (where, ex) => err("[" + where + "] " + ex);
                 System.Windows.Forms.Application.ThreadException += ex => err("[loop] " + ex);
                 System.Windows.Forms.Application.Notice += m => err("[notice] " + m);
                 WinTimer.Begin();
-                try { Program.Main2(new[] { "--bg" }); }
+                // §153 不用沙盒双开：第二份游戏也在自己进程里跑 DLL 版，只是 net 目录换成 net2（以前第二份走 exe，面板老是"没响应"）
+                if (slot == 0)
+                {
+                    bool created;
+                    slot1 = new Mutex(true, "Local\\PBZ_MP_DllSlot1_" + Program.Fnv(Path.GetFullPath(dir).ToLowerInvariant()), out created);
+                    slot = created ? 1 : 2;     // 定下来就不变（面板"重启联机程序"再进来也一样）
+                }
+                string[] args = slot == 1 ? new[] { "--bg" } : new[] { "--bg", "--dir", Path.Combine(dir, "net2") };
+                try { Program.Main2(args); }
                 finally { WinTimer.End(); }
             }
             catch (Exception ex) { err("[main] " + ex); }

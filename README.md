@@ -73,6 +73,9 @@ lobby\aot\build_aot.bat
 - 成步堂芦苇
 - 谦逊的刘恒宇
 - 亦如黎明中的花朵_
+- 絡訸
+- 化境
+- 一一清风以及他的小伙伴们
 
 ### 许可证
 [GPL-3.0](LICENSE)；大厅服务器 `server/` 单独用 [AGPL-3.0](server/LICENSE)（改过的服务端对外提供服务，要向玩家提供源码）。
@@ -181,6 +184,9 @@ Players who tested the mod and reported bugs (on Bilibili):
 - 成步堂芦苇
 - 谦逊的刘恒宇
 - 亦如黎明中的花朵_
+- 絡訸
+- 化境
+- 一一清风以及他的小伙伴们
 
 ### License
 [GPL-3.0](LICENSE). The lobby server in `server/` is licensed separately under [AGPL-3.0](server/LICENSE): if you run a modified server for others, you must offer them its source.

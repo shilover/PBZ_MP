@@ -28,7 +28,7 @@ namespace PbzLobby
     {
         // 联机程序之间的协议版本：1 = v0.20.x 及以前（状态包里没有 pv=）；2 = v0.22.0 起（可靠事件 + 签名）
         public const int Version = 2;
-        public const string App = "0.29.6";        // 和 main.lua 的 VERSION 一致
+        public const string App = "0.30.2";        // 和 main.lua 的 VERSION 一致
         public const double MaxSkewSec = 120.0;    // 签名时间戳和本机时钟最多差 2 分钟
     }
 

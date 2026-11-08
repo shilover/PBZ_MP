@@ -25,6 +25,20 @@
 //   客机 → PBZS|RELAY|<会话号>             ← PBZS|RELAYOK|<会话号>；同时发给主机 PBZS|RELAYON|<会话号>
 //                                         ← 没开 --relay 时 PBZS|ERR|<会话号>|norelay；主机不允许中转时 …|hostnorelay
 //   双方 → PBZR|<会话号>\n<原样的状态包>    服务器按来源转给会话的另一方（包原样转发，带着这个头）
+//   §141 观战（要开 --relay；主机 REG 第 12 段 = 1 表示认观战，列表第 8 列 = 能观战）：
+//   观战者 → PBZS|WATCH|<房间号>           每 2 秒（保活）  ← PBZS|WATCHOK|<房间号>|<观战人数>
+//                                         ← 出错 PBZS|ERR|<房间号>|nofound / nowatch（主机是旧版）/ ranked / norelay / watchfull
+//   观战者 → PBZS|UNWATCH|<房间号>
+//   主机   → PBZW|<房间号>\n<签过名的状态包（带 src=h / src=c）>   服务器原样（带着这个头）发给这个房间每个观战者；没人观战时主机不发
+//   主机的 REGOK 第 5 段 = 现在的观战人数（主机靠它决定发不发）
+//   §141.7 排队：观战者按先来后到排队（WATCHOK 第 5 段 = 排第几；WATCH 第 4 段 = down 表示"刚下场的"，先不叫它上场；
+//   第 5 段 = noq 表示只观战、不排队：不叫它上场、不挑它当第二位、排第几报 0）。
+//   房间有过对手、现在没满（对手走了 / 被主机换下）→ 服务器给队首发 PBZS|YOURTURN|<房间号>|<口令>（15 秒内每 2 秒重发），
+//   这段时间别人 JOIN 一律 full，队首拿口令 JOIN（第 7 段）才放行
+//   §141.8 主机下场（第二位选手经服务器转发）：主机 → PBZS|HOSTDOWN|<密钥>：服务器挑队首（跳过刚下场的）当第二位，
+//   给它发 PBZS|SECOND|<房间号>|1；主机 → PBZS|HOSTUP|<密钥>：取消，给第二位发 PBZS|SECOND|<房间号>|0（回去观战）。
+//   主机的 REGOK 第 6 段 = 有没有第二位。第二位 → PBZV|<房间号>\n<包> 服务器转给主机；主机 → PBZU|<房间号>\n<包> 服务器转给第二位。
+//   第二位不再收观战包（PBZW）
 // 主机 / 客机的 REG、JOIN、PBZR 都从各自的"游戏 UDP 端口"发出，这样服务器看到的就是 NAT 给游戏端口分配的公网地址，
 // 告诉对方后双方往这个地址互发包（打洞）。打洞不通时客机发 RELAY，之后两边的状态包都经服务器转发。
 //
@@ -38,10 +52,14 @@
 //
 // --ranked <数据文件>：开武林盟主排位（账号、上报、Elo、排行榜；协议见 pbz-ranked.mjs 文件头，HANDOVER §110）。
 // --web <目录>：再把排行榜 + 武器 / 招式统计写成静态网页（index.html + ranked.json，每分钟有变化才写，§110.11）。
+// --cfg <文件>：数值表（标准数值基准 + 武器平衡，一行，客户端 tools/cfg_export.py 导出；HANDOVER §158）。文件改了自动重读（5 秒看一次）。
+//   任何 → PBZS|CFGQ|<我有的哈希或 ->   ← PBZS|CFG|<哈希>|<第几块>|<共几块>|<内容>（每块 ≤ 900 字节，内容里本来就有 |，客户端只按前 5 个 | 切）
+//                                       ← 已经是最新：PBZS|CFG|<哈希>|0|0|     没给 --cfg：PBZS|CFG|-|0|0|
 // pbz-ranked.mjs 只在给了 --ranked 时才加载：没有这个文件、不加 --ranked，服务器照常跑（排位不公开源码，不随发布包分发）。
 import dgram from 'node:dgram';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
+import fs from 'node:fs';
 
 const arg = (name, def) => {
     const i = process.argv.indexOf(name);
@@ -52,6 +70,7 @@ const HOST = arg('--host', process.env.HOST || '0.0.0.0');
 const QUIET = process.argv.includes('--quiet');
 const RELAY = process.argv.includes('--relay') || process.env.RELAY === '1';
 const RANKED_FILE = arg('--ranked', process.env.RANKED || '');
+const CFG_FILE = arg('--cfg', process.env.PBZ_CFG || '');
 const UPSTREAMS =process.argv.flatMap((a, i) => (a === '--upstream' && process.argv[i + 1] ? [process.argv[i + 1]] : []));
 
 const ROOM_TTL = 10_000;          // 主机 10 秒没心跳就删房间
@@ -62,6 +81,9 @@ const MAX_PACKET = 1400;
 const PUSH_CHUNK = 6;             // 每个 PUSH 包几个房间（中文名字 32 字 ≈ 96 字节，6 个也在 1400 以内）
 const MAX_REMOTE_PER_SOURCE = 200;
 const RELAY_RATE = 120;           // 每个会话每个方向每秒最多转发多少包（游戏 30 包/秒，留余量）
+const MAX_WATCH = 8;              // §141 每个房间最多几个观战者
+const WATCH_TTL = 6_000;          // 观战者 6 秒没保活就移出
+const WATCH_RATE = 150;           // 主机每秒最多上传多少观战包（两路 × 30 包/秒，留余量）
 
 /** @type {Map<string, {id:string,key:string,name:string,map:string,full:boolean,host:string,hostLocal:string,noRelay?:boolean,seen:number}>} */
 const rooms = new Map();          // 房间号 → 房间
@@ -110,6 +132,35 @@ if (RANKED_FILE) {
     }
 }
 
+// §158 数值表：读一次，之后每 5 秒看文件改没改
+const cfg = { text: '', hash: '-', chunks: [] };
+function fnv(s) {
+    let h = 0x811c9dc5;
+    for (const b of Buffer.from(s, 'utf8')) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(16).padStart(8, '0');
+}
+function loadCfg() {
+    let t;
+    try { t = fs.readFileSync(CFG_FILE, 'utf8').replace(/^\uFEFF/, '').trim(); } catch (e) { console.error(`[cfg] 读不了 ${CFG_FILE}：${e.message}`); return; }
+    if (!t.startsWith('v=') || /[\r\n]/.test(t)) { console.error(`[cfg] ${CFG_FILE} 不是一行数值表（要 v= 开头），不用`); return; }
+    if (t === cfg.text) return;
+    const buf = Buffer.from(t, 'utf8'), chunks = [];
+    // 按字节切，但别切在 UTF-8 多字节字符中间（数值表本来全是 ASCII，保险）
+    let i = 0;
+    while (i < buf.length) {
+        let j = Math.min(i + 900, buf.length);
+        while (j < buf.length && (buf[j] & 0xc0) === 0x80) j--;
+        chunks.push(buf.subarray(i, j).toString('utf8'));
+        i = j;
+    }
+    Object.assign(cfg, { text: t, hash: fnv(t), chunks });
+    console.log(`[cfg] 数值表 ${cfg.hash}（${buf.length} 字节，${chunks.length} 块）`);
+}
+if (CFG_FILE) {
+    loadCfg();
+    fs.watchFile(CFG_FILE, { interval: 5000 }, loadCfg);
+}
+
 function send(text, to) {
     const [host, port] = splitEp(to);
     sock.send(Buffer.isBuffer(text) ? text : Buffer.from(text, 'utf8'), port, host);
@@ -144,6 +195,12 @@ function onControl(f, from) {
         case 'PING':
             send(`PBZS|PONG|${from}`, from);
             return;
+        case 'CFGQ': {     // §158 数值表
+            if (!cfg.chunks.length) { send('PBZS|CFG|-|0|0|', from); return; }
+            if (clean(f[2], 16) === cfg.hash) { send(`PBZS|CFG|${cfg.hash}|0|0|`, from); return; }
+            cfg.chunks.forEach((c, k) => send(`PBZS|CFG|${cfg.hash}|${k + 1}|${cfg.chunks.length}|${c}`, from));
+            return;
+        }
         case 'REG': {
             const key = clean(f[2], 64);
             if (key.length < 8) return;
@@ -171,8 +228,12 @@ function onControl(f, from) {
             room.ranked = rk;                       // §110 武林盟主排位房间
             room.pid = rk ? pid : '';
             room.steam = rk ? steamIdOf(f[10]) : '';   // §135 排位对局走 Steam：主机的 SteamID（旧版联机程序不发 = 空）
+            room.watch = f[11] === '1' && !rk;         // §141 主机认观战（排位房间不给看）
+            room.aiFight = f[13] === '1';           // §141 第 14 段 = 主机在和本地 AI 对打（列表第 9 列）
+            room.maxWatch = Math.min(MAX_WATCH, Number.isFinite(Number(f[12])) && f[12] !== undefined && f[12] !== '' ? Number(f[12]) : MAX_WATCH);   // 第 13 段 = 主机设的上限
             room.seen = now;
-            send(`PBZS|REGOK|${id}|${from}`, from);
+            send(`PBZS|REGOK|${id}|${from}|${watchCount(room, now)}|${room.second && room.watchers?.has(room.second) ? 1 : 0}`, from);
+            queueTick(room, now);
             return;
         }
         case 'UNREG': {
@@ -186,7 +247,53 @@ function onControl(f, from) {
             const order = (x, y) => Number(!x.title) - Number(!y.title) || Number(x.full) - Number(y.full) || y.seen - x.seen;
             const own = [...rooms.values()].map((r) => ({ ...r, home: '', title: title(r) })).sort(order);
             const list = own.concat([...remote.values()].sort(order)).slice(0, MAX_LIST);
-            send('PBZS|ROOMS\n' + list.map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}\t${r.home}\t${r.ranked ? 1 : 0}\t${r.title || ''}`).join('\n'), from);
+            // §141 第 8 列 = 能观战（主机认观战、这台开了中转、是这台自己的房间）
+            send('PBZS|ROOMS\n' + list.map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}\t${r.home}\t${r.ranked ? 1 : 0}\t${r.title || ''}\t${r.watch && RELAY && !r.home ? 1 : 0}\t${r.aiFight ? 1 : 0}`).join('\n'), from);
+            return;
+        }
+        case 'WATCH': {
+            const id = clean(f[2], 16).toUpperCase();
+            const room = rooms.get(id);
+            if (!room) { send(`PBZS|ERR|${id}|nofound`, from); return; }
+            if (room.ranked) { send(`PBZS|ERR|${id}|ranked`, from); return; }
+            if (!room.watch) { send(`PBZS|ERR|${id}|nowatch`, from); return; }
+            if (!RELAY) { send(`PBZS|ERR|${id}|norelay`, from); return; }
+            room.watchers ??= new Map();
+            watchCount(room, now);
+            const w = room.watchers.get(from);
+            if (!w) {
+                if (room.watchers.size >= (room.maxWatch ?? MAX_WATCH)) { send(`PBZS|ERR|${id}|watchfull`, from); return; }
+                room.watchers.set(from, { seen: now, down: f[3] === 'down', noq: f[4] === 'noq' });
+                log(`[watch] ${from} 观战房间 ${id}${f[3] === 'down' ? '（刚下场）' : ''}${f[4] === 'noq' ? '（只观战）' : ''}`);
+            } else { w.seen = now; w.noq = f[4] === 'noq'; if (f[3] === 'up') w.down = false; }     // §141 观战者切回了排队
+            const queue = [...room.watchers].filter(([, v]) => !v.noq).map(([k]) => k);
+            const pos = queue.indexOf(from) + 1;
+            send(`PBZS|WATCHOK|${id}|${room.watchers.size}|${pos}`, from);
+            if (room.reserve?.ep === from && now <= room.reserve.until) send(`PBZS|YOURTURN|${id}|${room.reserve.token}`, from);
+            return;
+        }
+        case 'HOSTDOWN': case 'HOSTUP': {
+            const id = byKey.get(clean(f[2], 64));
+            const room = id && rooms.get(id);
+            if (!room || room.host !== from || !RELAY) return;
+            if (f[1] === 'HOSTUP') {
+                if (room.second) { send(`PBZS|SECOND|${id}|0`, room.second); log(`[watch] 房间 ${id} 主机回来打，第二位 ${room.second} 回去观战`); }
+                room.second = null;
+                return;
+            }
+            if (room.second && room.watchers?.has(room.second)) { send(`PBZS|SECOND|${id}|1`, room.second); return; }
+            watchCount(room, now);
+            const head = [...(room.watchers ?? [])].find(([, v]) => !v.down && !v.noq && now - v.seen <= WATCH_TTL);
+            if (!head) return;
+            room.second = head[0];
+            for (const v of room.watchers.values()) v.down = false;
+            log(`[watch] 房间 ${id} 主机下场，第二位 ${room.second}`);
+            send(`PBZS|SECOND|${id}|1`, room.second);
+            return;
+        }
+        case 'UNWATCH': {
+            const room = rooms.get(clean(f[2], 16).toUpperCase());
+            if (room?.watchers?.delete(from)) log(`[watch] ${from} 不看房间 ${room.id} 了`);
             return;
         }
         case 'PUSHOK': {
@@ -199,6 +306,17 @@ function onControl(f, from) {
             const room = rooms.get(id);
             if (!room) { send(`PBZS|ERR|${id}|nofound`, from); return; }
             const cpid = clean(f[4], 16), csteam = steamIdOf(f[5]);
+            // §141.7 轮到队首上场的这段时间，只放拿着口令的（队首）进来
+            const rs = room.reserve;
+            if (rs && now <= rs.until && clean(f[6], 16) !== rs.token
+                && ![...sessions.values()].some((x) => x.room === id && x.b === from)) { send(`PBZS|ERR|${id}|full`, from); return; }
+            if (rs && clean(f[6], 16) === rs.token) {
+                log(`[watch] 房间 ${id} 队首 ${rs.ep} 上场（${from}）`);
+                room.watchers?.delete(rs.ep);
+                for (const v of room.watchers?.values() ?? []) v.down = false;
+                room.reserve = null;
+                room.full = false;
+            }
             if (room.ranked && !(ranked && ranked.known(cpid) && cpid !== room.pid)) { send(`PBZS|ERR|${id}|ranked`, from); return; }
             // §135 排位对局只走 Steam：两边都要有 SteamID（一边是旧版就说清楚，别让客机一直连不上）
             if (room.ranked && !room.steam !== !csteam) { send(`PBZS|ERR|${id}|${room.steam ? 'needsteam' : 'oldhost'}`, from); return; }
@@ -207,6 +325,7 @@ function onControl(f, from) {
             if (!s) {
                 if (room.full) { send(`PBZS|ERR|${id}|full`, from); return; }
                 s = { sid: newId(10), room: id, a: room.host, b: from, relay: false, seen: now, rate: {} };
+                room.hadPeer = true;
                 sessions.set(s.sid, s);
                 log(`[join] ${from} → 房间 ${id}（主机 ${room.host}），会话 ${s.sid}`);
             }
@@ -264,6 +383,56 @@ function onRelay(buf, from) {
     stats.relayed++;
     ctr(s)[side === 'a' ? 'ab' : 'ba']++;
     send(buf, to);
+}
+
+// §141 观战人数（顺带移出 6 秒没保活的）
+function watchCount(room, now) {
+    if (!room.watchers) return 0;
+    for (const [w, v] of room.watchers) if (now - v.seen > WATCH_TTL) { room.watchers.delete(w); if (room.second === w) room.second = null; log(`[watch] ${w} 观战超时`); }
+    return room.watchers.size;
+}
+
+// §141.7 主机心跳时看一次：有过对手、现在没满、有人排队 → 叫队首（跳过刚下场的）。满了就取消
+function queueTick(room, now) {
+    if (!room.watch || !room.watchers?.size) { room.reserve = null; return; }
+    if (room.full) { room.hadPeer = true; room.reserve = null; return; }
+    if (!room.hadPeer) return;
+    if (!room.reserve || now > room.reserve.until) {
+        const head = [...room.watchers].find(([, v]) => !v.down && !v.noq && now - v.seen <= WATCH_TTL);
+        if (!head) { room.reserve = null; return; }
+        room.reserve = { ep: head[0], token: newId(8), until: now + 15_000 };
+        log(`[watch] 房间 ${room.id} 没满，叫队首 ${head[0]} 上场`);
+    }
+    send(`PBZS|YOURTURN|${room.id}|${room.reserve.token}`, room.reserve.ep);
+}
+
+// §141 PBZW|<房间号>\n<包>：主机上传的观战包，原样发给这个房间的每个观战者。只认这个房间登记的主机端点
+function onWatchUp(buf, from) {
+    const nl = buf.indexOf(10);
+    if (nl < 0 || nl > 24) { stats.dropped++; return; }
+    const room = rooms.get(buf.toString('utf8', 5, nl));
+    if (!room || room.host !== from || !room.watchers || room.watchers.size === 0 || !RELAY) { stats.dropped++; return; }
+    const sec = Math.floor(Date.now() / 1000);
+    const r = room.wrate ?? (room.wrate = { sec, n: 0 });
+    if (r.sec !== sec) { r.sec = sec; r.n = 0; }
+    if (++r.n > WATCH_RATE) { stats.dropped++; return; }
+    for (const w of room.watchers.keys()) { if (w === room.second) continue; stats.relayed++; send(buf, w); }
+}
+
+// §141.8 主机下场时第二位选手和主机之间的包：PBZV（第二位 → 主机）、PBZU（主机 → 第二位）
+function onSecond(buf, from, up) {
+    const nl = buf.indexOf(10);
+    if (nl < 0 || nl > 24) { stats.dropped++; return; }
+    const room = rooms.get(buf.toString('utf8', 5, nl));
+    if (!room || !room.second || !RELAY) { stats.dropped++; return; }
+    if (up ? from !== room.second : from !== room.host) { stats.dropped++; return; }
+    const sec = Math.floor(Date.now() / 1000);
+    const r = room.srate ?? (room.srate = { sec, n: 0 });
+    if (r.sec !== sec) { r.sec = sec; r.n = 0; }
+    if (++r.n > RELAY_RATE * 2) { stats.dropped++; return; }
+    if (up) { const w = room.watchers?.get(from); if (w) w.seen = Date.now(); }
+    stats.relayed++;
+    send(buf, up ? room.host : room.second);
 }
 
 function dropRoom(id, why) {
@@ -340,6 +509,9 @@ sock.on('message', (buf, rinfo) => {
     // 上游回的列表可能比一个普通包大（40 个房间）；其余来源超长的一律丢
     if (buf.length > MAX_PACKET && !up) { stats.dropped++; return; }
     if (buf.length > 5 && buf.toString('latin1', 0, 5) === 'PBZR|') { onRelay(buf, from); return; }
+    if (buf.length > 5 && buf.toString('latin1', 0, 5) === 'PBZW|') { onWatchUp(buf, from); return; }
+    if (buf.length > 5 && buf.toString('latin1', 0, 5) === 'PBZV|') { onSecond(buf, from, true); return; }
+    if (buf.length > 5 && buf.toString('latin1', 0, 5) === 'PBZU|') { onSecond(buf, from, false); return; }
     const text = buf.toString('utf8');
     if (!text.startsWith('PBZS|')) { stats.dropped++; return; }
     try {

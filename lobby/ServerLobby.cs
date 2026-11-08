@@ -4,6 +4,7 @@
 // 协议见服务端文件头。REG / JOIN / 中转都从游戏用的那个 UDP 端口发，服务器看到的才是 NAT 给这个端口的公网地址。
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -99,7 +100,7 @@ namespace PbzLobby
         Func<string> MapOf { get; set; }
     }
 
-    class ServerLink : ITransport, IRoomLink
+    class ServerLink : ITransport, IRoomLink, ISpecSink, IQueueHost, IRelayHost
     {
         public const int Tries = 3;              // 用户 2026-11-04 定：直连重试 3 次连不上改走服务器中转
         public const double TryWindow = 2.5;     // 每次直连等多少秒
@@ -139,6 +140,98 @@ namespace PbzLobby
         public string PeerMt { get; private set; }
         public string PeerQuit { get; private set; }
         public Action<Dictionary<string, string>> PeerPacket { get; set; }
+        // §141 观战：主机把两路包经服务器发给观战者（PBZW|房间号）。Watchers = 服务器在 REGOK 里报的观战人数；
+        // OnPeerState = 收到对手的一个状态包（Session 加 src=c 转发）
+        public volatile int Watchers;
+        public Action<string> OnPeerState { get; set; }
+        public long WatchTx;
+        public int SpecCount { get { return Watchers; } }
+        public void SendSpecs(byte[] b) { SendWatch(b); }
+        public bool SpecMode { get { return false; } set { } }      // 服务器大厅的观战者走 WatchLink，不走这里
+        public Action<string> OnRole { get; set; }
+        public int QPos { get { return 0; } }
+        public int QLen { get { return 0; } }
+        public string JoinToken;          // §141.7 客机：服务器叫我上场时给的口令（JOIN 第 7 段）
+        public volatile bool AiRoom;      // §141 AI 对战时等人的房间：REG 第 14 段 = 1（列表第 9 列，别人能观战 AI 对打）
+
+        // ---- §141.7 排队（主机）：上场由服务器叫（YOURTURN），这里只管让现在的对手下场：发 PBZROLE spec，3 秒后丢掉这个对手
+        DateTime demoteAt = DateTime.MinValue;
+        public List<object> QueueOrder() { var l = new List<object>(); for (int i = 0; i < Watchers; i++) l.Add(i); return l; }
+        public object PromoteHead() { return null; }
+        public object DemotePeer()
+        {
+            if (peer == null && !relay) return null;
+            demoteAt = DateTime.UtcNow;
+            NetLog.W("排队：让对手下场观战（3 秒后断开，服务器叫队首上场）");
+            return "peer";
+        }
+        public void SendTo(object who, byte[] b) { if ("peer".Equals(who)) Send(b); }
+        public bool HasPeer { get { return peer != null || relay; } }
+        public double SinceFromPeer { get { return (DateTime.UtcNow - lastFromPeer).TotalSeconds; } }
+        public bool CanPromote { get { return Watchers > 0; } }
+        void DropPeer()
+        {
+            demoteAt = DateTime.MinValue;
+            sid = null; peer = null; relay = false; relayOk = false; rx.Reset();
+            lastFromPeer = DateTime.MinValue;
+            cands.Clear();
+            NetLog.W("排队：对手已下场，等服务器介绍下一位");
+        }
+
+        // ---- §141.8 主机下场：第二位选手由服务器挑（队首）、双向转发（PBZU 发出去 / PBZV 收进来）
+        public volatile bool SecondOn;          // 服务器 REGOK 第 6 段
+        DateTime lastFrom2 = DateTime.MinValue, lastSecondReq = DateTime.MinValue;
+        int lastSeq2 = -1;
+        bool wantSecond;
+        public Action<string> OnSecondState { get; set; }
+        public bool NoOut { get; set; }
+        public bool HasSecond { get { return wantSecond && (SecondOn || (DateTime.UtcNow - lastFrom2).TotalSeconds < 3); } }
+        public double SinceFromSecond { get { return (DateTime.UtcNow - lastFrom2).TotalSeconds; } }
+        public object PromoteSecond()
+        {
+            if (Watchers == 0) return null;
+            wantSecond = true; lastSeq2 = -1; lastFrom2 = DateTime.UtcNow; lastSecondReq = DateTime.MinValue;
+            NetLog.W("主机下场：请服务器挑第二位选手");
+            return "second";      // 上场通知由服务器发（SECOND），Session 发的 PBZROLE 这里不发（SendTo 只认 "peer"）
+        }
+        public object DemoteSecond()
+        {
+            if (!wantSecond) return null;
+            wantSecond = false;
+            Raw("PBZS|HOSTUP|" + key, server);
+            NetLog.W("主机回来打：第二位选手回去观战");
+            return null;
+        }
+        public void SecondToPeer() { DemoteSecond(); }
+        public void SendSecond(byte[] b)
+        {
+            if (!wantSecond || roomId.Length == 0) return;
+            var head = Kv.Utf8.GetBytes("PBZU|" + roomId + "\n");
+            var pkt = new byte[head.Length + b.Length];
+            Buffer.BlockCopy(head, 0, pkt, 0, head.Length);
+            Buffer.BlockCopy(b, 0, pkt, head.Length, b.Length);
+            tx++;
+            Raw(pkt, server);
+        }
+
+        // 主机发来的换角色（客机这边）：直连和中转两条路都要看
+        bool RoleCtl(string s)
+        {
+            if (host || !s.StartsWith("PBZROLE", StringComparison.Ordinal)) return false;
+            string rv;
+            if (Kv.Parse(s).TryGetValue("role", out rv)) { var cb = OnRole; if (cb != null) cb(rv); }
+            return true;
+        }
+        public void SendWatch(byte[] b)
+        {
+            if (!host || roomId.Length == 0 || Watchers == 0) return;
+            var head = Kv.Utf8.GetBytes("PBZW|" + roomId + "\n");
+            var pkt = new byte[head.Length + b.Length];
+            Buffer.BlockCopy(head, 0, pkt, 0, head.Length);
+            Buffer.BlockCopy(b, 0, pkt, head.Length, b.Length);
+            WatchTx++;
+            Raw(pkt, server);
+        }
         int attempt = 1;
         DateTime attemptAt, lastJoin, lastPunch, lastReg, lastRelayReq, lastFromPeer = DateTime.MinValue, lastFromServer = DateTime.MinValue, punchUntil;
         // §130 连接诊断（net\net_conn.log）：只在状态变化时写；计数在每轮打洞 / 每个会话开始时清零
@@ -167,6 +260,7 @@ namespace PbzLobby
         }
 
         public string RoomId { get { return roomId; } }
+        public IPEndPoint Server { get { return server; } }
         public string Sid { get { return sid; } }       // §110 服务器给的会话号（排位上报用）
         public bool Relay { get { return relay; } }
         public string Error { get { return error; } }
@@ -291,11 +385,13 @@ namespace PbzLobby
                     if (noRelay || blocked) { error = ""; blocked = false; }
                 }
                 lastFromPeer = now;
-                if (wire.Control(text)) continue;
-                if (rx.Take(text)) { got++; outq.Push(text); }
+                if (RoleCtl(text) || wire.Control(text)) continue;
+                if (rx.Take(text)) { got++; if (!NoOut) outq.Push(text); var fw = OnPeerState; if (fw != null) fw(text); }
             }
             outq.Flush();   // 每轮写一个（RemoteOut，HANDOVER §72.10）
             if (got > 0) TakeNewest();
+            if (host && demoteAt != DateTime.MinValue && (now - demoteAt).TotalSeconds > 3.2) DropPeer();
+            if (host && wantSecond && !SecondOn && (now - lastSecondReq).TotalSeconds > 2) { lastSecondReq = now; Raw("PBZS|HOSTDOWN|" + key, server); }
             if (host) HostTick(now); else ClientTick(now);
             ServerWatch(now);
             return got;
@@ -334,6 +430,24 @@ namespace PbzLobby
         int FromServer(byte[] data, DateTime now)
         {
             lastFromServer = now;
+            if (host && data.Length > 5 && data[0] == 'P' && data[1] == 'B' && data[2] == 'Z' && data[3] == 'V' && data[4] == '|')
+            {
+                // §141.8 第二位选手经服务器发来的包
+                int nl2 = Array.IndexOf(data, (byte)'\n');
+                if (nl2 < 0 || !wantSecond) return 0;
+                var b2 = wire.Verify(data, nl2 + 1, data.Length - nl2 - 1, x => { });
+                if (b2 == null) return 0;
+                lastFrom2 = now;
+                if (b2.StartsWith("PBZ", StringComparison.Ordinal) || b2.Contains("hello=1")) return 0;
+                string q2s;
+                int q2;
+                if (!Kv.Parse(b2).TryGetValue("seq", out q2s) || !int.TryParse(q2s, out q2)) return 0;
+                if (q2 <= lastSeq2 && q2 > lastSeq2 - 100) return 0;
+                lastSeq2 = q2;
+                var cb2 = OnSecondState;
+                if (cb2 != null) cb2(b2);
+                return 0;
+            }
             if (data.Length > 5 && data[0] == 'P' && data[1] == 'B' && data[2] == 'Z' && data[3] == 'R' && data[4] == '|')
             {
                 // 中转来的状态包：PBZR|<会话号>\n<包>
@@ -359,8 +473,10 @@ namespace PbzLobby
                 if (blocked) { error = ""; blocked = false; }
                 if (relayRx++ == 0) NetLog.W("中转收到对方第一个包（" + Link.Head(body) + "，切到中转后 " + Ms(relayAt, now) + "）");
                 lastFromPeer = now;
-                if (wire.Control(body) || !rx.Take(body)) return 0;
-                outq.Push(body);   // 中转来的也要排队写（§72.10 漏了这条路，中转时对方状态一帧都写不出去）
+                if (RoleCtl(body) || wire.Control(body) || !rx.Take(body)) return 0;
+                if (!NoOut) outq.Push(body);   // 中转来的也要排队写（§72.10 漏了这条路，中转时对方状态一帧都写不出去）
+                var fw2 = OnPeerState;
+                if (fw2 != null) fw2(body);
                 TakeNewest();
                 return 1;
             }
@@ -369,6 +485,9 @@ namespace PbzLobby
             switch (f[1])
             {
                 case "REGOK":
+                    int wn;
+                    if (f.Length > 4 && int.TryParse(f[4], out wn)) Watchers = wn;     // §141 观战人数（旧服务器没有这段）
+                    SecondOn = f.Length > 5 && f[5] == "1";                             // §141.8 有没有第二位
                     if (f.Length > 2 && roomId != f[2])
                     {
                         roomId = f[2]; log(L.T("房间已登记到大厅：", "Room listed on the lobby server: ") + roomId);
@@ -493,7 +612,7 @@ namespace PbzLobby
                 if (!regLogged) { regLogged = true; NetLog.W("开始登记房间：大厅服务器 " + ServerDiag + "，本机内网 " + NetLog.Ip(LobbyServer.LocalAddr(LocalPort)) + "，允许中转 " + (AllowRelay ? "是" : "否") + "（每 2 秒一次）"); }
                 Raw("PBZS|REG|" + key + "|" + LobbyServer.Clean(name) + "|" + LobbyServer.Clean(MapOf()) + "|" + (full ? "1" : "0")
                     + "|" + LobbyServer.LocalAddr(LocalPort) + "|" + (AllowRelay ? "1" : "0")
-                    + (RankPid != null ? "|1|" + RankPid : ""), server);
+                    + (RankPid != null ? "|1|" + RankPid + "||" : "|0|||") + (SpecCfg.Max > 0 ? "1" : "0") + "|" + SpecCfg.Max + "|" + (AiRoom ? "1" : "0"), server);     // §141 第 12 段 = 认观战（排位房间服务器不给看），第 13 段 = 人数上限
                 if (lastFromServer == DateTime.MinValue ? (now - attemptAt).TotalSeconds > 5 : ServerQuiet)
                     error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + LobbyServer.Show(ServerName, server);
             }
@@ -544,7 +663,8 @@ namespace PbzLobby
             {
                 lastJoin = now;
                 if (!joinLogged) { joinLogged = true; joinAt = now; NetLog.W("发加入请求（JOIN）：房间 " + roomId + "，本机内网 " + NetLog.Ip(LobbyServer.LocalAddr(LocalPort)) + "，第 " + attempt + " 次"); }
-                Raw("PBZS|JOIN|" + roomId + "|" + LobbyServer.LocalAddr(LocalPort) + (RankPid != null ? "|" + RankPid : ""), server);
+                Raw("PBZS|JOIN|" + roomId + "|" + LobbyServer.LocalAddr(LocalPort) + (RankPid != null ? "|" + RankPid : "")
+                    + (JoinToken != null ? (RankPid != null ? "" : "|") + "||" + JoinToken : ""), server);     // §141.7 第 7 段 = 上场口令
             }
             Punch(now, "PBZHELLO\nsid=" + sid + "\n");
             if ((now - attemptAt).TotalSeconds < TryWindow) return;
@@ -609,6 +729,283 @@ namespace PbzLobby
     }
 
     // 不在联机时也要列房间：自己一个 UDP 口，每 2 秒问一次服务器（界面线程的 Tick 里调，不阻塞）
+    // §141 服务器大厅观战：观战者只跟大厅服务器说话（PBZS|WATCH 保活），主机上传的两路包由服务器原样转来（PBZW|房间号\n<包>）。
+    // 不打洞、不连主机，所以观战者在什么网络都能看；要服务器开了中转。观战者不发状态包（Send 什么都不做）
+    class WatchLink : ITransport, ISpecSink
+    {
+        readonly UdpClient udp;
+        readonly IPEndPoint server;
+        readonly string roomId;
+        readonly RemoteOut outq;
+        readonly Dictionary<string, int> srcSeq = new Dictionary<string, int>();
+        DateTime lastWatch = DateTime.MinValue, lastFromServer = DateTime.MinValue;
+        Action<string> log = delegate { };
+        Wire wire = new Wire(null);
+        long tx, gap;
+        public long SrcH, SrcC, Stale;
+        public volatile int Watchers;
+        public string Error = "";
+        string nick;
+        public bool Down;                       // §141.7 刚下场的：WATCH 带 down，服务器先不叫我上场
+        public volatile string TurnToken;       // §141.7 服务器叫我上场（YOURTURN）的口令
+        public int SpecCount { get { return 0; } }
+        public void SendSpecs(byte[] b) { }
+        public Action<string> OnPeerState { get; set; }
+        bool specMode = true;
+        public bool SpecMode { get { return specMode; } set { specMode = value; } }      // §141.8 false = 当第二位选手（经服务器和主机互发）
+        public Action<string> OnRole { get; set; }
+        public int QPos { get; private set; }
+        int lastSeqU = -1;
+        public int QLen { get { return Watchers; } }
+
+        public IPEndPoint Server { get { return server; } }
+
+        public WatchLink(IPEndPoint server, string room, string fRemote)
+        {
+            this.server = server;
+            roomId = (room ?? "").Trim().ToUpperInvariant();
+            outq = new RemoteOut(fRemote);
+            udp = new UdpClient(new IPEndPoint(NetBind.Addr, 0));
+            try { udp.Client.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch (Exception) { }
+        }
+
+        public string RoomId { get { return roomId; } }
+        public int LocalPort { get { return ((IPEndPoint)udp.Client.LocalEndPoint).Port; } }
+        public string PeerStr { get { return L.T("观战房间 ", "watching room ") + roomId; } }
+        public string PeerName { get { return ""; } }
+        public string PeerNick { get { return nick; } }
+        public long Tx { get { return tx; } }
+        public long Gap { get { return gap; } }
+        public double PingMs { get { return -1; } }
+        public Action<string> Log { get { return log; } set { log = value ?? delegate { }; } }
+        public Wire Wire { get { return wire; } set { wire = value ?? new Wire(null); } }
+        public RemoteOut Out { get { return outq; } }
+        // §141.8 当第二位选手时：自己的状态包经服务器发给主机（PBZV）；观战时什么都不发
+        public void Send(byte[] b)
+        {
+            if (specMode) return;
+            var head = Kv.Utf8.GetBytes("PBZV|" + roomId + "\n");
+            var pkt = new byte[head.Length + b.Length];
+            Buffer.BlockCopy(head, 0, pkt, 0, head.Length);
+            Buffer.BlockCopy(b, 0, pkt, head.Length, b.Length);
+            tx++;
+            try { udp.Send(pkt, pkt.Length, server); } catch (Exception) { }
+        }
+        public void Close()
+        {
+            try { var b = Kv.Utf8.GetBytes("PBZS|UNWATCH|" + roomId); udp.Send(b, b.Length, server); } catch (Exception) { }
+            try { udp.Close(); } catch (Exception) { }
+        }
+
+        public int Pump()
+        {
+            var now = DateTime.UtcNow;
+            if ((now - lastWatch).TotalSeconds > 2)
+            {
+                lastWatch = now;
+                tx++;
+                // 第 4 段 down = 刚下场；第 5 段 noq = 只观战、不排队（§141）
+                try { var b = Kv.Utf8.GetBytes("PBZS|WATCH|" + roomId + "|" + (SpecCfg.Up ? "up" : Down ? "down" : "") + (SpecCfg.NoQueue ? "|noq" : "")); udp.Send(b, b.Length, server); } catch (Exception) { }
+                if (lastFromServer != DateTime.MinValue && (now - lastFromServer).TotalSeconds > 6)
+                    Error = L.T("大厅服务器没回应", "The lobby server is not answering");
+            }
+            int got = 0;
+            while (true)
+            {
+                int avail;
+                try { avail = udp.Available; } catch (Exception) { break; }
+                if (avail <= 0) break;
+                IPEndPoint from = null;
+                byte[] data;
+                try { data = udp.Receive(ref from); } catch (Exception) { break; }
+                if (!from.Equals(server)) continue;
+                lastFromServer = now;
+                if (data.Length > 5 && data[0] == 'P' && data[1] == 'B' && data[2] == 'Z' && data[3] == 'U' && data[4] == '|')
+                {
+                    // §141.8 主机经服务器转给我（第二位选手）的包：对手的状态包，不带 src
+                    if (specMode) continue;
+                    int nlu = Array.IndexOf(data, (byte)'\n');
+                    if (nlu < 0) continue;
+                    var bu = wire.Verify(data, nlu + 1, data.Length - nlu - 1, x => { });
+                    if (bu == null || wire.Control(bu)) continue;
+                    string qs;
+                    int qu;
+                    if (!Kv.Parse(bu).TryGetValue("seq", out qs) || !int.TryParse(qs, out qu)) continue;
+                    if (qu <= lastSeqU && qu > lastSeqU - 100) continue;
+                    lastSeqU = qu;
+                    got++;
+                    nick = Kv.NickOf(bu) ?? nick;
+                    outq.Push(bu);
+                    continue;
+                }
+                if (data.Length > 5 && data[0] == 'P' && data[1] == 'B' && data[2] == 'Z' && data[3] == 'W' && data[4] == '|')
+                {
+                    if (!specMode) continue;
+                    int nl = Array.IndexOf(data, (byte)'\n');
+                    if (nl < 0) continue;
+                    var body = wire.Verify(data, nl + 1, data.Length - nl - 1, b => { });
+                    if (body == null || wire.Control(body)) continue;
+                    var d = Kv.Parse(body);
+                    string seqS, src;
+                    int seq;
+                    if (!d.TryGetValue("seq", out seqS) || !int.TryParse(seqS, out seq) || !d.TryGetValue("src", out src)) continue;
+                    int ls;
+                    if (!srcSeq.TryGetValue(src, out ls)) ls = -1;
+                    if (seq <= ls && seq > ls - 100) { Stale++; continue; }
+                    if (ls >= 0 && seq > ls + 1) gap += seq - ls - 1;
+                    srcSeq[src] = seq;
+                    if (src == "h") { SrcH++; nick = Kv.NickOf(body) ?? nick; } else SrcC++;
+                    got++;
+                    outq.Push(body);
+                    continue;
+                }
+                var f = Kv.Utf8.GetString(data).Split('|');
+                if (f.Length < 3 || f[0] != "PBZS") continue;
+                int n;
+                if (f[1] == "WATCHOK")
+                {
+                    Error = "";
+                    if (f.Length > 3 && int.TryParse(f[3], out n)) Watchers = n;
+                    if (f.Length > 4 && int.TryParse(f[4], out n)) QPos = n;
+                }
+                else if (f[1] == "SECOND" && f.Length > 3)
+                {
+                    bool on = f[3] == "1";
+                    if (on == specMode) { lastSeqU = -1; var cb = OnRole; if (cb != null) cb(on ? "client" : "spec"); }
+                }
+                else if (f[1] == "YOURTURN" && f.Length > 3 && TurnToken == null)
+                {
+                    TurnToken = f[3];
+                    log(L.T("轮到你上场了", "Your turn to play"));
+                    NetLog.W("排队：服务器叫我上场");
+                }
+                else if (f[1] == "ERR")
+                {
+                    var why = f.Length > 3 ? f[3] : "";
+                    var e = why == "nofound" ? L.T("大厅里没有这个房间（" + roomId + "）", "No such room (" + roomId + ")")
+                          : why == "nowatch" ? L.T("这个房间的主机是旧版，不能观战", "The host's version does not support spectating")
+                          : why == "norelay" ? L.T("这台大厅服务器没开中转，不能观战", "This lobby server has no relay, so no spectating")
+                          : why == "watchfull" ? L.T("观战人数满了", "Too many spectators")
+                          : why == "ranked" ? L.T("武林盟主排位房间不能观战", "Ranked rooms can't be watched")
+                          : L.T("大厅服务器报错：", "Lobby server error: ") + why;
+                    if (e != Error) { Error = e; log(e); NetLog.W("观战：" + e); }
+                }
+            }
+            outq.Flush();
+            return got;
+        }
+    }
+
+    // §158 数值表（标准数值基准 + 武器平衡）从大厅服务器拉：填了服务器地址就问一次 PBZS|CFGQ|<我有的哈希>，之后每 10 分钟再问（服务器上的表可能改了）。
+    // 服务器回 PBZS|CFG|<哈希>|<第几块>|<共几块>|<内容>（内容里本来就有 |，只按前 5 个 | 切）；共 0 块 = 我的已经是最新 / 服务器没有（哈希 -）。
+    // 收齐、FNV-1a 哈希对得上才写 net\srvcfg.txt（h= / s=），Lua 启动和每场开局前读它；服务器没开 --cfg 时不回，什么都不写。
+    class CfgFetch
+    {
+        UdpClient sock;
+        IPEndPoint server;
+        string serverText = null, have = "", partsHash = null;
+        string[] parts;
+        DateTime lastAsk = DateTime.MinValue, nextAsk = DateTime.MinValue;
+        public const int AskEverySec = 600, RetrySec = 5;
+
+        public static string Fnv(string s)
+        {
+            uint h = 0x811c9dc5;
+            foreach (var b in Kv.Utf8.GetBytes(s)) { h ^= b; h *= 0x01000193; }
+            return h.ToString("x8");
+        }
+
+        public void Poll(string addr, string dir)
+        {
+            var now = DateTime.UtcNow;
+            addr = (addr ?? "").Trim();
+            if (addr != serverText)
+            {
+                serverText = addr;
+                server = null;
+                nextAsk = now;
+                Close();
+                have = ReadHave(dir);
+            }
+            if (addr.Length == 0) return;
+            if (server == null)
+            {
+                if (now < nextAsk) return;
+                server = LobbyServer.Resolve(addr);
+                if (server == null) { nextAsk = now.AddSeconds(30); return; }
+            }
+            if (sock == null)
+            {
+                try
+                {
+                    sock = new UdpClient(new IPEndPoint(NetBind.Addr, 0));
+                    try { sock.Client.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch (Exception) { }
+                }
+                catch (Exception) { sock = null; nextAsk = now.AddSeconds(30); return; }
+            }
+            while (true)
+            {
+                int avail;
+                try { avail = sock.Available; } catch (Exception) { break; }
+                if (avail <= 0) break;
+                IPEndPoint from = null;
+                byte[] data;
+                try { data = sock.Receive(ref from); } catch (Exception) { break; }
+                if (!from.Equals(server)) continue;
+                var f = Kv.Utf8.GetString(data).Split(new[] { '|' }, 6);
+                if (f.Length < 6 || f[0] != "PBZS" || f[1] != "CFG") continue;
+                int i, n;
+                if (!int.TryParse(f[3], out i) || !int.TryParse(f[4], out n)) continue;
+                if (n == 0)
+                {
+                    nextAsk = now.AddSeconds(AskEverySec);     // 已经是最新 / 服务器没有
+                    if (f[2] != have && f[2] != "-") NetLog.W("数值表：服务器说是 " + f[2] + "，本地缓存 " + (have == "" ? "（没有）" : have));
+                    continue;
+                }
+                if (n > 200 || i < 1 || i > n) continue;
+                if (partsHash != f[2] || parts == null || parts.Length != n) { partsHash = f[2]; parts = new string[n]; }
+                parts[i - 1] = f[5];
+                bool all = true;
+                foreach (var x in parts) if (x == null) { all = false; break; }
+                if (!all) continue;
+                var text = string.Concat(parts);
+                parts = null;
+                if (Fnv(text) != partsHash) { NetLog.W("数值表：服务器发来的收齐了但哈希对不上（" + Fnv(text) + " ≠ " + partsHash + "），不用"); continue; }
+                try
+                {
+                    var tmp = Path.Combine(dir, "srvcfg.txt.tmp");
+                    File.WriteAllText(tmp, "h=" + partsHash + "\ns=" + text + "\nend=1\n", Kv.Utf8);
+                    var dst = Path.Combine(dir, "srvcfg.txt");
+                    if (File.Exists(dst)) File.Delete(dst);
+                    File.Move(tmp, dst);
+                    have = partsHash;
+                    NetLog.W("数值表：从服务器拿到 " + have + "（" + text.Length + " 字节），写进 srvcfg.txt");
+                }
+                catch (Exception ex) { NetLog.W("数值表：写 srvcfg.txt 失败：" + ex.Message); }
+                nextAsk = now.AddSeconds(AskEverySec);
+            }
+            if (now >= nextAsk && (now - lastAsk).TotalSeconds >= RetrySec)
+            {
+                lastAsk = now;
+                var b = Kv.Utf8.GetBytes("PBZS|CFGQ|" + (have == "" ? "-" : have));
+                try { sock.Send(b, b.Length, server); } catch (Exception) { }
+            }
+        }
+
+        static string ReadHave(string dir)
+        {
+            try
+            {
+                foreach (var line in File.ReadAllLines(Path.Combine(dir, "srvcfg.txt"), Kv.Utf8))
+                    if (line.StartsWith("h=")) return line.Substring(2).Trim();
+            }
+            catch (Exception) { }
+            return "";
+        }
+
+        public void Close() { if (sock != null) { try { sock.Close(); } catch (Exception) { } sock = null; } }
+    }
+
     class LobbyList
     {
         UdpClient sock;

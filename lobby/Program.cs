@@ -9,7 +9,8 @@
 //   lang.txt          本程序写：lang=zh|en（窗口右上角切换），游戏据此切换屏幕提示的语言
 //   lobby.txt         本程序写（每 0.5 秒）：给游戏内联机面板看的状态和可加入目标（net-ui，docs/NETWORK_UI.md §2.5）
 //   cmd.txt           游戏内联机面板写：host / join / stop / mode / show，本程序按 id 执行一次
-// 房间发现：主机每秒往 UDP 27016 广播 "PBZROOM|名字|端口|地图|是否已满"，加入方监听同一端口列出来。
+// 房间发现：主机每秒往 UDP 27016 广播 "PBZROOM|名字|端口|地图|是否已满|能观战"，加入方监听同一端口列出来。
+// 第 6 段 §141 起有（"1" = 这个主机认观战连接）；旧版主机只有 5 段，满房照旧不能点
 // 连接方式（net-ui）：局域网（含 Tailscale / ZeroTier，见 NetExtras.cs）、
 // 服务器大厅（自建服务端登记房间 + 打洞，服务器开了中转时不通走中转，含输入 IP 直连，ServerLobby.cs）、本地 AI 对战（LocalAi.cs）。
 //
@@ -179,7 +180,7 @@ namespace PbzLobby
     }
 
     // 一个 UDP 端点：收包只要比上一个新的序号，排队写进 state_remote.txt（RemoteOut）
-    class Link : ITransport
+    class Link : ITransport, ISpecSink, IQueueHost, IRelayHost
     {
         public readonly UdpClient Udp;
         public IPEndPoint Peer;
@@ -192,6 +193,190 @@ namespace PbzLobby
         public long DelayN;
         public Action<string> Log = delegate { };
         public bool Diag;      // §130 写 net\net_conn.log（局域网 / 输入 IP 直连；AI 对战的回环不写）
+        // §141 观战（第 2 步）。主机：握手带 spec=1 的地址记成观战者（不占对战位、不锁定），Session 把两路状态包转给它们；
+        // OnPeerState = 收到对手的一个状态包（Session 加 src=c 转发）。观战者：SpecMode = 收主机转来的两路包（src=h / src=c），
+        // 两路各有自己的序号，按来源分别去重
+        public const int MaxSpec = 4;
+        public const double SpecLost = 6.0;
+        readonly Dictionary<IPEndPoint, DateTime> specs = new Dictionary<IPEndPoint, DateTime>();
+        readonly List<IPEndPoint> order = new List<IPEndPoint>();     // §141.7 排队：先来的在前
+        public Action<string> OnPeerState { get; set; }
+        public Action<string> OnRole { get; set; }   // 观战者 / 对手：主机发来 PBZROLE（轮到你上场 / 你下场观战）
+        public volatile int QPos, QLen;       // 观战者：主机发来的 PBZQ（排第几、一共几个）
+        int ISpecSink.QPos { get { return QPos; } }
+        int ISpecSink.QLen { get { return QLen; } }
+        List<object> IQueueHost.QueueOrder() { return QueueOrder().ConvertAll(e => (object)e); }
+        public bool CanPromote { get { lock (specs) foreach (var ep in order) if (specs.ContainsKey(ep) && !ep.Equals(lastDown)) return true; return false; } }
+        bool IQueueHost.CanPromote { get { return CanPromote; } }
+        object IQueueHost.PromoteHead() { return PromoteHead(); }
+        object IQueueHost.DemotePeer() { return DemotePeer(); }
+        void IQueueHost.SendTo(object who, byte[] b) { SendTo(who as IPEndPoint, b); }
+        bool IQueueHost.HasPeer { get { return Peer != null; } }
+        bool specMode;
+        public bool SpecMode { get { return specMode; } set { specMode = value; srcSeq.Clear(); lastSeq = -1; } }
+        public long SpecTx, SrcH, SrcC, SpecRefused;
+        readonly Dictionary<string, int> srcSeq = new Dictionary<string, int>();
+
+        internal static bool IsSpecHello(string s)
+        {
+            return s.StartsWith("PBZHELLO", StringComparison.Ordinal) && s.Contains("\nspec=1");
+        }
+
+        public int SpecCount
+        {
+            get
+            {
+                lock (specs)
+                {
+                    var now = DateTime.UtcNow;
+                    var gone = new List<IPEndPoint>();
+                    foreach (var kv in specs) if ((now - kv.Value).TotalSeconds > SpecLost) gone.Add(kv.Key);
+                    foreach (var g in gone) { specs.Remove(g); order.Remove(g); Log(L.T("观战者离开：", "Spectator left: ") + g); }
+                    return specs.Count;
+                }
+            }
+        }
+
+        // 观战者的握手 / 保活：记下（满了不收）。返回 true = 这个包是观战者的，不再往下处理
+        bool NoteSpec(IPEndPoint from, string s)
+        {
+            bool noq = s.Contains("\nnoq=1");      // §141 只观战、不排队：在 specs 里（照样收转发），不在 order 里（不会被叫上场）
+            lock (specs)
+            {
+                if (specs.ContainsKey(from))
+                {
+                    specs[from] = DateTime.UtcNow;
+                    if (IsSpecHello(s))
+                    {
+                        if (s.Contains("\nup=1") && from.Equals(lastDown)) lastDown = null;     // §141 刚下场的人切回了排队
+                        if (noq) order.Remove(from);
+                        else if (!order.Contains(from)) order.Add(from);      // 改回排队：排到队尾
+                    }
+                    return true;
+                }
+                if (!IsSpecHello(s)) return false;
+                if (specs.Count >= SpecCfg.Max) { SpecRefused++; return true; }     // 房间设置的上限（0 = 不让观战）
+                specs[from] = DateTime.UtcNow;
+                order.Remove(from);
+                if (!noq) order.Add(from);
+            }
+            Log(L.T("观战者加入：", "Spectator joined: ") + from);
+            if (Diag) NetLog.W("观战者加入：" + NetLog.Ip(from));
+            return true;
+        }
+
+        // §141.7 对手位让给队首：返回顶上来的地址（没人排队 = null）。刚下场的那个跳过（自己下去观战的不会马上又被叫上来）
+        IPEndPoint lastDown;
+        DateTime promotedAt = DateTime.MinValue;
+
+        // ---- §141.8 主机下场：第二位选手
+        public IPEndPoint Peer2;
+        int lastSeq2 = -1;
+        DateTime lastFrom2 = DateTime.MinValue;
+        public Action<string> OnSecondState { get; set; }
+        public bool NoOut { get; set; }
+        public bool HasSecond { get { return Peer2 != null; } }
+        public double SinceFromSecond { get { return (DateTime.UtcNow - lastFrom2).TotalSeconds; } }
+        public void SendSecond(byte[] b) { var p = Peer2; if (p != null) { Tx++; try { Udp.Send(b, b.Length, p); } catch (Exception) { } } }
+        public object PromoteSecond()
+        {
+            IPEndPoint head = null;
+            lock (specs)
+            {
+                var now = DateTime.UtcNow;
+                foreach (var ep in order)
+                    if (specs.ContainsKey(ep) && (now - specs[ep]).TotalSeconds <= SpecLost && !ep.Equals(lastDown)) { head = ep; break; }
+                if (head == null) return null;
+                specs.Remove(head);
+                order.Remove(head);
+            }
+            Peer2 = head; lastSeq2 = -1; lastFrom2 = DateTime.UtcNow; lastDown = null;
+            Log(L.T("第二位选手上场：", "Second player: ") + head);
+            if (Diag) NetLog.W("主机下场：第二位选手 " + NetLog.Ip(head));
+            return head;
+        }
+        public object DemoteSecond()
+        {
+            var old = Peer2;
+            if (old == null) return null;
+            lock (specs) { specs[old] = DateTime.UtcNow; order.Remove(old); order.Add(old); }
+            Peer2 = null;
+            lastDown = old;
+            Log(L.T("第二位选手下场：", "Second player steps down: ") + old);
+            return old;
+        }
+        public void SecondToPeer()
+        {
+            if (Peer2 == null) return;
+            Peer = Peer2; Peer2 = null; lastSeq = -1; lastFromPeer = lastFrom2;
+            Log(L.T("第二位选手改当对手：", "Second player is now the opponent: ") + Peer);
+        }
+        public const double PromoteGrace = 6.0;
+        public IPEndPoint PromoteHead()
+        {
+            IPEndPoint head = null;
+            lock (specs)
+            {
+                var now = DateTime.UtcNow;
+                foreach (var ep in order)
+                    if (specs.ContainsKey(ep) && (now - specs[ep]).TotalSeconds <= SpecLost && !ep.Equals(lastDown)) { head = ep; break; }
+                if (head == null) return null;
+                specs.Remove(head);
+                order.Remove(head);
+            }
+            Peer = head;
+            lastSeq = -1;
+            lastFromPeer = DateTime.UtcNow;
+            lastDown = null;
+            promotedAt = DateTime.UtcNow;
+            Log(L.T("队首上场：", "Next in queue plays: ") + head);
+            if (Diag) NetLog.W("排队：队首上场 " + NetLog.Ip(head));
+            return head;
+        }
+
+        // §141.7 打完换人：现在的对手下场，排到队尾当观战者。返回下场的地址
+        public IPEndPoint DemotePeer()
+        {
+            var old = Peer;
+            if (old == null) return null;
+            lock (specs)
+            {
+                specs[old] = DateTime.UtcNow;
+                order.Remove(old);
+                order.Add(old);
+            }
+            Peer = null;
+            lastDown = old;
+            Log(L.T("对手下场观战：", "Opponent moves to spectators: ") + old);
+            if (Diag) NetLog.W("排队：对手下场观战 " + NetLog.Ip(old));
+            return old;
+        }
+
+        public double SinceFromPeer { get { return (DateTime.UtcNow - lastFromPeer).TotalSeconds; } }
+        public bool SpecAlive(IPEndPoint ep) { lock (specs) return ep != null && specs.ContainsKey(ep); }
+
+        // 观战者在队里的位置（1 起），给每个人发 PBZQ 用
+        public List<IPEndPoint> QueueOrder()
+        {
+            lock (specs) return new List<IPEndPoint>(order);
+        }
+
+        public void SendTo(IPEndPoint ep, byte[] b)
+        {
+            if (ep == null) return;
+            try { Udp.Send(b, b.Length, ep); } catch (Exception) { }
+        }
+
+        public void SendSpecs(byte[] b)
+        {
+            List<IPEndPoint> to;
+            lock (specs) to = new List<IPEndPoint>(specs.Keys);
+            foreach (var ep in to)
+            {
+                SpecTx++;
+                try { Udp.Send(b, b.Length, ep); } catch (Exception) { }
+            }
+        }
 
         public Link(int port, IPEndPoint peer, string fRemote)
         {
@@ -255,6 +440,31 @@ namespace PbzLobby
                 var to = from;
                 var s = wire.Verify(data, 0, data.Length, b => { try { Udp.Send(b, b.Length, to); } catch (Exception) { } });
                 if (s == null) continue;
+                // §141.8 第二位选手的包：状态包交给 Session 转发；握手 / 可靠事件不进主机的可靠通道（它只认第一位）
+                var p2 = Peer2;
+                if (lockFirst && p2 != null && from.Equals(p2))
+                {
+                    lastFrom2 = DateTime.UtcNow;
+                    if (s.StartsWith("PBZ", StringComparison.Ordinal) || s.Contains("hello=1")) continue;
+                    var d2 = Kv.Parse(s);
+                    string q2;
+                    int sq2;
+                    if (!d2.TryGetValue("seq", out q2) || !int.TryParse(q2, out sq2)) continue;
+                    if (sq2 <= lastSeq2 && sq2 > lastSeq2 - 100) continue;
+                    lastSeq2 = sq2;
+                    var cb2 = OnSecondState;
+                    if (cb2 != null) cb2(s);
+                    continue;
+                }
+                // §141 主机：观战者的握手 / 保活不锁定、不占对战位（对手本人发来的不算）
+                if (lockFirst && !from.Equals(Peer) && NoteSpec(from, s)) continue;
+                // §141.7 对手自己说要下去观战（发来观战握手）：下场排到队尾
+                // 刚叫上场的人在收到 PBZROLE 之前还会发几个观战握手：上场后 PromoteGrace 秒内的不算
+                if (lockFirst && Peer != null && from.Equals(Peer) && IsSpecHello(s))
+                {
+                    if ((DateTime.UtcNow - promotedAt).TotalSeconds > PromoteGrace) { DemotePeer(); NoteSpec(from, s); }
+                    continue;
+                }
                 // 主机：锁定第一个来的对端；对端 3 秒没动静（比如对方重开了联机窗口，端口变了）就允许换人
                 if (lockFirst && (Peer == null || (!from.Equals(Peer) && (DateTime.UtcNow - lastFromPeer).TotalSeconds > 3)))
                 {
@@ -267,6 +477,22 @@ namespace PbzLobby
                     lastSeq = -1;
                 }
                 if (Peer != null && !from.Equals(Peer)) continue;
+                // §141.7 主机发来的换角色 / 排队位置（只认主机：观战者 / 客机的 Peer 就是主机）
+                if (!lockFirst && s.StartsWith("PBZROLE", StringComparison.Ordinal))
+                {
+                    string rv;
+                    if (Kv.Parse(s).TryGetValue("role", out rv)) { var cb = OnRole; if (cb != null) cb(rv); }
+                    continue;
+                }
+                if (!lockFirst && s.StartsWith("PBZQ", StringComparison.Ordinal))
+                {
+                    var q = Kv.Parse(s);
+                    string a, b2;
+                    int pos, len;
+                    if (q.TryGetValue("pos", out a) && int.TryParse(a, out pos)) QPos = pos;
+                    if (q.TryGetValue("n", out b2) && int.TryParse(b2, out len)) QLen = len;
+                    continue;
+                }
                 lastFromPeer = DateTime.UtcNow;
                 if (wire.Control(s)) continue;     // 可靠事件 / 确认 / 握手（握手包只用来让主机知道往哪回）
                 if (s.Contains("hello=1")) continue;
@@ -274,9 +500,23 @@ namespace PbzLobby
                 string seqS;
                 int seq;
                 if (!d.TryGetValue("seq", out seqS) || !int.TryParse(seqS, out seq)) continue;
-                if (seq <= lastSeq && seq > lastSeq - 100) { Stale++; continue; }   // 乱序到达的旧包；回退很多 = 对方重启了游戏
-                if (lastSeq >= 0 && seq > lastSeq + 1) Gap += seq - lastSeq - 1;
-                lastSeq = seq;
+                string src;
+                if (SpecMode && d.TryGetValue("src", out src))
+                {
+                    // §141 观战者：主机 / 对手两路包各自的序号
+                    int ls;
+                    if (!srcSeq.TryGetValue(src, out ls)) ls = -1;
+                    if (seq <= ls && seq > ls - 100) { Stale++; continue; }
+                    if (ls >= 0 && seq > ls + 1) Gap += seq - ls - 1;
+                    srcSeq[src] = seq;
+                    if (src == "h") SrcH++; else SrcC++;
+                }
+                else
+                {
+                    if (seq <= lastSeq && seq > lastSeq - 100) { Stale++; continue; }   // 乱序到达的旧包；回退很多 = 对方重启了游戏
+                    if (lastSeq >= 0 && seq > lastSeq + 1) Gap += seq - lastSeq - 1;
+                    lastSeq = seq;
+                }
                 Rx++;
                 got++;
                 string st;
@@ -288,10 +528,12 @@ namespace PbzLobby
                     if (delay > DelayMax) DelayMax = delay;
                 }
                 newest = s;
-                outq.Push(s);
+                if (!NoOut) outq.Push(s);
+                var fw = OnPeerState;
+                if (fw != null && !SpecMode) fw(s);
             }
             outq.Flush();
-            if (newest != null) PeerNick = Kv.NickOf(newest) ?? PeerNick;
+            if (newest != null && !SpecMode) PeerNick = Kv.NickOf(newest) ?? PeerNick;
             return got;
         }
     }
@@ -300,7 +542,9 @@ namespace PbzLobby
     class Session
     {
         public const int GamePort = 27015, DiscoveryPort = 27016, PollMs = 4;
-        public readonly string Role, Name, Mode;
+        public readonly string Name, Mode;
+        volatile string role;
+        public string Role { get { return role; } }     // §141.7 观战者 ↔ 客机会在会话里换（轮到上场 / 下场观战）
         public readonly ITransport T;
         volatile string fLocal, fSession;
         volatile string retargetTo;     // §85 等人的房间转正：Run 线程里换目录
@@ -334,12 +578,20 @@ namespace PbzLobby
         // secret：联机密码，空 = 不签名
         public Session(string role, string mode, ITransport t, IPEndPoint peer, int port, string name, string dir, bool doBackup, string secret)
         {
-            Role = role;
+            this.role = role;
             Mode = mode;
             Name = string.IsNullOrEmpty(name) ? Environment.MachineName : name;
             fLocal = Path.Combine(dir, "state_local.txt");
             fSession = Path.Combine(dir, "session.txt");
             T = t ?? new Link(role == "host" ? port : 0, peer, Path.Combine(dir, "state_remote.txt"));
+            var lk0 = T as Link;
+            // §141 观战：主机把对手的包加 src=c 转给观战者；观战者（role = spec）只收不发状态包
+            var ss0 = T as ISpecSink;
+            if (ss0 != null && role == "host") ss0.OnPeerState = body => { if (RelayOn) RelayForward(body, true); else ForwardSpec(body, "c"); };
+            var rh0 = T as IRelayHost;
+            if (rh0 != null && role == "host") rh0.OnSecondState = body => { secondRx++; if (RelayOn) RelayForward(body, false); };
+            if (ss0 != null && role == "spec") ss0.SpecMode = true;
+            if (ss0 != null && role != "host") ss0.OnRole = r => wantRole = r;
             // 局域网 / 虚拟局域网才广播房间（广域网的朋友收不到广播；Steam 用富状态）
             // 测试给了 --lan-port（不是 27015）时不广播，免得开着的游戏的房间列表里冒出测试房间（§85.5）
             broadcast = role == "host" && mode == "lan" && port == GamePort;
@@ -366,6 +618,262 @@ namespace PbzLobby
 
         // Session 发出的包都走这里：签名 → （测试时的坏网络）→ 传输
         void SendText(string body) { lock (sendLock) sim.Send(Wire.Seal(body), T.Send); }
+
+        // §141 主机：一个状态包加上来源（h = 主机自己，c = 对手）签名后发给每个观战者；没有观战者不做
+        // §141 主机和本地 AI 对打、同时开着等人的房间：AI 会话的两路包（主机 = h、AI = c）交给等人房间的观战者
+        public volatile Session SpecRelay;
+        // §141 这个会话是"AI 对战时等人的房间"：房间列表里多一行"观战 AI 对战"（局域网广播第 7 段 / 服务器 REG 第 14 段 / Steam 大厅 ai）
+        public volatile bool AiWaiting;
+        public void ForwardSpecFrom(string body, string src) { ForwardSpec(body, src); }
+
+        void ForwardSpec(string body, string src)
+        {
+            var relay = SpecRelay;
+            if (relay != null && relay != this) { relay.ForwardSpecFrom(body, src); return; }
+            var ss = T as ISpecSink;
+            if (ss == null || ss.SpecCount == 0) return;
+            var sb = new StringBuilder();
+            foreach (var raw in SpecCfg.Slim(body).Split('\n'))     // 只留观战用得到的字段
+            {
+                var line = raw.TrimEnd('\r');
+                if (line.Length == 0 || line.StartsWith("src=")) continue;
+                sb.Append(line).Append('\n');
+            }
+            sb.Append("src=").Append(src).Append('\n');
+            lock (sendLock) ss.SendSpecs(Wire.Seal(sb.ToString()));
+        }
+        int QPos { get { var ss = T as ISpecSink; return ss != null && Role == "spec" && !SpecCfg.NoQueue ? ss.QPos : 0; } }
+        int QLen
+        {
+            get
+            {
+                var q = T as IQueueHost;
+                if (Role == "host") return q != null ? q.QueueOrder().Count : 0;
+                var ss = T as ISpecSink;
+                return ss != null ? ss.QLen : 0;
+            }
+        }
+        public int Spectators
+        {
+            get
+            {
+                var ss = T as ISpecSink;
+                return ss != null ? ss.SpecCount : 0;
+            }
+        }
+
+        // §141.7 排队。主机：对手掉线 FillAfter 秒、有人排队 → 队首上场；游戏打完一场按房间规矩发 rotate → 对手下场排队尾、队首上场。
+        // 换角色的 PBZROLE 每 0.5 秒重发，直到对方照新角色发包（上场的发状态包 / 下场的发 spec=1 握手），最多 RoleRetry 秒
+        public const double FillAfter = 4.0, RoleRetry = 6.0;
+        volatile string wantRole;                   // 观战者 / 客机：主机让换成的角色（Run 线程里换）
+        object roleTo, roleTo2;                     // 主机：正在通知上场的 / 下场的（IP 端点或 Steam 连接句柄）
+        DateTime roleAt, roleSentAt, lastQ;
+        public volatile string QueueMsg = "";       // 给面板：最近一次换人
+        long rxAtPromote;
+
+        // ---- §141.8 主机下场：两位选手经主机互相转发，主机自己观战（游戏收到 src=h 第一位 / src=c 第二位）。
+        // 转发给对面选手时序号改成主机自己的（两边看到的序号一直往上走），房间规矩字段换成主机的（两位都是客机，按"主机"的规矩打）。
+        // 可靠事件（聊天 / 回合结果）不转：对局流程靠状态包里的 mt= / dead= / quit= 就能走
+        public volatile bool RelayOn;
+        volatile string relayReq;           // "down" / "up"：面板的"我也下场" / "我回来打"，Run 线程里做
+        long secondRx, relaySeq = 100000;
+        readonly Dictionary<string, string> hostRules = new Dictionary<string, string>();
+        static readonly string[] RuleKeys = { "bar", "bo", "dm", "ab", "ctr", "bal", "medok", "npos", "ult0", "sp0", "resm", "ultx", "rdyto" };
+        public bool HostDown() { if (Role != "host" || !(T is IRelayHost)) return false; relayReq = "down"; return true; }
+        public bool HostUp() { if (Role != "host" || !RelayOn) return false; relayReq = "up"; return true; }
+
+        void RelayForward(string body, bool fromFirst)
+        {
+            var rh = T as IRelayHost;
+            if (rh == null) return;
+            var side = fromFirst ? "h" : "c";
+            ForwardSpec(body, side);
+            var strip = new StringBuilder();
+            foreach (var raw in body.Split('\n'))
+            {
+                var line = raw.TrimEnd('\r');
+                if (line.Length == 0 || line.StartsWith("src=")) continue;
+                strip.Append(line).Append('\n');
+            }
+            var plain = strip.ToString();
+            T.Out.Push(plain + "src=" + side + "\n");        // 主机自己的游戏：观战
+            var sb = new StringBuilder();
+            foreach (var raw in plain.Split('\n'))
+            {
+                if (raw.Length == 0) continue;
+                int eq = raw.IndexOf('=');
+                var k = eq > 0 ? raw.Substring(0, eq) : raw;
+                if (k == "seq") continue;
+                string hv;
+                lock (hostRules) if (hostRules.TryGetValue(k, out hv)) { sb.Append(k).Append('=').Append(hv).Append('\n'); continue; }
+                sb.Append(raw).Append('\n');
+            }
+            sb.Append("seq=").Append(System.Threading.Interlocked.Increment(ref relaySeq)).Append('\n');
+            lock (sendLock)
+            {
+                var b = Wire.Seal(sb.ToString());
+                if (fromFirst) rh.SendSecond(b); else T.Send(b);
+            }
+        }
+
+        void RelayTick(DateTime now)
+        {
+            var rh = T as IRelayHost;
+            var q = T as IQueueHost;
+            if (rh == null || q == null) return;
+            var req = relayReq;
+            relayReq = null;
+            if (req == "down" && !RelayOn)
+            {
+                if (!q.HasPeer || !q.CanPromote) { QueueMsg = L.T("要有对手、也要有人排队才能下场", "Need an opponent and someone waiting"); return; }
+                var p2 = rh.PromoteSecond();
+                if (p2 == null) return;
+                rh.NoOut = true;
+                RelayOn = true;
+                roleTo = p2; roleTo2 = null; roleAt = now; roleSentAt = DateTime.MinValue; rxAtPromote = RxSeen + secondRx;
+                QueueMsg = L.T("主机下场，两位对打", "Host stepped down; two players fight");
+                if (diag) NetLog.W("主机下场：两位选手经主机转发");
+                return;
+            }
+            if (req == "up" && RelayOn)
+            {
+                var old = rh.DemoteSecond();
+                rh.NoOut = false;
+                RelayOn = false;
+                roleTo = null; roleTo2 = old; roleAt = now; roleSentAt = DateTime.MinValue;
+                QueueMsg = L.T("主机回来打", "Host is back");
+                if (diag) NetLog.W("主机回来打：第二位选手下场");
+                return;
+            }
+            if (!RelayOn) return;
+            // 第二位走了：有人排队就补，没人就结束转发（主机回来跟第一位打）
+            if (roleTo == null && (!rh.HasSecond || rh.SinceFromSecond > FillAfter))
+            {
+                var p2 = q.CanPromote ? rh.PromoteSecond() : null;
+                if (p2 != null) { roleTo = p2; roleAt = now; roleSentAt = DateTime.MinValue; rxAtPromote = RxSeen + secondRx; QueueMsg = L.T("第二位走了，队首补上", "Second player left; next in queue"); }
+                else { rh.NoOut = false; RelayOn = false; QueueMsg = L.T("第二位走了，主机回来打", "Second player left; host is back"); }
+                return;
+            }
+            // 第一位走了、没人补：第二位改当第一位，主机回来跟他打
+            if (roleTo == null && (!q.HasPeer || q.SinceFromPeer > FillAfter) && !q.CanPromote && rh.HasSecond)
+            {
+                rh.SecondToPeer();
+                rh.NoOut = false;
+                RelayOn = false;
+                QueueMsg = L.T("第一位走了，主机回来跟第二位打", "First player left; host plays the second");
+            }
+        }
+
+        // 打完换人：只记下请求，由 Run 线程的 QueueTick 做（和"对手走了补位"在同一个线程，不会两边同时换）
+        volatile string rotateWhy, rotateWho;
+        public bool Rotate(string why, string who)
+        {
+            rotateWho = who;
+            return Rotate(why);
+        }
+        public bool Rotate(string why)
+        {
+            var lk = T as IQueueHost;
+            if (lk == null || Role != "host") return false;
+            if (!lk.CanPromote) { QueueMsg = L.T("没人排队，不换", "Nobody is waiting"); return false; }
+            rotateWhy = why ?? "";
+            return true;
+        }
+
+        void DoRotate(IQueueHost lk, string why)
+        {
+            if (!lk.CanPromote) { QueueMsg = L.T("没人排队，不换", "Nobody is waiting"); return; }
+            var who = rotateWho;
+            rotateWho = null;
+            var rh = T as IRelayHost;
+            object old, head;
+            if (RelayOn && rh != null && who == "c") { old = rh.DemoteSecond(); head = rh.PromoteSecond(); }     // §141.8 第二位输了
+            else { old = lk.DemotePeer(); head = lk.PromoteHead(); }
+            roleTo2 = old;
+            roleTo = head;
+            roleAt = DateTime.UtcNow;
+            roleSentAt = DateTime.MinValue;
+            rxAtPromote = RxSeen + secondRx;
+            QueueMsg = L.T("打完换人（", "Rotated (") + why + "）";
+            if (diag) NetLog.W("排队：打完换人（" + why + "）");
+        }
+
+        // §141.7 对手自己下去观战（面板"我下去观战"）：本机换成观战者、发观战握手，主机见到就让下一位上场
+        public bool StepDown()
+        {
+            if (Role != "client" || !(T is ISpecSink)) return false;
+            SpecCfg.NoQueue = true;     // §141 自己下去 = 观战开关切成"只观战"，想再打自己切回"排队"（房主换人 / 补位不碰这个开关）
+            wantRole = "spec";
+            return true;
+        }
+
+        void QueueTick(DateTime now)
+        {
+            var lk = T as IQueueHost;
+            var ss = T as ISpecSink;
+            if (Role == "host")
+            {
+                if (lk == null) return;
+                var rw = rotateWhy;
+                if (rw != null) { rotateWhy = null; DoRotate(lk, rw); }
+                RelayTick(now);
+                // 对手走了（连接断了，或 FillAfter 秒没包）→ 队首上场。从来没有过对手（RxSeen = 0）不补：空房间先来的观战者只是来看
+                if (RxSeen > 0 && roleTo == null && (!lk.HasPeer || lk.SinceFromPeer > FillAfter) && lk.CanPromote)
+                {
+                    var head = lk.PromoteHead();
+                    if (head != null)
+                    {
+                        roleTo = head; roleTo2 = null;
+                        roleAt = now; roleSentAt = DateTime.MinValue; rxAtPromote = RxSeen;
+                        QueueMsg = L.T("对手走了，队首上场", "Opponent left, next in queue plays");
+                    }
+                }
+                if (roleTo != null || roleTo2 != null)
+                {
+                    bool upDone = roleTo == null || RxSeen + secondRx > rxAtPromote;   // 新对手开始发状态包了
+                    bool downDone = roleTo2 == null || (now - roleAt).TotalSeconds > 3.0;   // 下场通知连发 3 秒（对方收到后不再变）
+                    if ((upDone && downDone) || (now - roleAt).TotalSeconds > RoleRetry) { roleTo = null; roleTo2 = null; }
+                    else if ((now - roleSentAt).TotalSeconds > 0.5)
+                    {
+                        roleSentAt = now;
+                        lock (sendLock)
+                        {
+                            if (roleTo != null && !upDone) lk.SendTo(roleTo, Wire.Seal("PBZROLE\nrole=client\n"));
+                            if (roleTo2 != null) lk.SendTo(roleTo2, Wire.Seal("PBZROLE\nrole=spec\n"));
+                        }
+                    }
+                }
+                // 每 2 秒告诉每个观战者排第几
+                if ((now - lastQ).TotalSeconds > 2.0)
+                {
+                    lastQ = now;
+                    var q = lk.QueueOrder();
+                    lock (sendLock)
+                        for (int i = 0; i < q.Count; i++) lk.SendTo(q[i], Wire.Seal("PBZQ\npos=" + (i + 1) + "\nn=" + q.Count + "\n"));
+                }
+                return;
+            }
+            var w = wantRole;
+            if (w != null)
+            {
+                wantRole = null;
+                // §141 只观战（不排队）的人：主机 / 服务器叫上场一律不理（刚切成只观战、上场通知已经在路上的情况），主机过几秒会换下一个
+                if (w == "client" && Role == "spec" && SpecCfg.NoQueue)
+                {
+                    Log(L.T("只观战：不上场", "Watch only: not going up"));
+                    if (diag) NetLog.W("排队：只观战，主机叫上场不理");
+                    w = null;
+                }
+                if (w != null && w != Role && (w == "client" || w == "spec"))
+                {
+                    Log(L.T("主机让你换成：", "Host switched you to: ") + w);
+                    if (diag) NetLog.W("排队：主机让本机换成 " + w);
+                    role = w;
+                    if (ss != null) ss.SpecMode = w == "spec";
+                    QueueMsg = w == "client" ? L.T("轮到你上场了", "Your turn to play") : L.T("你下场观战了", "You are spectating now");
+                }
+            }
+        }
 
         public bool Connected { get { return (DateTime.UtcNow - lastRx).TotalSeconds < 2.0; } }
         // §85.5 对方在：收到状态包，或 2 秒内握过手。等人的房间读不到游戏的包、一个状态包都不发，
@@ -395,7 +903,7 @@ namespace PbzLobby
             }
             thread = Safe.Thread("session-recv", Run);
             thread.Start();
-            sendThread = Safe.Thread("session-send", SendLoop);
+            sendThread = Safe.Thread("session-send", SendLoop);     // 观战者也开（§141.7 轮到上场就要发），观战时不发
             sendThread.Start();
             return this;
         }
@@ -433,6 +941,13 @@ namespace PbzLobby
                     lastSess = DateTime.MinValue;     // session.txt 马上写一份（role / peer / mode 都换了）
                 }
                 Rel.PollLua();
+                // §141 观战者一直每秒发一次握手（带 spec=1）当保活：主机 6 秒没收到就当它走了
+                if (Role == "spec" && (now - lastHello).TotalSeconds > 1.0)
+                {
+                    lastHello = now;
+                    SendText("PBZHELLO\npv=" + Proto.Version + "\nav=" + Proto.App + "\nnm=" + Name.Replace("\r", " ").Replace("\n", " ") + "\nspec=1\n"
+                             + (SpecCfg.NoQueue ? "noq=1\n" : "") + (SpecCfg.Up ? "up=1\n" : ""));
+                }
                 // 客机没连上之前每 0.5 秒发一次握手：主机就算游戏还没读档，也能先知道往哪回
                 if (Role == "client" && !Connected && (now - lastHello).TotalSeconds > 0.5)
                 {
@@ -446,12 +961,13 @@ namespace PbzLobby
                     lastRx = now;
                     RxSeen += got;
                 }
+                QueueTick(now);
                 Rel.Tick(now);
                 lock (sendLock) sim.Flush(T.Send);
                 if (bsock != null && (now - lastBcast).TotalSeconds > 1.0)
                 {
                     lastBcast = now;
-                    var msg = "PBZROOM|" + Name.Replace("|", " ") + "|" + T.LocalPort + "|" + LocalMap + "|" + (Connected ? "1" : "0");
+                    var msg = "PBZROOM|" + Name.Replace("|", " ") + "|" + T.LocalPort + "|" + LocalMap + "|" + (Connected ? "1" : "0") + (SpecCfg.Max > 0 ? "|1" : "|0") + (AiWaiting ? "|1" : "|0");
                     var b = Kv.Utf8.GetBytes(msg);
                     // Windows 发 255.255.255.255 只走一张网卡（实测走了 VMware 虚拟网卡，WLAN 上的朋友收不到），
                     // 所以再往每张网卡自己的子网广播地址各发一份
@@ -471,7 +987,7 @@ namespace PbzLobby
                     lastSess = now;
                     if (diag) DiagTick(now);
                     // v0.22.0：签名 / 拒收 / 可靠事件的统计（窗口状态、测试读这里；Lua 只用前几个键）
-                    GamePipe.Out(fSession, "role=" + Role + "\nconnected=" + (Connected ? 1 : 0) + "\npeer=" + PeerStr
+                    GamePipe.Out(fSession, "role=" + Role + "\nconnected=" + (Connected ? 1 : 0) + "\npeer=" + PeerStr + "\nspecs=" + Spectators + "\nrelay=" + (RelayOn ? 1 : 0) + "\nqpos=" + QPos + "\nqlen=" + QLen + "\nqmsg=" + QueueMsg
                                              + "\nmode=" + Mode + "\nt=" + Kv.F(Link.UnixNow(), "0.0")
                                              + "\nsig=" + (Wire.Signed ? 1 : 0) + "\nrej=" + Wire.Rejected + "\nrejbad=" + Wire.RejBad
                                              + "\nrejtime=" + Wire.RejTime + "\nrejunsigned=" + Wire.RejUnsigned + "\nrejsigned=" + Wire.RejSigned
@@ -541,6 +1057,7 @@ namespace PbzLobby
                 var fl = fLocal;
                 if (!ReferenceEquals(fl, pipeFor)) { pipeFor = fl; pipe = GamePipe.For(Path.GetDirectoryName(fl)); }
                 bool viaPipe = pipe != null && pipe.Connected;
+                if (Role == "spec") { Thread.Sleep(PollMs * 5); SendLoops++; continue; }     // §141 观战者不发自己的状态包
                 var text = viaPipe ? pipe.LatestLocal : Kv.ReadText(fl);
                 if (text != null && text != lastText)   // 每 4ms 读一次，没变就不解析
                 {
@@ -577,7 +1094,14 @@ namespace PbzLobby
                         sb.Append("nm=").Append(Name.Replace("\r", " ").Replace("\n", " ")).Append('\n');
                         var rk = RankPid;
                         if (rk != null) sb.Append("rk=").Append(rk).Append('\n');
-                        SendText(sb.ToString());
+                        var body = sb.ToString();
+                        lock (hostRules)
+                            foreach (var k in RuleKeys) { string rv; if (loc.TryGetValue(k, out rv)) hostRules[k] = rv; }
+                        if (!RelayOn)
+                        {
+                            SendText(body);
+                            ForwardSpec(body, "h");     // §141 也给观战者一份
+                        }
                     }
                 }
                 // §83 管道：游戏一发来就醒（不用等 4ms 轮询）
@@ -696,7 +1220,7 @@ namespace PbzLobby
     // 监听 27016 上的房间广播
     class Discovery
     {
-        class Room { public string Name, Map; public bool Full; public DateTime Seen; }
+        class Room { public string Name, Map; public bool Full, Watch, Ai; public DateTime Seen; }
         readonly Dictionary<string, Room> rooms = new Dictionary<string, Room>();
         readonly UdpClient sock;
         public readonly bool Ok;
@@ -729,17 +1253,17 @@ namespace PbzLobby
                 var p = Kv.Utf8.GetString(data).Split('|');
                 int port;
                 if (p.Length >= 5 && p[0] == "PBZROOM" && int.TryParse(p[2], out port))
-                    lock (rooms) rooms[from.Address + ":" + port] = new Room { Name = p[1], Map = p[3], Full = p[4] == "1", Seen = DateTime.UtcNow };
+                    lock (rooms) rooms[from.Address + ":" + port] = new Room { Name = p[1], Map = p[3], Full = p[4] == "1", Watch = p.Length >= 6 && p[5] == "1", Ai = p.Length >= 7 && p[6] == "1", Seen = DateTime.UtcNow };
             }
         }
 
-        public List<string[]> Current()   // {地址:端口, 名字, 地图, 已满}
+        public List<string[]> Current()   // {地址:端口, 名字, 地图, 已满, 能观战}
         {
             var list = new List<string[]>();
             lock (rooms)
                 foreach (var kv in rooms)
                     if ((DateTime.UtcNow - kv.Value.Seen).TotalSeconds < 3.5)
-                        list.Add(new[] { kv.Key, kv.Value.Name, kv.Value.Map, kv.Value.Full ? "1" : "0" });
+                        list.Add(new[] { kv.Key, kv.Value.Name, kv.Value.Map, kv.Value.Full ? "1" : "0", kv.Value.Watch ? "1" : "0", kv.Value.Ai ? "1" : "0" });
             list.Sort((a, b) => string.CompareOrdinal(a[0], b[0]));
             return list;
         }
@@ -762,6 +1286,7 @@ namespace PbzLobby
         readonly ComboBox aiRoomModeBox = new ComboBox();
         readonly Discovery disc = new Discovery();
         readonly LobbyList lobbyList = new LobbyList();
+        readonly CfgFetch cfgFetch = new CfgFetch();     // §158 数值表从大厅服务器拉
         RankClient rank;     // §110 武林盟主（排位）：密钥、上报、排行榜（Ranked.cs）
         RankClient Rank { get { return rank ?? (rank = new RankClient(dir) { Log = m => { lastLog = DateTime.Now.ToString("HH:mm:ss ") + m; } }); } }
 
@@ -888,6 +1413,7 @@ namespace PbzLobby
             {
                 int i = roomList.SelectedIndex;
                 if (i >= 0 && i < cands.Count && cands[i][0] == "nohost") Warn(L.T("对方还没开房", "They are not hosting yet"));   // §123
+                else if (i >= 0 && i < cands.Count && (cands[i][0] == "watch" || cands[i][0] == "watchf")) Spectate(cands[i][2]);   // §141
                 else if (i >= 0 && i < cands.Count) { ipBox.Text = cands[i][2]; Join(cands[i][2]); }
             };
             Controls.Add(roomList);
@@ -942,7 +1468,7 @@ namespace PbzLobby
                 // 2026-11-05 19:56 内测：点 × 整个联机程序退出，游戏那边管道断开、4 分多钟没有联机程序，直到手动重启
                 if (bg && !quitting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); return; }
                 quitting = true;          // 关闭过程中 Tick() 再进 AutoExit 时不要再 Quit
-                timer.Stop(); cmdTimer.Stop(); StopSession(); disc.Close(); lobbyList.Close(); Steam.Shutdown();
+                timer.Stop(); cmdTimer.Stop(); StopSession(); disc.Close(); lobbyList.Close(); cfgFetch.Close(); Steam.Shutdown();
                 WriteLobby(false);
             };
             Shown += delegate { ActiveControl = hostBtn; };
@@ -1073,8 +1599,49 @@ namespace PbzLobby
             if (StartSession("client", ep, 0) && remember) cfg.Remember(Mode, ep.Port == Session.GamePort ? ep.Address.ToString() : ep.ToString());
         }
 
+        // §141.7 对手自己下去观战：局域网 / IP / Steam 在会话里换角色；服务器大厅的客机要换成观战连接（WatchLink），重开会话
+        void ToSpec()
+        {
+            var s = session;
+            if (s == null || s.Role != "client") return;
+            if (s.StepDown()) return;
+            var sl = s.T as ServerLink;
+            if (sl != null && sl.RoomId.Length > 0) { var room = sl.RoomId; nextDown = true; StartSession("spec", null, 0, room); }
+        }
+
+        // §141 观战：局域网 / 服务器大厅里输入 IP，连主机当观战者（主机要是局域网开的房，服务器大厅的主机还不支持）
+        void Spectate(string text)
+        {
+            text = (text ?? "").Trim();
+            if (Mode == "ranked" || Mode == "ai") { Warn(L.T("这种连接方式不能观战", "Spectating is not available in this mode")); return; }
+            if (Modes.IsSteam(Mode))
+            {
+                // §141 Steam 好友（steam:<SteamID64>）/ Steam 大厅（lobby:<大厅 ID>）：连主机当观战者（不进大厅，大厅只有两个位子）
+                ulong owner = Addr.SteamId(text), lobby = 0;
+                if (owner == 0 && text.StartsWith("lobby:") && ulong.TryParse(text.Substring(6), out lobby)) owner = SteamLobby.OwnerOf(lobby);
+                if (owner == 0 && text.StartsWith("watch:") && ulong.TryParse(text.Substring(6), out lobby)) owner = SteamLobby.OwnerOf(lobby);
+                if (owner == 0) { Warn(L.T("找不到主机：", "Can't find the host: ") + text); return; }
+                StartSession("spec", null, owner);
+                return;
+            }
+            // §141 服务器大厅房间列表里的 watch:<房间号>[@服务器]，或直接填房间号
+            if (Modes.IsServer(Mode) && (text.StartsWith("watch:") || text.StartsWith("room:") || (text.IndexOf('.') < 0 && text.IndexOf(':') < 0)))
+            {
+                var room = text.StartsWith("watch:") ? text.Substring(6) : text.StartsWith("room:") ? text.Substring(5) : text;
+                if (room.Length < 4) { Warn(L.T("这不是房间号：", "Not a room code: ") + text); return; }
+                StartSession("spec", null, 0, room);
+                return;
+            }
+            var ep = Addr.Parse(text, Modes.IsServer(Mode) ? cfg.Port : Session.GamePort);
+            if (ep == null) { Warn(L.T("认不出这个地址：", "Can't resolve this address: ") + text); return; }
+            StartSession("spec", ep, 0);
+        }
+
         bool StartSession(string role, IPEndPoint peer) { return StartSession(role, peer, 0, null); }
         bool StartSession(string role, IPEndPoint peer, ulong steamHost) { return StartSession(role, peer, steamHost, null); }
+
+        string nextToken;       // §141.7 下一次服务器大厅客机会话 JOIN 带的上场口令
+        bool nextDown;          // §141.7 下一次服务器大厅观战会话是"刚下场的"
 
         bool StartSession(string role, IPEndPoint peer, ulong steamHost, string room)
         {
@@ -1108,7 +1675,17 @@ namespace PbzLobby
                 {
                     if (!Steam.Init()) { Warn(Steam.Error); return false; }
                 }
-                else if (Modes.IsServer(Mode) && !(role == "client" && peer != null))     // 客机输入 IP 直连 = 普通 UDP（下面 t = null）
+                else if (role == "spec" && room != null && Modes.IsServer(Mode))
+                {
+                    // §141 服务器大厅的房间：观战者只和大厅服务器说话，主机的两路包由服务器转来
+                    int at = room.IndexOf('@');
+                    var srv = LobbyServer.Resolve(at >= 0 ? room.Substring(at + 1) : cfg.Server);
+                    if (at >= 0) room = room.Substring(0, at);
+                    if (srv == null) { Warn(L.T("认不出大厅服务器地址：", "Can't resolve the lobby server: ") + cfg.Server); return false; }
+                    t = new WatchLink(srv, room, Path.Combine(dir, "state_remote.txt")) { Down = nextDown };
+                    nextDown = false;
+                }
+                else if (Modes.IsServer(Mode) && !((role == "client" || role == "spec") && peer != null))     // 客机输入 IP 直连 = 普通 UDP（下面 t = null）
                 {
                     // 客机加入别的服务器的房间（room = 房间号@那台服务器）：去那台 JOIN、打洞、中转
                     int at = room != null ? room.IndexOf('@') : -1;
@@ -1126,6 +1703,7 @@ namespace PbzLobby
                                             Path.Combine(dir, "state_remote.txt"), Program.SimNoDirect);
                     sl.AllowRelay = cfg.Relay;
                     sl.ServerName = at >= 0 ? "" : cfg.Server;     // 互通过来的房间去的是别的服务器，只显示 IP
+                    if (role == "client") { sl.JoinToken = nextToken; nextToken = null; }
                     if (Mode == "ranked") sl.RankPid = Rank.Pid;     // 只有测试开关 RankUdp 时武林盟主才走到这里（§135）
                     rl = sl;
                 }
@@ -1152,7 +1730,7 @@ namespace PbzLobby
                 WriteNone();
                 if (!Modes.IsSteam(Mode) && Mode != "ai") NetLog.W("开会话失败（" + role + "，" + Mode + "）：开不了端口 " + ex.Message);
                 Warn(L.T("开不了端口：", "Can't open the port: ") + ex.Message
-                     + L.T("（是不是还开着另一个联机窗口 / 幽灵测试？）", " (Is another lobby window or the ghost test still running?)"));
+                     + L.T("（是不是还开着另一个游戏 / 联机程序 / 幽灵测试？）", " (Is another game, online helper or the ghost test still running?)"));
                 return false;
             }
             catch (Exception ex)
@@ -1253,11 +1831,16 @@ namespace PbzLobby
                 var ses = NewHost(m, wdir);
                 ses.Log = x => { lastLog = DateTime.Now.ToString("HH:mm:ss ") + L.T("[等人的房间] ", "[Room] ") + x; };
                 ses.LocalMap = session.LocalMap;
+                ses.AiWaiting = true;
+                var wsl = ses.T as ServerLink;
+                if (wsl != null) wsl.AiRoom = true;
                 ses.Start();
                 waitSes = ses;
+                var ais = session;
+                if (ais != null) ais.SpecRelay = ses;     // §141 AI 对打的两路包给等人房间的观战者
                 waitMode = m;
                 if (m == "server" && cfg.Upnp) Upnp.MapAsync(cfg.Port);
-                if (m == "steamlobby") SteamLobby.Host(cfg.Name);
+                if (m == "steamlobby") { SteamLobby.AiRoom = true; SteamLobby.Host(cfg.Name); }
                 lastLog = DateTime.Now.ToString("HH:mm:ss ") + L.T("同时开着房间等真人（", "Also hosting a room (") + Modes.Name(m)
                           + L.T("）：有人进来就结束 AI 对战", "): the AI battle ends when a player joins");
             }
@@ -1274,6 +1857,9 @@ namespace PbzLobby
             var w = waitSes;
             if (w == null) return;
             waitSes = null;
+            var ais = session;
+            if (ais != null && ais.SpecRelay == w) ais.SpecRelay = null;
+            SteamLobby.AiRoom = false;
             w.Stop();
             if (waitMode == "steamlobby" && (SteamLobby.Mine != 0 || SteamLobby.Hosting)) SteamLobby.Leave();
             if (waitMode == "server") Upnp.Unmap();
@@ -1422,6 +2008,20 @@ namespace PbzLobby
                 case "mode": if (d.TryGetValue("mode", out v)) SetMode(v); break;
                 case "host": if (session == null || session.Role != "host") StartSession("host", null); break;
                 case "join": Join(d.TryGetValue("target", out v) ? v : "", !(d.TryGetValue("remember", out v) && v == "0")); break;   // §116 remember=0 不记最近
+                case "spectate": Spectate(d.TryGetValue("target", out v) ? v : ""); break;     // §141 观战（先只有局域网 / 输入 IP）
+                case "rotate":     // §141.7 游戏打完一场按规矩换人；§141.8 主机下场时 who = h（第一位）/ c（第二位）谁输了
+                    if (session != null) { string who; d.TryGetValue("who", out who); session.Rotate(d.TryGetValue("why", out v) ? v : "", who); }
+                    break;
+                case "hostdown": if (session != null) session.HostDown(); break;     // §141.8 主机也下场
+                case "specq":      // §141 观战者自己：排队上场（on=1）/ 只观战（on=0）。马上生效（下一个观战握手就带上）
+                    if (d.TryGetValue("on", out v)) { SpecCfg.NoQueue = v == "0"; if (v != "0") SpecCfg.WantUp(); cfg.Save(); }     // 切回排队：顺带让主机 / 服务器清掉"刚下场、先别叫"
+                    break;
+                case "maxspec":    // §141 房间设置：观战 / 排队人数上限（马上生效：已经在看的超了也不赶，新来的按新上限）
+                    int mx;
+                    if (d.TryGetValue("n", out v) && int.TryParse(v, out mx) && mx >= 0 && mx <= 8) { cfg.MaxSpec = mx; SpecCfg.Max = mx; cfg.Save(); }
+                    break;
+                case "hostup": if (session != null) session.HostUp(); break;
+                case "tospec": ToSpec(); SpecCfg.NoQueue = true; cfg.Save(); break;     // §141 自己下去 → 只观战（服务器大厅那条路也一样）     // §141.7 对手自己下去观战
                 case "stop": StopSession(); break;
                 // v0.18.6：窗口里能改的设置，游戏内面板也都能改（用户 2026-11-04："所有操作都可以在游戏内实现"）
                 case "name":
@@ -1575,8 +2175,12 @@ namespace PbzLobby
             if (Mode == "steam")
             {
                 foreach (var f in Steam.FriendsInGame())
+                {
                     // §123 没开房的好友单独标 nohost：面板不算"可加入"、排在后面，点了直接提示（以前也标 friend，连过去注定超时）
                     add(f[2] == "1" ? "friend" : "nohost", f[1] + (f[2] == "1" ? L.T("（在开房）", " (hosting)") : L.T("（在玩，没开房）", " (playing, not hosting)")), "steam:" + f[0]);
+                    // §141 开房的好友再列一行"观战"（好友状态里看不出满没满：满了就看，没满也能先看着排队）
+                    if (f[2] == "1") add("watchf", f[1], "steam:" + f[0]);
+                }
             }
             else if (Modes.IsServer(Mode))
             {
@@ -1590,9 +2194,14 @@ namespace PbzLobby
                     var title = rk && r.Length > 6 && r[6].Trim().Length > 0 ? "【" + r[6].Trim() + "】" : "";
                     // 第 5 列 = 所在服务器（空 = 就是我们连的这台；否则是互通过来的别的服务器，§50）
                     var home = r.Length > 4 ? r[4].Trim() : "";
-                    add(r[3] == "1" ? "full" : "room", (home.Length > 0 ? L.T("[互通] ", "[LINKED] ") : "") + title + r[1] + L.T("  地图 ", "  map ") + r[2]
+                    // §141 第 8 列 = 能观战（服务器开了中转、主机认观战）：满了的房间标 watch，点了以观战者身份经服务器看
+                    bool watch = r[3] == "1" && r.Length > 7 && r[7] == "1";
+                    add(r[3] != "1" ? "room" : watch ? "watch" : "full", (home.Length > 0 ? L.T("[互通] ", "[LINKED] ") : "") + title + r[1] + L.T("  地图 ", "  map ") + r[2]
                                 + (r[3] == "1" ? L.T("  已满", "  full") : "") + L.T("  房间号 ", "  code ") + r[0],
-                        "room:" + r[0] + (home.Length > 0 ? "@" + home : ""));
+                        (watch ? "watch:" : "room:") + r[0] + (home.Length > 0 ? "@" + home : ""));
+                    // §141 第 9 列 = 主机在和 AI 对打（没满）：再列一行"观战"
+                    if (r[3] != "1" && r.Length > 8 && r[7] == "1" && r[8] == "1" && home.Length == 0)
+                        add("watchf", r[1] + L.T("（和 AI 对打中）", " (vs AI)"), "watch:" + r[0]);
                 }
             }
             else if (Mode == "steamlobby")
@@ -1600,7 +2209,11 @@ namespace PbzLobby
                 foreach (var r in SteamLobby.Poll())
                 {
                     if (r[0] == SteamLobby.Mine.ToString() || r[4] == Steam.MyId.ToString()) continue;   // 不列自己的大厅
-                    add(r[3] == "1" ? "full" : "lobby", r[1] + L.T("  地图 ", "  map ") + r[2] + (r[3] == "1" ? L.T("  已满", "  full") : ""), "lobby:" + r[0]);
+                    // §141 满了、主机认观战（大厅数据 spec=1）的大厅标 watch
+                    bool watch = r[3] == "1" && r.Length > 5 && r[5] == "1";
+                    add(r[3] != "1" ? "lobby" : watch ? "watch" : "full", r[1] + L.T("  地图 ", "  map ") + r[2] + (r[3] == "1" ? L.T("  已满", "  full") : ""), (watch ? "watch:" : "lobby:") + r[0]);
+                    if (r[3] != "1" && r.Length > 6 && r[5] == "1" && r[6] == "1")      // §141 主机在和 AI 对打
+                        add("watchf", r[1] + L.T("（和 AI 对打中）", " (vs AI)"), "watch:" + r[0]);
                 }
             }
             else if (Mode == "lan")
@@ -1611,7 +2224,12 @@ namespace PbzLobby
                     if (s != null && s.Role == "host" && r[0].EndsWith(":" + s.T.LocalPort) && myIps.Contains(r[0].Substring(0, r[0].LastIndexOf(':'))))
                         continue;
                     var addr = r[0].EndsWith(":" + Session.GamePort) ? r[0].Substring(0, r[0].LastIndexOf(':')) : r[0];
-                    add(r[3] == "1" ? "full" : "room", r[1] + "  " + addr + L.T("  地图 ", "  map ") + r[2] + (r[3] == "1" ? L.T("  已满", "  full") : ""), addr);
+                    // §141 满了、主机又认观战的房间标 watch（面板上能点"观战"），旧版主机的满房照旧 full（灰）
+                    add(r[3] != "1" ? "room" : r[4] == "1" ? "watch" : "full",
+                        r[1] + "  " + addr + L.T("  地图 ", "  map ") + r[2] + (r[3] == "1" ? L.T("  已满", "  full") : ""), addr);
+                    // §141 主机在和 AI 对打（房间没满、加入 = 替换 AI）：再列一行"观战"
+                    if (r[3] != "1" && r[4] == "1" && r.Length > 5 && r[5] == "1")
+                        add("watchf", r[1] + L.T("（和 AI 对打中）", " (vs AI)"), addr);
                 }
             }
             if (Mode == "ai") return;     // 本地 AI 没有可加入的目标
@@ -1711,12 +2329,12 @@ namespace PbzLobby
             switch (Mode)
             {
                 case "steam":
-                    return L.T("对方在 Steam 好友列表里、也开着游戏和联机窗口，选\"Steam 好友\"即可看到你开的房。不用 IP、不用端口转发（走 Steam 中继）。",
-                               "Your friend sees your room in their list (both need the game and this window open). No IP or port forwarding needed (Steam relay).")
+                    return L.T("对方在 Steam 好友列表里、也开着游戏和这个模组，选\"Steam 好友\"即可看到你开的房。不用 IP、不用端口转发（走 Steam 中继）。",
+                               "Your friend sees your room in their list (both need the game with this mod running). No IP or port forwarding needed (Steam relay).")
                            + (Steam.Ready ? "" : "\n" + Steam.Error);
                 case "steamlobby":
-                    return L.T("用 Steam 自带的大厅：你建房后，所有开着游戏和联机窗口、选了\"Steam 大厅\"的人都能在列表里看到（不用加好友）。连接走 Steam 中继。",
-                               "Uses Steam's own lobbies: everyone with the game and this window open on \"Steam lobby\" sees your room (no need to be friends). Steam relay.")
+                    return L.T("用 Steam 自带的大厅：你建房后，所有开着游戏和这个模组、选了\"Steam 大厅\"的人都能在列表里看到（不用加好友）。连接走 Steam 中继。",
+                               "Uses Steam's own lobbies: everyone running the game with this mod on \"Steam lobby\" sees your room (no need to be friends). Steam relay.")
                            + (Steam.Ready ? (SteamLobby.Status.Length > 0 ? "\n" + SteamLobby.Status : "") : "\n" + Steam.Error);
                 case "server":
                     return L.T("房间登记在大厅服务器上（右上角填地址）。加入时先试直连（打洞），" + ServerLink.Tries + " 次不通自动改走服务器中转。把房间号发给朋友也行。",
@@ -1726,14 +2344,14 @@ namespace PbzLobby
                            + (Upnp.Status.Length > 0 ? "\n" + Upnp.Status : "")
                            + (lobbyList.Error.Length > 0 ? "\n" + lobbyList.Error : "");
                 case "ranked":
-                    return L.T("武林盟主（排位）：房间登记在大厅服务器上，和服务器大厅一样建房 / 加入，但只列排位房间；对局走 Steam（两边都要开着 Steam）。打完两边各报结果，对上才记分（Elo，每天同一对人记 3 场）；规则由服务器定：3 局 2 胜、伤害 150%、禁血瓶、开武器平衡。",
-                               "Ranked: rooms on the lobby server, host / join like the lobby server but only ranked rooms are listed. Both sides report the result; it counts only if they agree (Elo, 3 rated matches per pair per day). The server sets the rules.")
+                    return L.T("武林盟主（排位）：房间登记在大厅服务器上，和服务器大厅一样建房 / 加入，但只列排位房间；对局走 Steam（两边都要开着 Steam）。打完两边各报结果，对上才记分（Elo，每天同一对人记 3 场）；规则由服务器定（游戏内面板的\"房间设置\"里能看到）。",
+                               "Ranked: rooms on the lobby server, host / join like the lobby server but only ranked rooms are listed. Both sides report the result; it counts only if they agree (Elo, 3 rated matches per pair per day). The server sets the rules (see Room rules in the in-game panel).")
                            + (Rank.Me.Length > 0 ? "\n" + L.T("我的分数 ", "My rating ") + Rank.Me.Split('|')[0] : "")
                            + (Rank.Error.Length > 0 ? "\n" + Rank.Error : "")
                            + (lobbyList.Error.Length > 0 ? "\n" + lobbyList.Error : "");
                 case "ai":
-                    return L.T("和电脑里的 AI 打（拿双刃，照抄你的攻击属性、最大血量和影之武装），不联网、不用别人。点\"开始 AI 对战\"后 AI 走到你身边，按 F1 开打。",
-                               "Fight a computer opponent (dual blades; copies your attack stats, max health and Phantom Edge). Offline. Click \"Start AI battle\", then press F1 to fight.")
+                    return L.T("和电脑里的 AI 打（照抄你的攻击属性和最大血量，武器 / 影之武装等在游戏内面板的\"AI 装备\"里选），不联网、不用别人。点\"开始 AI 对战\"后 AI 走到你身边，按 F1 开打。",
+                               "Fight a computer opponent (copies your attack stats and max health; pick its gear in AI loadout in the in-game panel). Offline. Click \"Start AI battle\", then press F1 to fight.")
                            + L.T("\n勾\"同时开房等真人\"：打 AI 的同时用右边选的方式开一个房间，有人进来就结束 AI 对战、改成和他联机。",
                                  "\nTick \"Also host a room\" to host a room (method on the right) while fighting the AI; when someone joins, the AI battle ends and you play them.")
                            + (waitSes != null ? "\n" + L.T("等人的房间：", "Room: ") + AddrOf(waitMode, waitSes) : "");
@@ -1744,15 +2362,43 @@ namespace PbzLobby
             }
         }
 
+        // §141.7 服务器大厅的排队要换连接：观战（WatchLink）轮到上场 → 带口令重新加入；客机被主机换下 → 改成观战连接
+        void QueueSwitch()
+        {
+            var s = session;
+            if (s == null) return;
+            var wl = s.T as WatchLink;
+            if (wl != null && wl.TurnToken != null && SpecCfg.NoQueue) wl.TurnToken = null;     // §141 只观战：服务器叫上场不理
+            if (wl != null && wl.TurnToken != null && wl.SpecMode)
+            {
+                nextToken = wl.TurnToken;
+                var room = wl.RoomId;
+                NetLog.W("排队：轮到上场，用口令加入房间 " + room);
+                StartSession("client", null, 0, room);
+                return;
+            }
+            var sl = s.T as ServerLink;
+            if (sl != null && s.Role == "spec" && sl.RoomId.Length > 0)
+            {
+                nextDown = true;
+                var room = sl.RoomId;
+                NetLog.W("排队：被换下场，改成观战房间 " + room);
+                StartSession("spec", null, 0, room);
+            }
+        }
+
         void Tick()
         {
             var s = session;
+            QueueSwitch();
+            s = session;
             var fLocal = Path.Combine(dir, "state_local.txt");
             var gp = GamePipe.For(dir);      // §83 走管道时 state_local.txt 不再更新
             bool gameOn = (gp != null && gp.Connected) || File.Exists(fLocal) && (DateTime.Now - File.GetLastWriteTime(fLocal)).TotalSeconds < 3;
             var w = waitSes;
             // §110 排位：在武林盟主方式下（或正连着排位房间）往来；不在时也每 30 秒问一下服务器开没开排位（决定列不列这个标签）
             Rank.Poll(cfg.Server, cfg.Name, Mode == "ranked" || (s != null && s.Mode == "ranked"), s);
+            cfgFetch.Poll(cfg.Server, dir);     // §158 数值表：填了服务器就拉一份缓存到 srvcfg.txt
             if (ShownKey != shownSupport && !modeBox.DroppedDown)
             {
                 if (Mode == "ranked" && Rank.Support == 0 && s == null)
@@ -1904,6 +2550,8 @@ namespace PbzLobby
             kv("cfgport", cfg.Port.ToString());
             kv("upnpon", cfg.Upnp ? "1" : "0");
             kv("relayon", cfg.Relay ? "1" : "0");
+            kv("maxspec", cfg.MaxSpec.ToString());     // §141 房间设置：观战人数上限
+            kv("specnoq", SpecCfg.NoQueue ? "1" : "0");     // §141 只观战、不排队
             kv("ailevel", cfg.AiLevel.ToString());
             kv("aiw", cfg.AiLoad.Wc);               // §114 AI 装备（面板按这些值标出当前选的是哪个）。Clean 会把 | 换掉，武器拆成路径 + 族两项
             kv("aiwf", cfg.AiLoad.Fam);
@@ -1938,6 +2586,11 @@ namespace PbzLobby
             // §91 房间列表还在取第一份：面板显示"正在获取房间…"（局域网 / Steam 好友是现成的，不用等）
             kv("listing", Modes.IsServer(Mode) ? (lobbyList.Listing ? "1" : "0") : Mode == "steamlobby" ? (Steam.Ready && SteamLobby.Listing ? "1" : "0") : "0");
             kv("shown", Visible ? "1" : "0");
+#if AOT
+            kv("win", "0");     // §122 游戏进程里的 DLL 没有窗口：面板不显示"打开电脑上的联机窗口"
+#else
+            kv("win", "1");
+#endif
             Rank.WriteLobby(sb, Mode == "ranked");     // §110 rk / rkme / rkrules / rktop / rkt1..
             // v0.19.1：8 → 40（跟大厅服务器一次给的上限一样），游戏内面板的"房间列表"页自己分页
             int n = Math.Min(cands.Count, 40);
@@ -1973,7 +2626,7 @@ namespace PbzLobby
             // → AutoExit → Quit() 又 Close() 一次（窗口正在关）→ 抛异常、这次关闭被取消，进程一直挂着，Steam 不让重开游戏
             quitting = true;
             if (Visible) { Close(); return; }
-            timer.Stop(); cmdTimer.Stop(); StopSession(); disc.Close(); lobbyList.Close(); Steam.Shutdown();
+            timer.Stop(); cmdTimer.Stop(); StopSession(); disc.Close(); lobbyList.Close(); cfgFetch.Close(); Steam.Shutdown();
             WriteLobby(false);
             Application.ExitThread();
         }
@@ -2029,12 +2682,19 @@ namespace PbzLobby
     static class Program
     {
         public static string BaseDir = AppDomain.CurrentDomain.BaseDirectory;   // AOT 版（游戏进程里的 DLL）由 AotEntry 改成 DLL 所在目录
+        // §152 单实例锁 / 管道名后缀：exe 版空（一个 net 目录一个联机程序）；DLL 版是 "_p<游戏 pid>"——沙盒里双开时
+        // 两份游戏看到的 net 目录路径一样（文件各在各的沙盒里），锁和管道却是全机共用的，不加 pid 第二份就被当成"已经开着"
+        public static string InstanceSalt = "";
         public static bool SimNoDirect;     // --sim-no-direct（测试用，见文件头）
         // §135 测试用：武林盟主照旧走 UDP（ServerLink，§110 那条路）。离线测试 / 假对手在一台电脑上没法走 Steam（同一个 Steam 账号连不了自己），
         // 排位上报 / 记分 / 统计靠它测。--rank-udp 或 cmd=rankudp on=1 打开；不存盘、面板里没有
         public static volatile bool RankUdp;
         public static double SimLoss, SimSkew;   // --sim-loss 0..1 / --sim-skew 秒（测试用，见文件头）
         public static bool SimReorder;           // --sim-reorder（测试用）
+        public static bool CliSpec;
+        public static string CliHostServer, CliJoinRoom;
+        public static double CliSpecUpAt = -1;     // --spec-up-at（测试用，§141）：观战者第 N 秒把观战开关切回"排队"
+        public static double CliRotateAt = -1, CliStepDownAt = -1, CliHostDownAt = -1, CliHostUpAt = -1;              // --spectate（测试用，§141）：当观战者连 --spectate 给的主机
         public static bool CliSteam;             // --steam（测试用，§120.11）：--host 时经 Steam 桥开房
         public static int LanPort = Session.GamePort;   // --lan-port（测试用，§85.5）：AI 对战时等人的房间用局域网方式时监听的端口，避开开着的游戏占的 27015
 
@@ -2059,6 +2719,16 @@ namespace PbzLobby
                 {
                     case "--host": host = true; break;
                     case "--join": join = args[++i]; break;
+                    case "--spectate": join = args[++i]; CliSpec = true; break;     // §141 测试：当观战者连主机
+                    case "--host-server": CliHostServer = args[++i]; host = true; break;   // §141 测试：经大厅服务器开房
+                    case "--join-room": CliJoinRoom = args[++i]; join = "room"; break;     // §141 测试：经大厅服务器加入
+                    case "--rotate-at": CliRotateAt = double.Parse(args[++i], CultureInfo.InvariantCulture); break;   // §141.7 测试：主机第 N 秒打完换人
+                    case "--spec-up-at": CliSpecUpAt = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                    case "--step-down-at": CliStepDownAt = double.Parse(args[++i], CultureInfo.InvariantCulture); break;   // §141.7 测试：客机第 N 秒下去观战
+                    case "--host-down-at": CliHostDownAt = double.Parse(args[++i], CultureInfo.InvariantCulture); break;   // §141.8 测试：主机第 N 秒下场
+                    case "--host-up-at": CliHostUpAt = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                    case "--max-spec": SpecCfg.Max = int.Parse(args[++i]); break;     // §141 测试：观战人数上限
+                    case "--no-queue": SpecCfg.NoQueue = true; break;     // §141 测试：只观战、不排队
                     case "--seconds": seconds = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
                     case "--dir": dir = args[++i]; break;
                     case "--log": log = args[++i]; break;
@@ -2101,7 +2771,7 @@ namespace PbzLobby
             if (host || join != null) return RunCli(host, join, seconds, dir, log, backup, secret, port);
             // 单实例（按 net 目录区分，测试时两个 --dir 可以同时开）：已经开着就让它显示窗口，自己退出
             bool created;
-            var mutex = new Mutex(true, "Local\\PBZ_MP_Lobby_" + Fnv(Path.GetFullPath(dir).ToLowerInvariant()), out created);
+            var mutex = new Mutex(true, "Local\\PBZ_MP_Lobby_" + Fnv(Path.GetFullPath(dir).ToLowerInvariant()) + InstanceSalt, out created);
             if (!created)
             {
                 if (!bg) Kv.WriteAtomic(Path.Combine(dir, "cmd.txt"), "id=show-" + DateTime.UtcNow.Ticks + "\ncmd=show\n");
@@ -2109,7 +2779,7 @@ namespace PbzLobby
             }
             NetLog.Start(dir, true);    // §130 非 Steam 方式的连接诊断 net\net_conn.log（上一份改名 net_conn.prev.log）
             NetLog.W("联机程序启动：" + NetLog.Build + " v" + Proto.App + (bg ? "（后台）" : "（窗口）"));
-            var pipe = GamePipe.Start(dir, Fnv(Path.GetFullPath(dir).ToLowerInvariant()));   // §83
+            var pipe = GamePipe.Start(dir, Fnv(Path.GetFullPath(dir).ToLowerInvariant()) + InstanceSalt);   // §83（§152 DLL 版带 pid）
             pipe.SetDown("lang.txt", "lang=" + (L.En ? "en" : "zh") + "\n");                  // §84 游戏经管道拿语言（只在切换时落盘）
             // §88 诊断：管道的连上 / 断开 / 出错记进 net\pipe_log.txt（只在这些事发生时写，平时不写）
             var pipeLog = Path.Combine(dir, "pipe_log.txt");
@@ -2156,6 +2826,29 @@ namespace PbzLobby
             {
                 log("这一版不带 Steam"); w.Close(); return 2;
             }
+            else if (CliSpec && join.StartsWith("watch:"))
+            {
+                // §141 测试：--spectate watch:<房间号>@<服务器 IP:端口>
+                var rest = join.Substring(6);
+                int at = rest.IndexOf('@');
+                var sp = rest.Substring(at + 1).Split(':');
+                t = new WatchLink(new IPEndPoint(IPAddress.Parse(sp[0]), int.Parse(sp[1])), rest.Substring(0, at), Path.Combine(dir, "state_remote.txt"));
+            }
+            else if (CliHostServer != null && host)
+            {
+                // §141 测试：--host-server <服务器 IP:端口> 经服务器大厅开房（ServerLink），房间号写进日志
+                var sp = CliHostServer.Split(':');
+                var sl = new ServerLink(new IPEndPoint(IPAddress.Parse(sp[0]), int.Parse(sp[1])), null, port, "CLI", Path.Combine(dir, "state_remote.txt"), false);
+                sl.AllowRelay = true;
+                t = sl;
+            }
+            else if (CliJoinRoom != null)
+            {
+                // §141 测试：--join-room <房间号>@<服务器 IP:端口> 经服务器大厅加入
+                int at = CliJoinRoom.IndexOf('@');
+                var sp = CliJoinRoom.Substring(at + 1).Split(':');
+                t = new ServerLink(new IPEndPoint(IPAddress.Parse(sp[0]), int.Parse(sp[1])), CliJoinRoom.Substring(0, at), 0, "CLI", Path.Combine(dir, "state_remote.txt"), false) { AllowRelay = true };
+            }
             else if (join != null)
             {
                 var p = join.Split(':');
@@ -2167,17 +2860,51 @@ namespace PbzLobby
             pipe.SetDown("lang.txt", "lang=" + (L.En ? "en" : "zh") + "\n");
             Session s;
             // 给了 --port 时按非局域网方式（不往 27016 广播房间），不占默认端口，测试可以并行跑
-            try { s = new Session(host ? "host" : "client", t != null ? "steam" : port > 0 ? "server" : "lan", t, peer, port > 0 ? port : Session.GamePort, "", dir, backup, secret); }
+            try { s = new Session(host ? "host" : CliSpec ? "spec" : "client", t is ServerLink || t is WatchLink ? "server" : t != null ? "steam" : port > 0 ? "server" : "lan", t, peer, port > 0 ? port : Session.GamePort, "", dir, backup, secret); }
             catch (SocketException ex) { log("开不了端口：" + ex.Message); return 2; }
             s.Log = log;
             s.Start();
             log("[lobby] " + s.Role + " 端口 " + s.T.LocalPort + " 目录 " + dir);
             var end = seconds > 0 ? DateTime.UtcNow.AddSeconds(seconds) : DateTime.MaxValue;
+            var rotateAt = CliRotateAt >= 0 ? DateTime.UtcNow.AddSeconds(CliRotateAt) : DateTime.MaxValue;
+            var stepAt = CliStepDownAt >= 0 ? DateTime.UtcNow.AddSeconds(CliStepDownAt) : DateTime.MaxValue;
+            var upAt = CliSpecUpAt >= 0 ? DateTime.UtcNow.AddSeconds(CliSpecUpAt) : DateTime.MaxValue;
+            var hdAt = CliHostDownAt >= 0 ? DateTime.UtcNow.AddSeconds(CliHostDownAt) : DateTime.MaxValue;
+            var huAt = CliHostUpAt >= 0 ? DateTime.UtcNow.AddSeconds(CliHostUpAt) : DateTime.MaxValue;
             var last = DateTime.MinValue;
             long lastLoops = 0, lastSendLoops = 0;
             while (DateTime.UtcNow < end)
             {
                 Thread.Sleep(200);
+                if (DateTime.UtcNow >= rotateAt) { rotateAt = DateTime.MaxValue; log("[lobby] 打完换人：" + s.Rotate("测试")); }
+                if (DateTime.UtcNow >= stepAt) { stepAt = DateTime.MaxValue; log("[lobby] 下去观战：" + s.StepDown()); }
+                if (DateTime.UtcNow >= upAt) { upAt = DateTime.MaxValue; SpecCfg.NoQueue = false; SpecCfg.WantUp(); log("[lobby] 切回排队"); }
+                if (DateTime.UtcNow >= hdAt) { hdAt = DateTime.MaxValue; log("[lobby] 主机下场：" + s.HostDown()); }
+                if (DateTime.UtcNow >= huAt) { huAt = DateTime.MaxValue; log("[lobby] 主机回来打：" + s.HostUp()); }
+                // §141.7 测试：服务器大厅排队要换连接（同 MainForm.QueueSwitch）
+                var wl = s.T as WatchLink;
+                var sl3 = s.T as ServerLink;
+                ITransport nt = null;
+                string nrole = null;
+                if (wl != null && wl.TurnToken != null && SpecCfg.NoQueue) wl.TurnToken = null;
+                if (wl != null && wl.TurnToken != null && wl.SpecMode)
+                {
+                    nt = new ServerLink(wl.Server, wl.RoomId, 0, "CLI", Path.Combine(dir, "state_remote.txt"), false) { AllowRelay = true, JoinToken = wl.TurnToken };
+                    nrole = "client";
+                }
+                else if (sl3 != null && s.Role == "spec" && sl3.RoomId.Length > 0)
+                {
+                    nt = new WatchLink(sl3.Server, sl3.RoomId, Path.Combine(dir, "state_remote.txt")) { Down = true };
+                    nrole = "spec";
+                }
+                if (nt != null)
+                {
+                    s.Stop();
+                    s = new Session(nrole, "server", nt, null, Session.GamePort, "", dir, backup, secret);
+                    s.Log = log;
+                    s.Start();
+                    log("[lobby] 排队换连接 → " + nrole);
+                }
                 if ((DateTime.UtcNow - last).TotalSeconds >= 2)
                 {
                     double secs = last == DateTime.MinValue ? 0 : (DateTime.UtcNow - last).TotalSeconds;
@@ -2186,6 +2913,11 @@ namespace PbzLobby
                     log("[lobby] " + (s.Connected ? "已连接 " + s.PeerStr : "未连接") + " 收包 " + s.RxSeen + " 发包 " + s.T.Tx
                         + " 地图 " + s.LocalMap + " 缺口 " + s.T.Gap + " " + s.Wire.RejText() + " " + s.Rel.StatText()
                         + (s.Wire.Hint().Length > 0 ? " 提示：" + s.Wire.Hint() : "")
+                        + (s.T is Link && s.Role == "host" ? " 观战者 " + s.Spectators + " 转发 " + ((Link)s.T).SpecTx : "")
+                        + (s.T is Link && s.Role == "spec" ? " 收到 主机 " + ((Link)s.T).SrcH + " 对手 " + ((Link)s.T).SrcC + " 排第 " + ((Link)s.T).QPos : "")
+                        + (s.T is WatchLink ? " 收到 主机 " + ((WatchLink)s.T).SrcH + " 对手 " + ((WatchLink)s.T).SrcC + " 观战人数 " + ((WatchLink)s.T).Watchers + " " + ((WatchLink)s.T).Error : "")
+                        + (s.T is ServerLink ? " 房间 " + ((ServerLink)s.T).RoomId + " 观战者 " + ((ServerLink)s.T).Watchers + " 上传 " + ((ServerLink)s.T).WatchTx : "")
+                        + " 角色 " + s.Role + " 观战者 " + s.Spectators
                         + (secs > 0 ? " 轮询 收 " + Kv.F((loops - lastLoops) / secs, "0") + " / 发 " + Kv.F((sendLoops - lastSendLoops) / secs, "0") + " 次/秒" : ""));
                     lastLoops = loops;
                     lastSendLoops = sendLoops;
