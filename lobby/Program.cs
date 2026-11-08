@@ -2333,8 +2333,8 @@ namespace PbzLobby
                                "Your friend sees your room in their list (both need the game with this mod running). No IP or port forwarding needed.")
                            + (Steam.Ready ? "" : "\n" + Steam.Error);
                 case "steamlobby":
-                    return L.T("用 Steam 自带的大厅：你建房后，所有开着游戏和这个模组、选了\"Steam 大厅\"的人都能在列表里看到（不用加好友）。",
-                               "Uses Steam's own lobbies: everyone running the game with this mod on \"Steam lobby\" sees your room (no need to be friends).")
+                    return L.T("你建房后，所有开着游戏和这个模组、选了\"Steam 大厅\"的人都能在列表里看到（不用加好友）。",
+                               "Everyone running the game with this mod on \"Steam lobby\" sees your room (no need to be friends).")
                            + (Steam.Ready ? (SteamLobby.Status.Length > 0 ? "\n" + SteamLobby.Status : "") : "\n" + Steam.Error);
                 case "server":
                     return L.T("房间登记在大厅服务器上（右上角填地址）。加入时先试直连（打洞），" + ServerLink.Tries + " 次不通自动改走服务器中转。把房间号发给朋友也行。",
