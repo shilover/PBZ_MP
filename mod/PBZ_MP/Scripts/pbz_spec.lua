@@ -17,7 +17,7 @@ local getP1, getP1PC = G.getP1, G.getP1PC
 
 local FRIEND, FOE = "Faction.Player", "Faction.Enemy"
 -- main.lua 传进来的函数缺了不报错就静默不干活（19:03 实测：netCmd 是 nil，断开 / 换人命令全没发）。缺了记一行，check_lua 认这行
-for _, k in ipairs({ "activate", "playNamed", "replayable", "netCmd", "flash", "mapGo", "readKV", "writeFile" }) do
+for _, k in ipairs({ "activate", "playNamed", "replayable", "netCmd", "flash", "mapGo", "readKV", "writeFile", "hostDist", "toHost", "travelling", "notice" }) do
     if type(ctx[k]) ~= "function" then out("!! 观战：main.lua 没传 %s", k) end
 end
 local SP = {
@@ -25,8 +25,11 @@ local SP = {
     AHEAD = 500.0,          -- 场地中心：玩家正前方多远（18:46 断魂山实测 9 米外是悬崖，两人一生成就掉下去）
     GAP = 400.0,            -- 开场两人相距
     FALL = 800.0,           -- 比开场位置低这么多 = 掉下去了，放回开场位置
+    SINK = 300.0,           -- §141.14 联机观战：替身比包里的高度低这么多 = 掉穿地面了，拉回
+    TP_NEAR = 50.0, TP_FAR = 100.0,  -- §168.5 联机观战：离主机超过 50 米先走游戏传送过去再开始看；看着看着主机跑出 100 米，停下传过去再接着看
+    LOAD_WAIT = 15.0,       -- §168.6 开始看之前最多等场地地面加载这么多秒
     REACH = 230.0,          -- 脚本对打：走到这么近就出招
-    CAM_SIDE = 650.0, CAM_UP = 230.0, CAM_BACK = 420.0,
+    CAM_SIDE = 650.0, CAM_UP = 230.0, CAM_BACK = 420.0, CAM_PAD = 40.0,
     TICK = 1 / 30,
 }
 local CAM_NAMES = { "侧面中点", "跟 A（看向 B）", "跟 B（看向 A）", "自由视角（鼠标转、WASD 飞、Shift 加速）" }
@@ -110,13 +113,13 @@ local function showSelf(p1, pc)
         if valid(cm) then pcall(function() cm:SetMovementMode(1, 0) end) end
         pcall(function() p1:SetActorHiddenInGame(false) end)
         if SP.locked then G.unlockSelf(p1, "观战原型结束") end
+        SP.locked = nil     -- 玩家1 无效时留着，下次（SP.feed 前往主机地图前）再解，不然锁血挂着、切图会被 MAPGO.dirty 拒
     end
     if valid(pc) then
         pcall(function() pc:ResetIgnoreMoveInput() end)
         pcall(function() pc:ResetIgnoreLookInput() end)
         if valid(p1) then pcall(function() pc:SetViewTargetWithBlend(p1, 0.3, 0, 0.0, false) end) end
     end
-    SP.locked = nil
 end
 
 -- ============================================================ 镜头：一个 CameraActor，每帧按模式摆
@@ -186,10 +189,195 @@ local function placeFree(cam)
     pcall(function() cam:K2_SetActorLocationAndRotation(p, { Pitch = pitch, Yaw = r.Yaw, Roll = 0.0 }, false, {}, true) end)
 end
 
+-- §167.1 线上反馈"视角会卡到虚空里"：固定视角摆在两人侧面 / 身后几米，旁边有石头、崖壁就钻进去，从里面看是一片虚空。
+-- 从看的点往镜头位置打射线，打到东西就把镜头拉到碰撞点前面 SP.CAM_PAD（同游戏的弹簧臂镜头）。
+-- §167.3 用户 11-09："第三方视角在没办法屏蔽场景建筑的情况下，其实在小地图挺不好用的"，两样都做：
+--   ① 挡视线的小物件（墙、柱子、树、杂物）只在本机画面上藏起来（SetActorHiddenInGame，不改碰撞、不进存档），1 秒不挡了再显示；
+--      地形、大块建筑（包围盒半边长 > HIDE_MAX）、角色不藏 —— 藏了会露出天空 / 少一大片
+--   ② 侧面中点视角被藏不了的东西挡住时，围着两人中间换个角度（AUTO_OFFS 里挑离现在最近的、看得到的），平滑转过去
+-- 自由视角不管（玩家自己飞）。射线调用出错就记一行、以后不再打
+SP.HIDE_MAX, SP.HIDE_KEEP, SP.SIGHT_SEC, SP.PICK_SEC, SP.TURN = 1500.0, 1.0, 0.1, 0.5, 1.5
+SP.TURN_WAIT, SP.TURN_HOLD = 1.0, 2.0
+-- §167.5 用户 11-09："为什么我看竹子、栅栏的还在挡着"→"如果你直接改摄像头范围内的所有物件呢"：
+-- 一条射线会从缝里漏过去、看不到没碰撞的植被。改成镜头到两人之间连一串 TUBE_R 的球（"管子"），管子里：
+--   有碰撞的物件 → SphereOverlapActors 找出来，能藏的整件藏（样条墙 / 栅栏放宽到 HIDE_MAX_WALL）；
+--   实例化网格（竹子、草等植被）→ 问组件哪几个实例在球里，只把那几个缩到看不见（只改本机画面），离开管子 HIDE_KEEP 秒恢复原样
+SP.TUBE_R, SP.HIDE_MAX_WALL, SP.HISM_SEC, SP.INST_MAX = 150.0, 5000.0, 10.0, 60
+SP.instHidden, SP.meshHalf = {}, {}
+-- §167.4 用户 11-09："很晕，几乎无法看……位置移动带来的不应该是视角即时移动，也应该有个速度曲线移动到新的目标点"：
+-- 镜头位置 / 看的点 / 换角度都按指数曲线追目标（时间常数越大越慢越稳）；拉近要快（别看穿墙），放远慢
+SP.EYE_T, SP.LOOK_T, SP.TURN_T, SP.CLIP_IN_T, SP.CLIP_OUT_T = 0.6, 0.3, 0.8, 0.08, 0.6
+SP.AUTO_OFFS = { 0.0, 0.6, -0.6, 1.2, -1.2, math.pi, math.pi - 0.6, math.pi + 0.6 }
+SP.hidden, SP.hideOk, SP.camOff, SP.camOffT, SP.clipK = {}, {}, 0.0, 0.0, 1.0
+local HIDE_SKIP = { "Landscape", "HLOD", "WorldPartition", "Water", "Sky", "Character", "Pawn", "Volume", "Renewal", "Hun_C" }
+
+-- 能不能藏：类名不在 HIDE_SKIP 里、包围盒不大。按路径缓存（同一个物件只问一次）
+local function hideable(act, comp)
+    if SP.hideOff or not (G.actorInfo and G.setHidden) then return false end
+    local key = pathOf(act)
+    local c = SP.hideOk[key]
+    if c ~= nil then return c end
+    local cls, ext = G.actorInfo(act, comp)
+    local lim = (cls and (cls:find("SplineWall", 1, true) or cls:find("Fence", 1, true))) and SP.HIDE_MAX_WALL or SP.HIDE_MAX
+    local ok = cls ~= nil and ext ~= nil and ext <= lim
+    if ok then for _, k in ipairs(HIDE_SKIP) do if cls:find(k, 1, true) then ok = false; break end end end
+    SP.hideOk[key] = ok
+    if ok and not SP.hideLogged then SP.hideLogged = true; out("观战镜头：挡视线的 %s（半边长 %.0f）藏起来了（以后不再记）", tostring(cls), ext) end
+    return ok
+end
+
+-- 从 look 看 eye 能不能看到：返回 true（看得到；挡着的都是能藏的，doHide 时顺手藏掉）/ false + 第一个藏不了的碰撞点
+local function sight(look, eye, a, b, doHide, tn)
+    if SP.traceOff or not G.traceActor then return true end
+    local ign = {}
+    for _, x in ipairs({ a and a.pup, b and b.pup, getP1() }) do if valid(x) then ign[#ign + 1] = x end end
+    for _ = 1, 6 do
+        local hp, act, err, comp = G.traceActor(SP.camActor, look, eye, ign)
+        if err then SP.traceOff = true; out("!! 观战镜头碰撞关掉了：%s", err); return true end
+        if not hp then return true end
+        local hx, hy, hz = hp.X - look.X, hp.Y - look.Y, hp.Z - look.Z
+        if hx * hx + hy * hy + hz * hz < 80.0 * 80.0 then return true end    -- 起点就在东西里（替身 / 自己的胶囊）：不算
+        if not (act and hideable(act, comp)) then
+            -- §167.3 实测（02:12）一次都没藏：记下挡视线的是什么（拿不到物件 / 类名 + 大小），每种只记一次
+            local key = act and pathOf(act) or "?"
+            SP.blockSeen = SP.blockSeen or {}
+            if not SP.blockSeen[key] and (SP.blockN or 0) < 12 then
+                SP.blockSeen[key], SP.blockN = true, (SP.blockN or 0) + 1
+                if act then
+                    local cls, ext = G.actorInfo(act, comp)
+                    out("观战镜头：挡视线的 %s（类 %s，半边长 %s）不能藏", short(key), tostring(cls), ext and string.format("%.0f", ext) or "?")
+                else
+                    out("观战镜头：射线打到东西，但拿不到是哪个物件（第 %d 种）", SP.blockN)
+                end
+            end
+            return false, hp
+        end
+        if doHide then
+            local key = pathOf(act)
+            local h = SP.hidden[key]
+            if not h then
+                if not G.setHidden(act, true) then SP.hideOk[key] = false; return false, hp end
+                h = { actor = act }
+                SP.hidden[key] = h
+            end
+            h.at = tn
+        end
+        ign[#ign + 1] = act
+    end
+    return true
+end
+
+-- 不挡了 HIDE_KEEP 秒的显示回来；all = 观战结束全显示回来
+local function unhide(tn, all)
+    for key, h in pairs(SP.hidden) do
+        if all or tn - h.at > SP.HIDE_KEEP then
+            if valid(h.actor) then G.setHidden(h.actor, false) end
+            SP.hidden[key] = nil
+        end
+    end
+    for key, h in pairs(SP.instHidden) do      -- §167.5 植被实例：恢复原来的变换
+        if all or tn - h.at > SP.HIDE_KEEP then
+            if valid(h.comp) then G.hismSetXf(h.comp, h.idx, h.xf) end
+            SP.instHidden[key] = nil
+        end
+    end
+end
+
+-- §167.5 管子：镜头和两人之间每隔 2×TUBE_R 一个球，球里能藏的物件、植被实例都藏起来
+local function tubeHide(look, eye, a, b, tn)
+    if SP.tubeOff or not (G.overlapActors and G.hismList) then return end
+    local dx, dy, dz = eye.X - look.X, eye.Y - look.Y, eye.Z - look.Z
+    local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if len < SP.TUBE_R * 2 then return end
+    local ign = {}
+    for _, x in ipairs({ a and a.pup, b and b.pup, getP1() }) do if valid(x) then ign[#ign + 1] = x end end
+    if not SP.hism or tn - (SP.hismAt or -99) > SP.HISM_SEC then SP.hism, SP.hismAt = G.hismList(), tn end
+    local newInst = 0
+    -- 第一个球离两人 1.5×TUBE_R（别把两人脚下的东西藏了），一直到镜头
+    local t = SP.TUBE_R * 1.5
+    while t <= len do
+        local k = t / len
+        local c = { X = look.X + dx * k, Y = look.Y + dy * k, Z = look.Z + dz * k }
+        local acts, err = G.overlapActors(SP.camActor, c, SP.TUBE_R, ign)
+        if err then SP.tubeOff = true; out("!! 观战镜头管子关掉了：%s", err); return end
+        for _, act in ipairs(acts) do
+            local okH = hideable(act)
+            -- §167.5 实测（03:34）：管子找到 6 个物件，截图里栅栏还挡着 —— 每个物件第一次进管子记一行（最多 30 个）
+            local dk = pathOf(act)
+            SP.tubeSeen = SP.tubeSeen or {}
+            if not SP.tubeSeen[dk] and (SP.tubeSeenN or 0) < 30 then
+                SP.tubeSeen[dk], SP.tubeSeenN = true, (SP.tubeSeenN or 0) + 1
+                local cls, ext = G.actorInfo(act)
+                out("观战镜头管子：碰到 %s（类 %s，半边长 %s）→ %s", short(dk), tostring(cls), ext and string.format("%.0f", ext) or "?", okH and "藏" or "不藏")
+            end
+            if okH then
+                local key = pathOf(act)
+                local h = SP.hidden[key]
+                if not h then
+                    if G.setHidden(act, true) then h = { actor = act }; SP.hidden[key] = h end
+                end
+                if h then h.at = tn end
+            end
+        end
+        for _, e in ipairs(SP.hism) do
+            local ex, ey, ez = e.o.X - c.X, e.o.Y - c.Y, e.o.Z - c.Z
+            if valid(e.comp) and ex * ex + ey * ey + ez * ez < (e.r + SP.TUBE_R) ^ 2 then
+                local half = SP.meshHalf[e.comp]
+                if half == nil then
+                    half = G.meshHalf(e.comp) or false; SP.meshHalf[e.comp] = half
+                    if (SP.compSeenN or 0) < 15 then
+                        SP.compSeenN = (SP.compSeenN or 0) + 1
+                        out("观战镜头管子：靠近实例组件 %s（网格半边长 %s，组件包围球 %.0f）", short(pathOf(e.comp)), half and string.format("%.0f", half) or "?", e.r)
+                    end
+                end
+                for _, i in ipairs(G.hismInstancesIn(e.comp, c, SP.TUBE_R)) do
+                    local key = pathOf(e.comp) .. "#" .. i
+                    local h = SP.instHidden[key]
+                    if h then h.at = tn
+                    elseif newInst < SP.INST_MAX then
+                        local xf = G.hismXf(e.comp, i)
+                        local big = xf and half and half * math.max(xf.Scale3D.X, xf.Scale3D.Y, xf.Scale3D.Z) > SP.HIDE_MAX
+                        if xf and not big then
+                            local tiny = { Rotation = xf.Rotation, Translation = xf.Translation, Scale3D = { X = 0.001, Y = 0.001, Z = 0.001 } }
+                            if G.hismSetXf(e.comp, i, tiny) then
+                                SP.instHidden[key] = { comp = e.comp, idx = i, xf = xf, at = tn }
+                                newInst = newInst + 1
+                                SP.instN = (SP.instN or 0) + 1
+                                if SP.instN == 1 then out("观战镜头管子：第一次藏植被 / 实例（%s 第 %d 个）", short(pathOf(e.comp)), i) end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if t >= len then break end
+        t = math.min(t + SP.TUBE_R * 2, len)      -- 最后一个球就在镜头上（03:34 截图：贴着镜头的栅栏没包进管子）
+    end
+end
+SP.unhideAll = function() unhide(0.0, true); SP.hideOk = {}; SP.hism, SP.meshHalf, SP.probed = nil, {}, nil end
+
+-- 拉近比例：看不到时拉到碰撞点前面 CAM_PAD
+local function clipK(look, eye, hp)
+    local dx, dy, dz = eye.X - look.X, eye.Y - look.Y, eye.Z - look.Z
+    local full = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if full < 1.0 then return 1.0 end
+    local hx, hy, hz = hp.X - look.X, hp.Y - look.Y, hp.Z - look.Z
+    local d = math.sqrt(hx * hx + hy * hy + hz * hz)
+    if not SP.clipLogged then SP.clipLogged = true; out("观战镜头：撞到地形，拉近到 %.0f / %.0f（以后不再记）", d - SP.CAM_PAD, full) end
+    return math.max(0.0, d - SP.CAM_PAD) / full
+end
+
+-- 角度差折到 -pi..pi
+local function wrap(x) return (x + math.pi) % (2 * math.pi) - math.pi end
+
 -- 【适配】CameraActor:K2_SetActorLocationAndRotation
 local function placeCam()
     local cam, a, b = SP.camActor, SP.side[1], SP.side[2]
-    if SP.cam == FREE then if valid(cam) then placeFree(cam) end; return end
+    if SP.cam == FREE then
+        if next(SP.hidden) or next(SP.instHidden) then unhide(0.0, true) end      -- §167.3 自由视角不藏东西
+        if valid(cam) then placeFree(cam) end
+        return
+    end
     if not (valid(cam) and a and b and valid(a.pup) and valid(b.pup)) then return end
     local la, lb = loc(a.pup), loc(b.pup)
     if not (la and lb) then return end
@@ -200,16 +388,66 @@ local function placeCam()
     local len = math.max(1.0, math.sqrt(dx * dx + dy * dy))
     local ux, uy = dx / len, dy / len
     local eye, look
+    local tn = now()
     if SP.cam == 1 then
         local mx, my, mz = (la.X + lb.X) / 2, (la.Y + lb.Y) / 2, (la.Z + lb.Z) / 2
         local side = SP.CAM_SIDE + len * 0.5          -- 两人拉开时镜头往后退
-        eye = { X = mx - uy * side, Y = my + ux * side, Z = mz + SP.CAM_UP }
         look = { X = mx, Y = my, Z = mz + 60.0 }
+        local base = math.atan(ux, -uy)               -- 侧面（两人连线的垂直方向）
+        local function eyeAt(off) local r = base + off; return { X = mx + math.cos(r) * side, Y = my + math.sin(r) * side, Z = mz + SP.CAM_UP } end
+        -- §167.3 ② 现在的角度被藏不了的东西挡住：挑离现在最近、看得到的角度
+        if tn - (SP.pickAt or 0) >= SP.PICK_SEC then
+            SP.pickAt = tn
+            -- 实测（02:12）30 秒换了 20 次：现在的角度连着挡 1 秒才换，换完至少停 2 秒
+            local blocked = not sight(look, eyeAt(SP.camOffT), a, b, false, tn)
+            if blocked then SP.blockedAt = SP.blockedAt or tn else SP.blockedAt = nil end
+            if blocked and tn - SP.blockedAt >= SP.TURN_WAIT and tn - (SP.turnedAt or -99) >= SP.TURN_HOLD then
+                local best, bd
+                for _, off in ipairs(SP.AUTO_OFFS) do
+                    local d = math.abs(wrap(off - SP.camOff))
+                    if (not bd or d < bd - 1e-6) and sight(look, eyeAt(off), a, b, false, tn) then best, bd = off, d end      -- 一样近取先列的
+                end
+                if best and best ~= SP.camOffT then
+                    SP.camOffT, SP.turnedAt, SP.blockedAt = best, tn, nil
+                    SP.turns = (SP.turns or 0) + 1
+                    if SP.turns <= 3 or SP.turns % 20 == 0 then out("观战镜头：侧面被挡，换个角度（%.0f°，第 %d 次）", math.deg(best), SP.turns) end
+                end
+            end
+        end
+        local dt = math.min(0.1, math.max(0.0, tn - (SP.turnAt or tn))); SP.turnAt = tn     -- 每帧调，按真实间隔转
+        local diff = wrap(SP.camOffT - SP.camOff)
+        SP.camOff = math.abs(diff) < 0.001 and SP.camOffT or SP.camOff + diff * (1 - math.exp(-dt / SP.TURN_T))   -- §167.4 先快后慢
+        eye = eyeAt(SP.camOff)
     else
         local me, other, s = la, lb, 1
         if SP.cam == 3 then me, other, s = lb, la, -1 end
         eye = { X = me.X - ux * s * SP.CAM_BACK, Y = me.Y - uy * s * SP.CAM_BACK, Z = me.Z + SP.CAM_UP }
         look = { X = other.X, Y = other.Y, Z = other.Z + 60.0 }
+    end
+    -- §167.4 平滑：镜头位置、看的点按指数曲线追目标（切视角时也是平滑过去）
+    local dt = math.min(0.1, math.max(0.0, tn - (SP.smAt or tn))); SP.smAt = tn
+    local function ease(cur, tgt, T)
+        if not cur then return tgt end
+        local k = 1 - math.exp(-dt / T)
+        return { X = cur.X + (tgt.X - cur.X) * k, Y = cur.Y + (tgt.Y - cur.Y) * k, Z = cur.Z + (tgt.Z - cur.Z) * k }
+    end
+    SP.eyeS, SP.lookS = ease(SP.eyeS, eye, SP.EYE_T), ease(SP.lookS, look, SP.LOOK_T)
+    eye, look = SP.eyeS, SP.lookS
+    -- §167.3 ① 挡视线的小物件藏起来，藏不了的才拉近（每 SIGHT_SEC 查一次，中间沿用上次的拉近比例）
+    if tn - (SP.sightAt or 0) >= SP.SIGHT_SEC then
+        SP.sightAt = tn
+        -- §167.6 观战开始 3 秒后探一次镜头附近有什么（竹子到底是哪类东西）
+        if not SP.probed and G.tubeProbe and tn - (SP.statAt or tn) > 3.0 then SP.probed = true; pcall(G.tubeProbe, eye) end
+        local okT, errT = pcall(tubeHide, look, eye, a, b, tn)     -- §167.5 先把管子里的藏掉，射线再看还有没有挡的
+        if not okT and not SP.tubeErr then SP.tubeErr = true; out("!! 观战镜头管子出错：%s", tostring(errT)) end
+        local ok, hp = sight(look, eye, a, b, true, tn)
+        SP.clipK = ok and 1.0 or clipK(look, eye, hp)
+        unhide(tn, false)
+    end
+    local cs = SP.clipS or SP.clipK
+    SP.clipS = cs + (SP.clipK - cs) * (1 - math.exp(-dt / (SP.clipK < cs and SP.CLIP_IN_T or SP.CLIP_OUT_T)))   -- §167.4 拉近快、放远慢
+    if SP.clipS < 0.999 then
+        eye = { X = look.X + (eye.X - look.X) * SP.clipS, Y = look.Y + (eye.Y - look.Y) * SP.clipS, Z = look.Z + (eye.Z - look.Z) * SP.clipS }
     end
     local hx, hy, hz = look.X - eye.X, look.Y - eye.Y, look.Z - eye.Z
     local rot = { Pitch = math.deg(math.atan(hz, math.sqrt(hx * hx + hy * hy))), Yaw = math.deg(math.atan(hy, hx)), Roll = 0.0 }
@@ -484,6 +722,18 @@ local function liveStep(s, other, tn)
     if not (x and y) then return end
     local target = { X = x + (tonumber(p.vx) or 0) * dt, Y = y + (tonumber(p.vy) or 0) * dt, Z = tonumber(p.z) }
     local mont, cur = G.montageOf(s.pup), loc(s.pup)
+    -- §141.14 线上反馈"人在虚空里 / 离很远打空气"：摆过去时那块地面还没加载出来，替身掉穿地面；之后水平距离近、steer 不再拉，
+    -- 就一直待在地面以下。比包里的高度低 SINK 以上 = 掉下去了：拉回包里的位置（地面加载出来之前会反复拉，限速）
+    if cur and target.Z and cur.Z < target.Z - SP.SINK and tn - (s.sinkAt or 0) > 0.5 then
+        s.sinkAt = tn
+        pcall(function() s.pup:K2_SetActorLocation({ X = target.X, Y = target.Y, Z = target.Z + 50.0 }, false, {}, true) end)
+        local cm = rawProp(s.pup, "CharacterMovement")
+        if valid(cm) then pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end) end
+        s.sinks = (s.sinks or 0) + 1
+        if s.sinks <= 3 or s.sinks % 20 == 0 then out("观战 %s 掉到地面以下（Z %.0f，包里 %.0f），拉回（第 %d 次）", s.tag, cur.Z, target.Z, s.sinks) end
+        s.feed = nil
+        return
+    end
     if mont ~= "" and cur and d2(cur, target) < 400.0 then s.feed = nil else steer(s, target) end
     if mont == "" then turn(s, tonumber(p.yaw) or 0) end
 end
@@ -530,6 +780,8 @@ local function bossBarStep(s, tn)
     if not ok and not s.setErr then s.setErr = true; out("!! 观战原型 %s 血条：写数值失败", s.tag) end
 end
 
+-- §141.14 以前观战期间把藏着的自己挪到主机旁边悬着、退出时放到主机旁边（模组自己改坐标）。
+-- §168.5 用户 11-09："统一，并且观战模式也可以用这套传送机制"：改成离主机远就走游戏传送（见 SP.onPacket），自己的角色一直站在游戏放的地方
 local function logic()
     local tn = now()
     local a, b = SP.side[1], SP.side[2]
@@ -635,6 +887,12 @@ function SP.start()
     local spots = { { X = cx - fx * SP.GAP / 2, Y = cy - fy * SP.GAP / 2, Z = l.Z + 50.0, yaw = rot.Yaw },
                     { X = cx + fx * SP.GAP / 2, Y = cy + fy * SP.GAP / 2, Z = l.Z + 50.0, yaw = rot.Yaw + 180.0 } }
     local pkts, live = nil, SP.live.want
+    -- §141.14 联机观战：直接在主机的位置生成（以前在自己正前方生成再走过去，路上地面没加载就掉下去）
+    local hp = live and ctx.NET and ctx.NET.pos
+    if hp and hp.X then
+        spots[1] = { X = hp.X, Y = hp.Y, Z = (hp.Z or l.Z) + 50.0, yaw = spots[1].yaw }
+        spots[2] = { X = hp.X + fx * SP.GAP, Y = hp.Y + fy * SP.GAP, Z = (hp.Z or l.Z) + 50.0, yaw = spots[2].yaw }
+    end
     if live then
         out("观战原型：联机观战，等主机转发的包（A = 主机，B = 对手）")
     elseif SP.src == "pkt" then
@@ -713,7 +971,11 @@ function SP.stop(why)
         hideOne(s.pup)
     end
     SP.side = {}
-    showSelf(getP1(), getP1PC())
+    SP.unhideAll()                -- §167.3 藏起来的场景物件都显示回来
+    SP.camOff, SP.camOffT, SP.clipK, SP.blockedAt, SP.turnedAt = 0.0, 0.0, 1.0, nil, nil
+    SP.eyeS, SP.lookS, SP.clipS, SP.smAt, SP.turnAt = nil, nil, nil, nil, nil
+    local p1 = getP1()
+    showSelf(p1, getP1PC())
     SP.live.want = false
     SP.score = nil
     out("观战原型结束（%s）", why or "")
@@ -756,16 +1018,55 @@ function SP.feed(t, tn)
     if otherMap then
         if SP.on and SP.live.want then SP.stop("主机在另一张地图") end
         -- 用户 2026-11-07："传送应该在刚进地图的时候，而不是需要上场的时候"：观战者一进来就自动去主机那张图（每个会话一次）
-        if not SP.live.mapGo and ctx.mapGo then
-            SP.live.mapGo = true
-            out("观战：主机在 %s，自动前往（会先自动存档）", tostring(NETT.rmap))
+        -- §167.2 停观战时玩家1 无效，锁血没解（MAPGO.dirty 会拒切图）：这里补解；没切成 15 秒后再试，最多 3 次
+        if SP.locked and valid(getP1()) then G.unlockSelf(getP1(), "观战结束（补解）"); SP.locked = nil end
+        local lv = SP.live
+        if ctx.mapGo and not ST.travel and (lv.mapGoN or 0) < 3 and (not lv.mapGo or tn - (lv.mapGoAt or 0) > 15.0) then
+            lv.mapGo, lv.mapGoAt, lv.mapGoN = true, tn, (lv.mapGoN or 0) + 1
+            lv.groundAt, lv.groundOk = nil, nil
+            ctx.notice("主机在另一张地图，传送过去观战", "会出加载画面、自动存档", 5.0)
+            out("观战：主机在 %s，自动前往（会先自动存档；第 %d 次）", tostring(NETT.rmap), lv.mapGoN)
             ctx.mapGo()
         end
         return
     end
+    SP.live.mapGo, SP.live.mapGoN = false, 0      -- 和主机同图了：主机以后再换图还能再自动跟过去
+    -- §168.5 同图但离主机远：走游戏传送过去（会自动存档、出加载画面），到了再看。观战中主机跑出 TP_FAR：先停观战（解锁血，存档检查才放行）再传
+    if ctx.travelling() then return end
+    local lv, d = SP.live, ctx.hostDist()
+    if d and SP.on and SP.live.want and d > SP.TP_FAR then SP.stop(string.format("主机跑远了（%.0f 米），走游戏传送跟过去", d)) end
+    if d and not SP.on and d > SP.TP_NEAR and not (lv.userStop or MATCH.role) then
+        if SP.locked and valid(getP1()) then G.unlockSelf(getP1(), "观战结束（补解）"); SP.locked = nil end
+        if (lv.tpN or 0) < 3 and tn - (lv.tpAt or 0) > 15.0 then
+            lv.tpAt, lv.tpN = tn, (lv.tpN or 0) + 1
+            out("观战：离主机 %.0f 米，走游戏传送过去（会先自动存档；第 %d 次）", d, lv.tpN)
+            ctx.notice(string.format("离主机 %.0f 米，传送过去观战", d), "会出加载画面、自动存档", 5.0)
+            lv.groundAt, lv.groundOk = nil, nil
+            ctx.toHost()
+        end
+        return
+    end
+    if d and d <= SP.TP_NEAR then lv.tpN = 0 end
     if not SP.on then
         if SP.live.userStop or MATCH.role then return end
         if not (NETT and NETT.rmap and NETT.rmap ~= "") then return end      -- 先收到主机的包、知道它在哪张图再开（19:02 实测先摆了一次又收掉）
+        -- §168.6 用户 11-09：传到以后先是一片白（地图细节还在加载），B 一生成就陷进地里。主机脚下探到地面再开，最多等 LOAD_WAIT 秒；
+        -- 等的时候每秒提示一次，不然玩家以为游戏坏了。探地用不了（nil）就不等
+        local lv, p1 = SP.live, getP1()
+        if not lv.groundOk and NETT.pos and valid(p1) and G.floorBelow then
+            lv.groundAt = lv.groundAt or tn
+            local fl = G.floorBelow(p1, NETT.pos, 1000.0)
+            local waited = tn - lv.groundAt
+            if fl == false and waited < SP.LOAD_WAIT then
+                if tn - (lv.groundMsgAt or 0) >= 1.0 then
+                    lv.groundMsgAt = tn
+                    ctx.notice("正在加载观战场地…", string.format("地图还在加载，最多再等 %d 秒", math.max(0, math.ceil(SP.LOAD_WAIT - waited))), 1.5)
+                end
+                return
+            end
+            lv.groundOk = true
+            out("观战：场地地面%s（等了 %.1f 秒）", fl == true and "已加载" or (fl == nil and "探测不了，不等" or "还没加载，等够了照样开始"), waited)
+        end
         if (SP.live.tryAt or 0) > tn then return end
         SP.live.tryAt = tn + 3.0
         if valid(G.puppet()) then G.removePuppet() end      -- 观战者不需要对战替身
@@ -810,7 +1111,7 @@ end
 SP.STATE_NAME = { cd = "倒计时", fight = "交手中", rend = "回合结束", ["end"] = "打完了", idle = "没开打" }
 
 -- 观战会话结束 / 换了会话：下次再收到包可以重新自动开
-function SP.liveReset() SP.live.userStop = false; SP.live.mapGo = false end
+function SP.liveReset() SP.live.userStop = false; SP.live.mapGo, SP.live.mapGoN = false, 0; SP.live.groundAt, SP.live.groundOk = nil, nil end
 
 -- ============================================================ §141.7 排队 / 打完换人（房间规矩由主机定，存 net\rules.txt）
 -- rot：0 = 不换（默认），1 = 每打完一场客机位就换给队首，2 = 客机输了才换（主机是房主，不下场）
@@ -1010,6 +1311,7 @@ function SP.onRole(old, new)
 end
 
 SP._pkt = { load = loadPkt, apply = pktApply, step = pktStep, world = pktWorld }   -- 给 tests/test_spec_pkt.py 用
+SP._cam = { place = placeCam }                       -- 给 tests/test_spec_cam.py 用
 
 -- 小键盘 .：换动作来源（AI 对打 ↔ 录像包）；开着时立刻重开
 SP.src = "ai"

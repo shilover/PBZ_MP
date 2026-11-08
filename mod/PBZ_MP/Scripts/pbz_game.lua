@@ -1080,6 +1080,26 @@ function LO.geClass(path)
     return valid(cls) and cls or nil
 end
 
+-- §170 饰品换级用：按 Handle 清掉一个技能格 / 给一个技能类并试着激活（被动技能一般自己激活）
+-- 【适配】ASC:ClearAbility({ Handle = h })；返回成没成功
+function LO.clearAbility(asc, h)
+    return (pcall(function() asc:ClearAbility({ Handle = h }) end))
+end
+-- 【适配】ASC:K2_GiveAbility(类, 1, -1) + ASC:TryActivateAbilityByClass(类, true)；返回给没给成
+function LO.giveClass(asc, cls)
+    local ok = pcall(function() asc:K2_GiveAbility(cls, 1, -1) end)
+    if ok then pcall(function() asc:TryActivateAbilityByClass(cls, true) end) end
+    return ok
+end
+-- §165.6 动画长度探针用：按资产路径加载并找到对象（没有返回 nil）
+-- 【适配】LoadAsset(路径) + StaticFindObject(路径)
+function LO.loadObject(path)
+    pcall(function() if type(LoadAsset) == "function" then LoadAsset(path) end end)
+    local o
+    pcall(function() o = StaticFindObject(path) end)
+    return valid(o) and o or nil
+end
+
 -- 【适配】ASC:BP_ApplyGameplayEffectToSelf(GE 类, 等级（默认 1）, ASC:MakeEffectContext())；返回成没成功
 function LO.applyGE(actor, path, label, lv)
     local cls, asc = LO.geClass(path), ascOf(actor)
@@ -1101,8 +1121,12 @@ end
 -- §118 身上生效的武器效果 GE：武器升级（白影 GE_Baiying_FrozenReinforced_Lv1–3 / LockFrozenWhileBlocked 加冰冻积累、
 -- 混沌 GE_Weapon_ChaosBlade_Lv15 …）和形态 / 增益（混沌冰形态 GE_Chaos_FrostBuff、GE_BaiYing_Buff）。
 -- 只要路径在 WGE_ROOT 下、而且不直接改属性的（Def.Modifiers 为空：改属性的已经随 att= 过去，再上一份会算两次）。
--- 返回 { "BaiYing/UpgradeData/GE_Baiying_FrozenReinforced_Lv1", … }（去重、排序）；读不到容器返回 nil
+-- §163 影之武装的升级在 WGE_SHAQI 下（贪狼铸魂 GE_TanLang_Evolution 给 CharacterState.WeaponUpgrade.TanLang.Evolution，
+-- 贪狼三招有这个标签才放紫火子弹 BulletData_TanLang_GhostFire），短名前面带 "ShaqiWeapon/"（主武器目录里没有叫这个的）。
+-- 返回 { "BaiYing/UpgradeData/GE_Baiying_FrozenReinforced_Lv1", "ShaqiWeapon/TanLang/UpgradeData/GE_TanLang_Evolution", … }
+-- （去重、排序）；读不到容器返回 nil
 LO.WGE_ROOT, LO.wgeMods = "/PBZCombatAsset/ActorData/Players/Hun/Weapon/", {}
+LO.WGE_HUN, LO.WGE_SHAQI = "/PBZCombatAsset/ActorData/Players/Hun/", "ShaqiWeapon/"
 
 -- 【适配】ASC.ActiveGameplayEffects.GameplayEffects_Internal[i].Spec.Def（只读属性，不调函数）、GE 默认对象的 Modifiers
 function LO.weaponEffects(actor)
@@ -1116,6 +1140,9 @@ function LO.weaponEffects(actor)
         if not valid(def) then return end
         local p = pathOf(def)        -- /PBZCombatAsset/…/GE_X.Default__GE_X_C
         local id = p:sub(1, #LO.WGE_ROOT) == LO.WGE_ROOT and p:sub(#LO.WGE_ROOT + 1):match("^([%w_/]+)%.") or nil
+        if not id and p:sub(1, #LO.WGE_HUN + #LO.WGE_SHAQI) == LO.WGE_HUN .. LO.WGE_SHAQI then     -- §163 影之武装
+            id = p:sub(#LO.WGE_HUN + 1):match("^([%w_/]+)%.")
+        end
         if not id or seen[id] then return end
         seen[id] = true
         if LO.wgeMods[id] == nil then
@@ -1125,7 +1152,8 @@ function LO.weaponEffects(actor)
         end
         -- 只要升级和增益（名字带 Buff）；同目录下还有挨打方身上的效果（白影 GameplayEffects/GE_BaiYing_AssaultTriggered），不发。
         -- §159 升级 GE 多数在 UpgradeData/，双月 / 破军的在 WeaponUpgrade/（双月进阶冲刺要的 CanSwiftDash 就在这里，以前漏了）
-        local isUpg = id:find("/UpgradeData/", 1, true) or id:find("/WeaponUpgrade/", 1, true)
+        -- §163 影之武装黄金火铳的升级在 Upgrade/（主武器没有这个目录）
+        local isUpg = id:find("/UpgradeData/", 1, true) or id:find("/WeaponUpgrade/", 1, true) or id:find("/Upgrade/", 1, true)
             or (id:match("([^/]+)$") or ""):find("Buff", 1, true)
         if LO.wgeMods[id] == 0 and isUpg then list[#list + 1] = id end
     end)
@@ -1137,6 +1165,7 @@ end
 -- 【适配】武器效果的短名（"BaiYing/UpgradeData/GE_X"）→ GE 类路径（"/PBZCombatAsset/…/GE_X.GE_X_C"）
 function LO.wgePath(id)
     local name = id:match("([%w_]+)$")
+    if id:sub(1, #LO.WGE_SHAQI) == LO.WGE_SHAQI then return LO.WGE_HUN .. id .. "." .. name .. "_C" end    -- §163 影之武装
     return LO.WGE_ROOT .. id .. "." .. name .. "_C"
 end
 
@@ -2528,6 +2557,56 @@ local function geSet(actor)
     return ok and set or nil
 end
 
+-- §170.2 同上，但数每个效果生效了几份（同一个效果可能挂两次 / 叠层：二周目的饰品增伤实测 0.3 × 2）
+-- 返回 { 短名 = 份数 }；读不到返回 nil
+-- 【适配】ASC.ActiveGameplayEffects.GameplayEffects_Internal[i].Spec.Def / Spec.StackCount（只读）
+local function geCounts(actor)
+    local asc = ascOf(actor)
+    local arr = asc and rawProp(rawProp(asc, "ActiveGameplayEffects"), "GameplayEffects_Internal")
+    if arr == nil then return nil end
+    local cnt = {}
+    local ok = eachArr(arr, function(_, age)
+        local spec = rawProp(age, "Spec")
+        local def = rawProp(spec, "Def")
+        if valid(def) then
+            local n = pathOf(def):match("/([%w_]+)%.[^/]*$")
+            local st = tonumber(rawProp(spec, "StackCount")) or 1
+            if n then cnt[n] = (cnt[n] or 0) + math.max(1, st) end
+        end
+    end)
+    return ok and cnt or nil
+end
+
+-- §170.5 每个生效效果改了哪些属性、改多少（pick(短名) 为真的才看）。返回 { { n = 短名, mods = { { a = 属性名, op = ModifierOp, v = 算好的数 }, ... } }, ... }
+-- ModifierOp：0 = 加（AddBase），4 = 乘（11-07 探测：招架减伤 op4 0.7、增伤 / 血上限 op0）
+-- 【适配】ASC.ActiveGameplayEffects.GameplayEffects_Internal[i].Spec.Def.Modifiers[j]（Attribute.AttributeName、ModifierOp）+ Spec.Modifiers[j].EvaluatedMagnitude（只读，同 PBZ_StatProbe）
+local function geMods(actor, pick)
+    local asc = ascOf(actor)
+    local arr = asc and rawProp(rawProp(asc, "ActiveGameplayEffects"), "GameplayEffects_Internal")
+    if arr == nil then return nil end
+    local list = {}
+    eachArr(arr, function(_, age)
+        local spec = rawProp(age, "Spec")
+        local def = rawProp(spec, "Def")
+        if not valid(def) then return end
+        local n = pathOf(def):match("/([%w_]+)%.[^/]*$")
+        if not (n and pick(n)) then return end
+        local defs, e = {}, { n = n, mods = {} }
+        eachArr(rawProp(def, "Modifiers"), function(j, m)
+            local an = nil
+            pcall(function() an = m.Attribute.AttributeName:ToString() end)
+            defs[j] = { a = an, op = tonumber(rawProp(m, "ModifierOp")) }
+        end)
+        eachArr(rawProp(spec, "Modifiers"), function(j, ms)
+            local d = defs[j] or {}
+            local v = tonumber(rawProp(ms, "EvaluatedMagnitude"))
+            if d.a and d.op and v then e.mods[#e.mods + 1] = { a = d.a, op = d.op, v = v } end
+        end)
+        list[#list + 1] = e
+    end)
+    return list
+end
+
 -- §113 直接写属性（setAttr）不走 ASC，HUD 的 W_WeaponUI 靠 WaitForAttributeChanged 听属性变化，收不到 → 精纯杀气 / 暗源的显示不动。
 -- 写完后按它自己的回调补一下：OnUltimateCharageCountChange / OnUltimateChargeChange（属性变化时它自己调的那两个，NewValue / OldValue），
 -- 暗源那格叫 Bullet（BulletNum / BulletText / "Change Bullet"）。参数按反射到的名字填，认不出的参数就不调、只记日志
@@ -2755,6 +2834,272 @@ local function teleportTo(actor, pos, yaw)
     if ok then return r == true end
     pcall(function() actor:K2_SetActorLocation(pos, false, {}, true) end)
     return true, "K2_TeleportTo 调用出错，退回直接设坐标：" .. tostring(r)
+end
+
+local KSL
+-- §167.1 观战镜头碰撞用：从 a 打一条射线到 b（Visibility 通道），打到东西返回碰撞点，没打到 / 出错返回 nil。
+-- ignore = 不算的角色（替身、自己）。这个游戏里还没实测过：调用出错时第一次返回 nil + 原因，调用方记日志后不再调
+-- 参数：世界上下文, 起点, 终点, TraceTypeQuery1, 不查复杂碰撞, 忽略列表, 不画调试线, OutHit（表，UE4SS 填进去）, 忽略自己, 颜色, 颜色, 0
+-- 【适配】Default__KismetSystemLibrary:LineTraceSingle(...) → bool；碰撞点取 OutHit.Location
+local function traceHit(ctxObj, a, b, ignore)
+    if not valid(KSL) then KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary") end
+    if not (valid(KSL) and valid(ctxObj)) then return nil, "找不到 KismetSystemLibrary / 世界上下文" end
+    local col = { R = 0.0, G = 0.0, B = 0.0, A = 0.0 }
+    local hit = {}
+    local ok, r = pcall(function() return KSL:LineTraceSingle(ctxObj, a, b, 0, false, ignore or {}, 0, hit, true, col, col, 0.0) end)
+    if not ok then return nil, "LineTraceSingle 报错：" .. tostring(r) end
+    if r ~= true then return nil end
+    local l = hit.Location or hit.ImpactPoint
+    local x, y, z
+    pcall(function() x, y, z = l.X, l.Y, l.Z end)
+    if not (x and y and z) then return nil, "OutHit 里没有 Location" end
+    return { X = x, Y = y, Z = z }
+end
+
+local traceActorLogged, actorInfoLogged      -- §167.3 第一次各记一行诊断
+-- §167.3 观战镜头"把挡视线的物件藏起来"：同 traceHit，另外给打到的角色（第二个值）。第三个值 = 出错原因。
+-- 打到的角色先看 OutHit.HitObjectHandle.Actor（UE5），拿不到再用 OutHit.Component 的 GetOwner()
+-- 【适配】Default__KismetSystemLibrary:LineTraceSingle(...)；OutHit.HitObjectHandle.Actor / OutHit.Component:GetOwner()
+local function traceActor(ctxObj, a, b, ignore)
+    if not valid(KSL) then KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary") end
+    if not (valid(KSL) and valid(ctxObj)) then return nil, nil, "找不到 KismetSystemLibrary / 世界上下文" end
+    local col = { R = 0.0, G = 0.0, B = 0.0, A = 0.0 }
+    local hit = {}
+    local ok, r = pcall(function() return KSL:LineTraceSingle(ctxObj, a, b, 0, false, ignore or {}, 0, hit, true, col, col, 0.0) end)
+    if not ok then return nil, nil, "LineTraceSingle 报错：" .. tostring(r) end
+    if r ~= true then return nil end
+    local x, y, z
+    pcall(function() local l = hit.Location or hit.ImpactPoint; x, y, z = l.X, l.Y, l.Z end)
+    -- 弱引用（TWeakObjectPtr）在 UE4SS 里要 :Get() 才是对象；§167.3 实测（02:12）一次都没拿到物件
+    local function deref(o)
+        if o == nil then return nil end
+        if not valid(o) then
+            local ok, g = pcall(function() return o:Get() end)
+            if ok then o = g end
+        end
+        return valid(o) and o or nil
+    end
+    local act, comp
+    pcall(function() local h = hit.HitObjectHandle; act = h and deref(h.Actor) end)
+    pcall(function() comp = deref(hit.Component) end)
+    if not act and comp then pcall(function() act = deref(comp:GetOwner()) end) end
+    if not traceActorLogged then       -- 第一次打到东西：把 OutHit 里拿到了什么记一行，查"拿不到物件"
+        traceActorLogged = true
+        local function ty(f) local ok, v = pcall(f); return ok and type(v) .. (v ~= nil and ("/" .. tostring(valid(v))) or "") or ("报错 " .. tostring(v)) end
+        out("观战镜头射线：HitObjectHandle=%s .Actor=%s Component=%s → 物件 %s 部件 %s",
+            ty(function() return hit.HitObjectHandle end), ty(function() return hit.HitObjectHandle.Actor end),
+            ty(function() return hit.Component end), act and full(act) or "nil", comp and full(comp) or "nil")
+    end
+    return (x and { X = x, Y = y, Z = z }) or { X = b.X, Y = b.Y, Z = b.Z }, act, nil, comp
+end
+
+-- §167.3 角色的类名 + 包围盒半径（厘米，取 XY / Z 里最大的半边长）；读不到给 nil
+-- 【适配】UObject:GetClass()、Actor:GetActorBounds(false, Origin, BoxExtent)、KismetSystemLibrary:GetComponentBounds(部件, Origin, BoxExtent, SphereRadius)、部件 / 根部件 .Bounds.BoxExtent
+local function actorInfo(actor, comp)
+    if not valid(actor) then return nil end
+    if not valid(comp) then pcall(function() comp = actor.RootComponent end) end      -- §167.5 重叠查询只给角色，拿根部件算包围盒
+    local cls, ext, how
+    pcall(function() cls = shortName(full(actor:GetClass())) end)
+    local function take(e, tag)
+        if ext or type(e) ~= "table" then return end
+        local x, y, z
+        pcall(function() x, y, z = e.X, e.Y, e.Z end)
+        if x and y and z and (x > 0 or y > 0 or z > 0) then ext, how = math.max(x, y, z), tag end
+    end
+    -- §167.4 实测（03:00）：拿到了物件，大小一直读不到（出参表没填）。出参先给好字段再传，几种办法挨个试，记下哪种管用
+    pcall(function()
+        local o, e = { X = 0.0, Y = 0.0, Z = 0.0 }, { X = 0.0, Y = 0.0, Z = 0.0 }
+        local r1, r2 = actor:GetActorBounds(false, o, e)
+        take(e, "GetActorBounds 出参"); take(r2, "GetActorBounds 返回值")
+    end)
+    if not ext and valid(comp) then
+        pcall(function()
+            if not valid(KSL) then KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary") end
+            local o, e, r = { X = 0.0, Y = 0.0, Z = 0.0 }, { X = 0.0, Y = 0.0, Z = 0.0 }, {}
+            local r1, r2 = KSL:GetComponentBounds(comp, o, e, r)
+            take(e, "GetComponentBounds 出参"); take(r2, "GetComponentBounds 返回值")
+        end)
+    end
+    if not ext and valid(comp) then
+        pcall(function() local b = comp.Bounds; take(b and b.BoxExtent, "部件 Bounds") end)
+    end
+    if not ext then
+        pcall(function() local rc = actor.RootComponent; local b = rc and rc.Bounds; take(b and b.BoxExtent, "根部件 Bounds") end)
+    end
+    if not actorInfoLogged then
+        actorInfoLogged = true
+        out("观战镜头：物件信息 %s → 类 %s，半边长 %s（%s）", full(actor), tostring(cls), ext and string.format("%.0f", ext) or "读不到", how or "几种办法都不行")
+    end
+    return cls, ext
+end
+
+-- §167.3 只在本机画面上藏 / 显示一个角色（不改碰撞、不发网络、不进存档）
+-- 【适配】Actor:SetActorHiddenInGame(bool)
+local function setHidden(actor, hide)
+    if not valid(actor) then return false end
+    return pcall(function() actor:SetActorHiddenInGame(hide and true or false) end)
+end
+
+-- ============================================================ §167.5 观战镜头"管子"：查镜头和两人之间的物件 / 植被实例
+-- 局部变量快到 200 个上限（03:1x 加完这段整个文件载不进）：这一段都挂在一张表上
+local TUBE = { logged = {} }
+-- 【适配】不调游戏（每种诊断只记一次日志）
+function TUBE.log(k, fmt, ...) if not TUBE.logged[k] then TUBE.logged[k] = true; out(fmt, ...) end end
+
+-- 球形区域里有碰撞的角色（世界静态 + 世界动态）。返回角色列表；第三个值 = 出错原因
+-- 【适配】KismetSystemLibrary:SphereOverlapActors(世界上下文, 球心, 半径, {ObjectTypeQuery1, ObjectTypeQuery2}, 类过滤 nil, 忽略列表, OutActors 出参)
+function TUBE.overlapActors(ctxObj, pos, r, ignore)
+    if not valid(KSL) then KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary") end
+    if not (valid(KSL) and valid(ctxObj)) then return {}, "找不到 KismetSystemLibrary / 世界上下文" end
+    local outA = {}
+    local ok, r1, r2 = pcall(function() return KSL:SphereOverlapActors(ctxObj, pos, r, { 0, 1 }, nil, ignore or {}, outA) end)
+    if not ok then return {}, "SphereOverlapActors 报错：" .. tostring(r1) end
+    local list = {}
+    local src = (#outA > 0 and outA) or (type(r2) ~= "boolean" and r2) or outA
+    -- 03:24 实测：出参 6 个、全被当成无效 —— 出参表里的元素还要 :get() 才是对象
+    eachArr(src, function(_, a)
+        if not valid(a) then pcall(function() a = a:get() end) end
+        if not valid(a) then pcall(function() a = a:Get() end) end
+        if valid(a) then list[#list + 1] = a end
+    end)
+    TUBE.log("ov", "观战镜头管子：SphereOverlapActors 返回 %s，出参 %d 个，第二返回值 %s → %d 个物件", tostring(r1), #outA, type(r2), #list)
+    return list
+end
+
+-- 场景里所有实例化静态网格组件（植被、成片的栅栏 / 石头都在这里），带包围球；找一次很慢，调用方别太勤
+-- 【适配】FindAllOf("FoliageInstancedStaticMeshComponent" / "HierarchicalInstancedStaticMeshComponent" / "InstancedStaticMeshComponent")、KismetSystemLibrary:GetComponentBounds
+function TUBE.hismList()
+    local list, all, seen, cnt, t0 = {}, {}, {}, {}, os.clock()
+    -- 03:24 实测 HierarchicalInstancedStaticMeshComponent 一个都没找到：植被可能是子类 / 普通实例化网格，几种类名都找、按路径去重
+    for _, cls in ipairs({ "FoliageInstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "InstancedStaticMeshComponent" }) do
+        local got = FindAllOf(cls) or {}
+        cnt[#cnt + 1] = cls .. " " .. #got
+        for _, c in ipairs(got) do
+            local k = valid(c) and full(c)
+            if k and not seen[k] then seen[k] = true; all[#all + 1] = c end
+        end
+    end
+    if not valid(KSL) then KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary") end
+    for _, c in ipairs(all) do
+        if valid(c) then
+            local o, e, rr = { X = 0.0, Y = 0.0, Z = 0.0 }, { X = 0.0, Y = 0.0, Z = 0.0 }, {}
+            local okB, r1, r2, r3 = pcall(function() return KSL:GetComponentBounds(c, o, e, rr) end)
+            local rad
+            pcall(function() rad = math.sqrt(e.X * e.X + e.Y * e.Y + e.Z * e.Z) end)
+            local nm = full(c) or ""
+            -- 03:41 实测缩掉了河流水面模拟的触发器：水面 / 触发器 / 体积这类不碰
+            local skip = nm:find("Water", 1, true) or nm:find("Trigger", 1, true) or nm:find("Volume", 1, true)
+            if rad and rad > 0 and not skip then list[#list + 1] = { comp = c, o = { X = o.X, Y = o.Y, Z = o.Z }, r = rad } end
+        end
+    end
+    TUBE.log("hl", "观战镜头管子：实例化网格组件 %d 个（%s），读到包围盒 %d 个，用时 %.0f ms", #all, table.concat(cnt, " / "), #list, (os.clock() - t0) * 1000)
+    return list
+end
+
+-- 组件里和球相交的实例序号
+-- 【适配】InstancedStaticMeshComponent:GetInstancesOverlappingSphere(球心, 半径, bSphereInWorldSpace=true) → TArray<int32>
+function TUBE.hismInstancesIn(comp, pos, r)
+    local idx = {}
+    local ok, arr = pcall(function() return comp:GetInstancesOverlappingSphere(pos, r, true) end)
+    if not ok then TUBE.log("hi", "!! 观战镜头管子：GetInstancesOverlappingSphere 报错：%s", tostring(arr)); return idx end
+    local raw = 0
+    eachArr(arr, function(_, v)
+        raw = raw + 1
+        if type(v) ~= "number" then pcall(function() v = v:get() end) end
+        if type(v) ~= "number" then pcall(function() v = v:Get() end) end
+        if type(v) == "number" then idx[#idx + 1] = v end
+    end)
+    if raw > 0 then TUBE.log("hi1", "观战镜头管子：GetInstancesOverlappingSphere 第一次有结果：%d 个，认出序号 %d 个（返回值类型 %s）", raw, #idx, type(arr)) end
+    return idx
+end
+
+-- 实例变换（世界坐标）；读不到给 nil
+-- 【适配】InstancedStaticMeshComponent:GetInstanceTransform(序号, OutInstanceTransform 出参, bWorldSpace=true)
+function TUBE.hismXf(comp, i)
+    local xf = { Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 }, Translation = { X = 0.0, Y = 0.0, Z = 0.0 }, Scale3D = { X = 0.0, Y = 0.0, Z = 0.0 } }
+    local ok, r1, r2 = pcall(function() return comp:GetInstanceTransform(i, xf, true) end)
+    if not ok then TUBE.log("gx", "!! 观战镜头管子：GetInstanceTransform 报错：%s", tostring(r1)); return nil end
+    if (xf.Scale3D.X == 0 and xf.Scale3D.Y == 0) and type(r2) == "table" then xf = r2 end
+    local okR, out1 = pcall(function()
+        return { Rotation = { X = xf.Rotation.X, Y = xf.Rotation.Y, Z = xf.Rotation.Z, W = xf.Rotation.W },
+                 Translation = { X = xf.Translation.X, Y = xf.Translation.Y, Z = xf.Translation.Z },
+                 Scale3D = { X = xf.Scale3D.X, Y = xf.Scale3D.Y, Z = xf.Scale3D.Z } }
+    end)
+    if not okR or (out1.Scale3D.X == 0 and out1.Scale3D.Y == 0 and out1.Scale3D.Z == 0) then
+        TUBE.log("gx0", "!! 观战镜头管子：实例变换读不到（缩放全 0）")
+        return nil
+    end
+    return out1
+end
+
+-- 写实例变换（只改本机画面）；最后一个 true = 立刻刷新渲染
+-- 【适配】InstancedStaticMeshComponent:UpdateInstanceTransform(序号, 变换, bWorldSpace=true, bMarkRenderStateDirty=true, bTeleport=true)
+function TUBE.hismSetXf(comp, i, xf)
+    local ok, r = pcall(function() return comp:UpdateInstanceTransform(i, xf, true, true, true) end)
+    if not ok then TUBE.log("ux", "!! 观战镜头管子：UpdateInstanceTransform 报错：%s", tostring(r)) end
+    return ok
+end
+
+-- 组件网格本身的半边长（不含缩放）
+-- 【适配】InstancedStaticMeshComponent.StaticMesh:GetBoundingBox() → FBox{Min, Max}
+function TUBE.meshHalf(comp)
+    local h
+    pcall(function()
+        local b = comp.StaticMesh:GetBoundingBox()
+        h = math.max(b.Max.X - b.Min.X, b.Max.Y - b.Min.Y, b.Max.Z - b.Min.Z) / 2
+    end)
+    return h
+end
+
+-- §167.6 竹子是什么：数几类组件 / 角色，再把离 pos 最近的网格组件和它们的模型名记下来（只读，一次性，可能卡一下）
+-- 【适配】FindAllOf(各类名)、SceneComponent:K2_GetComponentLocation()、StaticMeshComponent.StaticMesh、UObject:GetOuter()
+function TUBE.probe(pos)
+    local t0 = os.clock()
+    local counts = {}
+    for _, cls in ipairs({ "StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent",
+                           "FoliageInstancedStaticMeshComponent", "GrassInstancedStaticMeshComponent", "InstancedFoliageActor",
+                           "StaticMeshActor", "LandscapeProxy", "LandscapeStreamingProxy", "PCGComponent", "InstancedActorsManager" }) do
+        local ok, got = pcall(FindAllOf, cls)
+        counts[#counts + 1] = cls .. "=" .. ((ok and got) and #got or 0)
+    end
+    out("观战镜头探针：组件 / 角色数量 %s", table.concat(counts, " "))
+    local near = {}
+    local all = FindAllOf("StaticMeshComponent") or {}
+    for _, c in ipairs(all) do
+        local l
+        pcall(function() l = c:K2_GetComponentLocation() end)
+        if l then
+            local d = math.sqrt((l.X - pos.X) ^ 2 + (l.Y - pos.Y) ^ 2 + (l.Z - pos.Z) ^ 2)
+            if d < 2500 then near[#near + 1] = { c = c, d = d } end
+        end
+    end
+    table.sort(near, function(x, y) return x.d < y.d end)
+    for i = 1, math.min(15, #near) do
+        local c, mesh, owner = near[i].c, "?", "?"
+        pcall(function() mesh = shortName(full(c.StaticMesh)) end)
+        pcall(function() owner = shortName(full(c:GetOwner())) end)
+        out("  探针 %2d：%.0f 厘米 %s（模型 %s，属于 %s）", i, near[i].d, shortName(full(c)), mesh, owner)
+    end
+    out("观战镜头探针：25 米内的网格组件 %d 个（共 %d 个），用时 %.0f ms", #near, #all, (os.clock() - t0) * 1000)
+end
+
+local floorErr     -- §168 floorBelow 用
+-- §168 落点下面有没有地：从 pos 上方 50 往下打一条射线（复用上面的 traceHit，Visibility，bIgnoreSelf 忽略 actor 自己），
+-- depth 以内碰到东西 = 有地。返回 true / false，碰到时第二个值是地面 Z（OutHit 没填回来就是 nil）；
+-- 射线调用不了返回 nil = 不知道（调用方按以前的做法），只记一次日志。
+-- 注意：远处的地形没加载时也是 false（分不清"没加载"和"真是虚空"），调用方自己按距离判断
+-- 【适配】traceHit(actor, pos+50, pos-depth, {})
+local function floorBelow(actor, pos, depth)
+    if not (valid(actor) and pos) or floorErr then return nil end
+    local h, err = traceHit(actor, { X = pos.X, Y = pos.Y, Z = pos.Z + 50.0 }, { X = pos.X, Y = pos.Y, Z = pos.Z - (depth or 800.0) }, {})
+    if h then return true, h.Z end
+    if err and err:find("OutHit", 1, true) then return true, nil end      -- 打到了，只是没拿到碰撞点
+    if err then
+        floorErr = err
+        out("!! 地面探测（LineTraceSingle）用不了，传送防虚空退回只看高度：%s", err)
+        return nil
+    end
+    return false
 end
 
 -- ============================================================ §92 蓄力招探针（只读，不改玩法）
@@ -3174,10 +3519,59 @@ local function tagsMatching(actor, list)
     return hit
 end
 
+-- §162 替身"放不出招"诊断（11-08 内测：重连后新建的替身整场放招全返回 false、锁不上、刀碰不到）：
+-- 一次性读出可能挡住它的东西，拼成一行日志。只读
+local PUP_DIAG_TAGS = { "CharacterState.Dead", "CharacterState.Unselectable", "CharacterState.Stand.Invulnerable",
+                        "Hitreact.State.Frozen", "CharacterState.StatusInfliction.Frost.Effect", "CharacterState.CanNotBeExecuted",
+                        "Dash.Cooldown", "State.Stun", "CharacterState.Stun" }
+-- 还读 Mesh.VisibilityBasedAnimTickOption / bNoSkeletonUpdate、Controller
+-- 【适配】actor.bHidden、GetActorEnableCollision()、Mesh:IsVisible()、Mesh:GetAnimInstance()、CharacterMovement.MovementMode、ASC:HasMatchingGameplayTag
+local function puppetDiag(pup)
+    if not valid(pup) then return "替身无效" end
+    local p = {}
+    local function add(k, f)
+        local ok, v = pcall(f)
+        p[#p + 1] = k .. "=" .. (ok and tostring(v) or "?")
+    end
+    add("隐藏", function() return pup.bHidden end)
+    add("碰撞", function() return pup:GetActorEnableCollision() end)
+    local m = rawProp(pup, "Mesh")
+    add("模型", function() return valid(m) end)
+    if valid(m) then
+        add("模型可见", function() return m:IsVisible() end)
+        add("动画更新方式", function() return m.VisibilityBasedAnimTickOption end)
+        add("不更新骨骼", function() return m.bNoSkeletonUpdate end)
+    end
+    add("动画实例", function() return animOf(pup) ~= nil end)
+    add("移动模式", function() return rawProp(rawProp(pup, "CharacterMovement"), "MovementMode") end)
+    add("控制器", function() return short(pathOf(rawProp(pup, "Controller"))) end)
+    add("ASC", function() return valid(ascOf(pup)) end)
+    local hit = tagsMatching(pup, PUP_DIAG_TAGS)
+    p[#p + 1] = "标签=" .. (hit and (#hit > 0 and table.concat(hit, ",") or "无") or "读不到")
+    return table.concat(p, " ")
+end
+
+-- §162 坏掉的替身：藏起来、停移动、关碰撞（同 removePuppet），但不放进 npcStore —— 以后永远不复用它。
+-- 销毁玩家类角色会崩（v0.11.0），只能留在原地。控制器也不复用（新建替身时会再生成一个）
+-- 【适配】同 removePuppet：DisableMovement + SetActorHiddenInGame + SetActorEnableCollision(false)
+local function discardPuppet()
+    local pup = puppet()
+    if valid(pup) then
+        local cm = rawProp(pup, "CharacterMovement")
+        if valid(cm) then pcall(function() cm:DisableMovement() end) end
+        pcall(function() pup:SetActorHiddenInGame(true) end)
+        pcall(function() pup:SetActorEnableCollision(false) end)
+        out("替身已作废（藏起、不再复用）：%s", short(pathOf(pup)))
+    end
+    if ST.npcStore and sameObj(ST.npcStore, pup) then ST.npcStore, ST.npcCtl = nil, nil end
+    ST.secondPC, ST.secondPawn, ST.abList, ST.abIdx, ST.pupWeapon, ST.bareTest = nil, nil, nil, 0, nil, nil
+    ST.watch.pup = {}
+end
+
 return {
-    tagsMatching = tagsMatching,
+    tagsMatching = tagsMatching, puppetDiag = puppetDiag, discardPuppet = discardPuppet,
     montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = holdTaskProbe, inputEnsure = inputEnsure, worldTime = worldTime, linkAbilityInput = linkAbilityInput, inputHold = inputHold, inputHoldDump = inputHoldDump,
-    teleportTo = teleportTo, laserBeamSpawn = laserBeamSpawn, aimComps = aimComps, destroyComps = destroyComps, rotateComps = rotateComps, setControlRot = setControlRot, compRotStr = compRotStr, bulletSubsysProbe = bulletSubsysProbe, findObj = findObj, countBullets = countBullets, bulletScan = bulletScan, bulletWhere = bulletWhere,
+    teleportTo = teleportTo, traceHit = traceHit, traceActor = traceActor, actorInfo = actorInfo, setHidden = setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = laserBeamSpawn, aimComps = aimComps, destroyComps = destroyComps, rotateComps = rotateComps, setControlRot = setControlRot, compRotStr = compRotStr, bulletSubsysProbe = bulletSubsysProbe, findObj = findObj, countBullets = countBullets, bulletScan = bulletScan, bulletWhere = bulletWhere,
     laserEmitterSpawn = laserEmitterSpawn, emitterInfo = emitterInfo, moveEmitter = moveEmitter, destroyActor = destroyActor,
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
@@ -3194,7 +3588,7 @@ return {
     activeMontage = activeMontage, montageSetPos = montageSetPos, montageNotifies = montageNotifies, attrAll = attrAll,
     bossBarShow = bossBarShow, bossBarHide = bossBarHide, bossBarOf = bossBarOf, bossBarSet = bossBarSet, bossBarDiag = bossBarDiag,
     bossBarShachiShow = bossBarShachiShow, weaponUiRefresh = weaponUiRefresh, attrModProbe = attrModProbe, attrModSet = attrModSet, attrDiff = attrDiff,
-    weaponLevel = weaponLevel, saveVeto = saveVeto, geSet = geSet,
+    weaponLevel = weaponLevel, saveVeto = saveVeto, geSet = geSet, geCounts = geCounts, geMods = geMods,
     forcedApply = forcedApply, forcedRestore = forcedRestore, forcedActive = forcedActive, weaponSnapped = weaponSnapped,
     loadoutLists = loadoutLists, loadoutPush = loadoutPush, loadoutPop = loadoutPop, loadoutSnapshot = loadoutSnapshot,
     accEquipped = accEquipped, accAssemble = accAssemble, objCounts = objCounts,

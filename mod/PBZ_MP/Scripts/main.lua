@@ -21,7 +21,7 @@
 
 local UEHelpers = require("UEHelpers")
 
-local VERSION = "0.30.2"
+local VERSION = "0.30.3"
 local TAG = "[PBZ_MP] "
 -- v0.14.0：所有文件都放在模组自己的目录（…/Mods/PBZ_MP/），不再写死本机的游戏路径，别人的电脑上也能用。
 -- 从本脚本的路径推出模组目录（脚本在 PBZ_MP/Scripts/main.lua）；拿不到时退回 UE4SS 的工作目录（游戏 exe 所在的 platform/steam）下的相对路径
@@ -462,7 +462,18 @@ end
 -- 每 TRY 秒放回走路试一次，再往下掉就再悬空；落地站住 OK 秒算地形到了；最多 MAX 秒。
 -- pos 可以是坐标，也可以是返回坐标的函数（替身跟着对方现在的网络位置）
 -- 全局（主代码块的 local 已满 200 个）
-HOV = { list = {}, FAR = 5000.0, DROP = 300.0, TRY = 1.0, OK = 1.5, MAX = 30.0, logs = 0, n = 0, unhid = 0 }
+-- §168 线上反馈"传送太容易掉虚空"：以前悬空 TRY 秒就放下来试，MAX 秒后不管了直接放手 → 落点下面真没地（两边存档进度不同、
+-- 主机脚下在你这边是空的 / 悬崖边）就一直掉。现在放下来之前先探地（G.floorBelow 往下 DEPTH 打射线）：
+--   下面没地 → 接着悬空；hold 时给了 alts（旁边的备选点）就看备选点有没有地，有就换过去；
+--   MAX 秒还没地、给了 back（传送前站稳的地方）→ 放回 back 再等一轮；back 也没地才按以前放手。
+--   探地用不了（nil）或者 GROUND 发现探地对脚下站着的地也说没有（noFloor）→ 按以前的做法
+HOV = { list = {}, FAR = 5000.0, DROP = 300.0, TRY = 1.0, OK = 1.5, MAX = 30.0, DEPTH = 1000.0, logs = 0, n = 0, unhid = 0 }
+
+-- 探地：true / false / nil（不知道）。noFloor = 探地不可信，一律当不知道
+function HOV.floor(actor, p, depth)
+    if HOV.noFloor or not (G.floorBelow and p) then return nil end
+    return G.floorBelow(actor, p, depth or HOV.DEPTH)
+end
 
 function HOV.posOf(e)
     if type(e.pos) == "function" then return e.pos() end
@@ -478,13 +489,13 @@ function HOV.log(fmt, ...)
     if HOV.logs <= 40 then out(fmt, ...) end
 end
 
--- 放到 pos（抬高 20）并悬空
-function HOV.hold(actor, pos, why, tn)
+-- 放到 pos（抬高 20）并悬空。opt（§168，可不给）：back = 等不到地时放回的点；alts = 落点没地时换过去的备选点
+function HOV.hold(actor, pos, why, tn, opt)
     if not valid(actor) then return end
     local key = pathOf(actor)
     local e = HOV.list[key]
     if not e then
-        e = { actor = actor, pos = pos, why = why, since = tn, tries = 0 }
+        e = { actor = actor, pos = pos, why = why, since = tn, tries = 0, back = opt and opt.back, alts = opt and opt.alts }
         HOV.list[key] = e
         HOV.n = HOV.n + 1
     end
@@ -500,14 +511,43 @@ function HOV.step(tn)
     for key, e in pairs(HOV.list) do
         if not valid(e.actor) then
             HOV.list[key] = nil
+        elseif tn - e.since > HOV.MAX and e.back then
+            -- §168 落点等了 MAX 秒还没站住：放回传送前站稳的地方（那里一定有地），再等一轮
+            local b = e.back
+            e.pos, e.back, e.alts, e.since, e.tries = b, nil, nil, tn, 0
+            HOV.log("!! %s：%.0f 秒了落点下面还是没地（那里在你的世界里可能是虚空），放回传送前站的地方 (%.0f, %.0f, %.0f)",
+                e.why, HOV.MAX, b.X, b.Y, b.Z)
+            e.why = e.why .. "（放回原处）"
+            HOV.hold(e.actor, b, e.why, tn)
         elseif tn - e.since > HOV.MAX then
             HOV.list[key] = nil
             G.hover(e.actor, false)
             HOV.log("!! %s：%.0f 秒了地形还是没站住，不再悬空（放回 %d 次）", e.why, HOV.MAX, e.tries)
         elseif e.flying then
             if tn >= e.next then
-                G.hover(e.actor, false)
-                e.flying, e.okAt = false, tn + HOV.OK
+                -- §168 下面没地就先别放下来；有备选点有地就换过去
+                local p = HOV.posOf(e)
+                local fl = HOV.floor(e.actor, p)
+                if fl == false and e.alts then
+                    for _, a in ipairs(e.alts) do
+                        if HOV.floor(e.actor, a) == true then
+                            e.pos, fl = a, true
+                            pcall(function() e.actor:K2_SetActorLocation({ X = a.X, Y = a.Y, Z = a.Z + 20.0 }, false, {}, true) end)
+                            HOV.log("%s：落点下面没地，换到旁边有地的点 (%.0f, %.0f, %.0f)", e.why, a.X, a.Y, a.Z)
+                            break
+                        end
+                    end
+                end
+                if fl == false then
+                    e.next = tn + HOV.TRY
+                    if not e.saidNoFloor then
+                        e.saidNoFloor = true
+                        HOV.log("%s：落点下面还没有地，接着悬空", e.why)
+                    end
+                else
+                    G.hover(e.actor, false)
+                    e.flying, e.okAt = false, tn + HOV.OK
+                end
             end
         else
             local loc = try("hov loc", function() return e.actor:K2_GetActorLocation() end)
@@ -521,6 +561,40 @@ function HOV.step(tn)
             end
         end
     end
+end
+
+-- §168 本机角色最近一次站稳的地方（在地上走、不在悬空、连着 STAND 秒）：传送后落点没地 / 掉下去时放回这里。
+-- 换地图就作废（GROUND.get 按地图名取）。站稳时每 CHECK 秒顺便探一次脚下：探地说"没地"= 探地不可信（射线打不到这游戏的地面），
+-- HOV.noFloor 关掉所有探地判断，按以前只看高度
+GROUND = { last = nil, map = nil, since = nil, STAND = 1.0, CHECK = 5.0, checkAt = 0.0, ok = 0 }
+
+function GROUND.step(p1, tn)
+    if tn < (GROUND.nextAt or 0) then return end
+    GROUND.nextAt = tn + 0.25
+    if not valid(p1) or HOV.has(p1) or (ST.spec and ST.spec.on) then GROUND.since = nil; return end
+    local st = G.airOf(p1)
+    if not st or st.falling or (st.mode and st.mode ~= 1 and st.mode ~= 2) then GROUND.since = nil; return end
+    local loc = try("ground loc", function() return p1:K2_GetActorLocation() end)
+    if not loc then return end
+    if not GROUND.since then GROUND.since = tn; return end
+    if tn - GROUND.since < GROUND.STAND then return end
+    GROUND.last, GROUND.map = { X = loc.X, Y = loc.Y, Z = loc.Z }, mapName(p1)
+    if not HOV.noFloor and tn >= GROUND.checkAt then
+        GROUND.checkAt = tn + GROUND.CHECK
+        local fl = HOV.floor(p1, loc, 400.0)
+        if fl == false then
+            HOV.noFloor = true
+            out("!! 地面探测对脚下站着的地也说没地，不可信，传送防虚空退回只看高度（%.0f, %.0f, %.0f）", loc.X, loc.Y, loc.Z)
+        elseif fl == true and GROUND.ok == 0 then
+            GROUND.ok = 1
+            out("地面探测可用（脚下有地）")
+        end
+    end
+end
+
+function GROUND.get(map)
+    if GROUND.last and GROUND.map == map then return { X = GROUND.last.X, Y = GROUND.last.Y, Z = GROUND.last.Z } end
+    return nil
 end
 
 -- 替身：每次驱动后看一眼。对方在地上（不在空中）、替身却比对方的网络位置低 DROP 以上还在往下掉 → 悬空跟着对方；
@@ -638,6 +712,7 @@ function NPM.frame()
     local cur = try("pup loc", function() return pup:K2_GetActorLocation() end)
     if not cur then return end
     local xy, snap = NPM.stepXY(cur, NPM.aim(tn), dt)
+    if snap and PHEAL.young(pup) and (xy.X - cur.X) ^ 2 + (xy.Y - cur.Y) ^ 2 > HOV.FAR ^ 2 then return end   -- §162 刚造的先别扔远处
     local z = cur.Z
     if NPM.rair ~= true and math.abs((NPM.pos.Z or z) - cur.Z) > NPM.Z_SNAP then z, snap = NPM.pos.Z + 20.0, true end
     pcall(function() pup:K2_SetActorLocation({ X = xy.X, Y = xy.Y, Z = z }, false, {}, snap) end)
@@ -683,6 +758,8 @@ local function drivePuppet(pup, pos, vel, yaw)
             ST.holdLogAt = now()
             out("替身出招中，离网络位置 %.0f，先不瞬移（出招后 %.1f 秒内 > %.0f 才瞬移；第 %d 次）", dist, ATK_HOLD, SNAP_ATK, ST.heldSnaps)
         end
+    elseif dist > HOV.FAR and PHEAL.young(pup) then
+        return dist     -- §162 刚造的替身先在你身边待 WARM 秒，再瞬移到远处
     elseif dist > (attacking and SNAP_ATK or SNAP_DIST) or stuck then
         ST.lagSince = nil
         pcall(function() pup:K2_SetActorLocation({ X = pos.X, Y = pos.Y, Z = pos.Z + 20.0 }, false, {}, true) end)
@@ -912,6 +989,7 @@ function LO.rescale(pup, tn)
     end
     if lwhy and lwhy ~= LO.stdWhy then LO.stdWhy = lwhy; out("%s：替身等级系数 ×%.2f（%s）", lname, lf, lwhy) end
     STD.tick(tn)
+    ACC.tick(tn)                 -- §170.1
     LO.apply(pup, NET.ratt)
 end
 
@@ -1018,6 +1096,7 @@ LO.removeGE, LO.weaponEffects, LO.wgePath = G.LO.removeGE, G.LO.weaponEffects, G
 LO.activeInstance, LO.funcsLike, LO.callNoArg, LO.callArgs = G.LO.activeInstance, G.LO.funcsLike, G.LO.callNoArg, G.LO.callArgs  -- §119 紫冥剑实验 / §139.4
 LO.propsLike, LO.targetingComp, LO.tcSetLock = G.LO.propsLike, G.LO.targetingComp, G.LO.tcSetLock
 LO.paramTypes, LO.lockCandidates, LO.paramList, LO.tcStop = G.LO.paramTypes, G.LO.lockCandidates, G.LO.paramList, G.LO.tcStop
+LO.clearAbility, LO.giveClass, LO.loadObject = G.LO.clearAbility, G.LO.giveClass, G.LO.loadObject      -- §170 饰品换级 / §165.6 动画探针
 LO.spawnFx, LO.fxOn = G.LO.spawnFx, G.LO.fxOn
 
 function LO.short(path) return path and (path:match("([^.]+)$") or path) or "-" end
@@ -1133,9 +1212,10 @@ function LO.dress(pup, p1)
     local cwc = rawProp(pup, "Character Weapons Component")
     if not valid(cwc) then return end
     LO.stMain, LO.stShachi = LO.stMain or {}, LO.stShachi or {}
-    LO.dressSlot(pup, p1, cwc, LO.slot(), NET.rwc, "武器", LO.stMain)
+    local hold = LO.swtHolding(pup)     -- §166 切刀斩那把在另一格、技能还没切过去：主武器两格都先不动
+    if not hold then LO.dressSlot(pup, p1, cwc, LO.slot(), NET.rwc, "武器", LO.stMain) end
     LO.dressSlot(pup, p1, cwc, LO.slotShachi(), NET.rwcs, "影之武装", LO.stShachi)
-    LO.dressOff(pup, cwc)
+    if not hold then LO.dressOff(pup, cwc) end
     if NET.rwc and NET.rarm ~= nil and LO.armed(pup) ~= NET.rarm then
         pcall(function() cwc:SetArmed(LO.slot(), NET.rarm) end)
     end
@@ -1185,6 +1265,15 @@ function LO.encodeWge(p1)
         LO.wgeLogs = true
         out("我的武器效果（发给对方的 wge=）：%s", list and (#list > 0 and table.concat(list, " ") or "（无）") or "读不到 ActiveGameplayEffects")
     end
+    -- §163 影之武装的升级（只在装着时挂）变了就记一行（前 20 次），实测看贪狼铸魂 GE_TanLang_Evolution 发没发出去
+    local sq = {}
+    for _, id in ipairs(list or {}) do if id:sub(1, 12) == "ShaqiWeapon/" then sq[#sq + 1] = id:sub(13) end end
+    sq = table.concat(sq, " ")
+    if list and sq ~= (LO.wgeSq or "") and (LO.wgeSqN or 0) < 20 then
+        LO.wgeSqN = (LO.wgeSqN or 0) + 1
+        out("我的影之武装升级（wge=）：%s", sq ~= "" and sq or "（无）")
+    end
+    if list then LO.wgeSq = sq end
     return list and table.concat(list, ",") or ""
 end
 
@@ -1221,7 +1310,8 @@ end
 function LO.syncPas(pup)
     if NET.rpas == nil then return end
     local std = STD.active()
-    local key = pathOf(pup) .. "|" .. NET.rpas .. (std and "|std" or "")
+    local accMode = ACC.mode()
+    local key = pathOf(pup) .. "|" .. NET.rpas .. (std and "|std" or "") .. "|acc" .. accMode
     if key == LO.pasKey then
         if LO.pasReportAt and ST.ticks >= LO.pasReportAt then
             LO.pasReportAt = nil
@@ -1235,8 +1325,11 @@ function LO.syncPas(pup)
     end
     LO.pasKey, LO.pasReportAt = key, ST.ticks + 60
     local want = {}
-    for n in NET.rpas:gmatch("[%w_]+") do want[n] = true end
-    if std then for _, n in ipairs(STD.TALENT_GA) do want[n] = true end end      -- §144 天赋按基准（饰品照对方的）
+    for n in NET.rpas:gmatch("[%w_]+") do                          -- §170.1 饰品按房间设置换级 / 失效
+        local t = ACC.pasName(n, accMode)
+        if t then want[t] = true end
+    end
+    if std then for _, n in ipairs(STD.TALENT_GA) do want[n] = true end end      -- §144 天赋按基准
     local asc = ascOf(pup)
     if not valid(asc) then return end
     local have, cleared = {}, {}
@@ -1517,6 +1610,142 @@ local function puppetAbMap(pup)
     return ST.abMap
 end
 
+-- §162 替身坏了自己换一个（11-08 内测，HANDOVER §162）：对方 16:07 重连，主机这边新建的替身从第一招起放招全返回 false
+-- （0/50、1/88、1/109），武器对、拔刀了、有这个技能、杀气满，"正在放"全是被动；同一个替身也锁不上、刀碰不到。
+-- 后来再重连走"替身复用"，拿回来的还是这个坏的。结果：对方打我全判落空（§155 放不出 = 落空）。
+-- 做法：远端的招在替身身上连续 N 次放不出、中间一次都没放出来过、跨了 SEC 秒以上 → 记一行诊断（G.puppetDiag），
+-- 驱动里把它作废（藏起、永不复用，销毁会崩）、新建一个。每次连接最多 MAX 次，两次之间至少 GAP 秒（防"不是替身坏了"时来回换）。
+-- 全局（主代码块 local 已满）
+PHEAL = { N = 8, SEC = 3.0, GAP = 30.0, MAX = 3, fails = 0, since = nil, want = nil, at = nil, n = 0, diagKey = nil }
+
+-- 远端招在替身上放完一次：ok = 放出来了没有；has = 替身有没有这个技能（没有的不算替身坏了）
+function PHEAL.note(pup, ok, has, name)
+    if ok then PHEAL.fails, PHEAL.since = 0, nil; return end
+    if not has then return end
+    PHEAL.fails = PHEAL.fails + 1
+    PHEAL.since = PHEAL.since or now()
+    local key = pathOf(pup)
+    if PHEAL.diagKey ~= key then      -- 每个替身第一次放不出就记一行状态（之后靠 failN 的那三行）
+        PHEAL.diagKey = key
+        out("  替身状态（第一次放不出 %s）：%s", name, G.puppetDiag(pup))
+    end
+    if PHEAL.want or PHEAL.fails < PHEAL.N or now() - PHEAL.since < PHEAL.SEC then return end
+    if PHEAL.n >= PHEAL.MAX then
+        if PHEAL.fails == PHEAL.N then out("!! 替身连续 %d 招放不出，但这次连接已经换过 %d 个替身，不再换", PHEAL.fails, PHEAL.n) end
+        return
+    end
+    if PHEAL.at and now() - PHEAL.at < PHEAL.GAP then return end
+    PHEAL.want = string.format("连续 %d 招放不出（%.1f 秒，最后一招 %s）", PHEAL.fails, now() - PHEAL.since, name)
+end
+
+-- 预防（猜测，没复现过）：坏掉的那个替身是新建出来后同一秒就被瞬移到 120 km 外、地形没加载的地方（§99 悬空），
+-- 16:02 那次没扔远处的新替身是好的。新替身（按对象路径第一次见到算）在本机玩家身边先待 WARM 秒、动画跑起来，再去远处。
+-- 只挡 > HOV.FAR 的远距离瞬移，近处跟随照常
+PHEAL.WARM, PHEAL.born = 2.0, {}
+function PHEAL.young(pup)
+    local key = pathOf(pup)
+    local t = PHEAL.born[key]
+    if not t then
+        PHEAL.born[key] = now()
+        out("替身 %s 第一次要瞬移到远处：先在你身边待 %.0f 秒（§162）", short(key), PHEAL.WARM)
+        return true
+    end
+    return now() - t < PHEAL.WARM
+end
+
+-- 新连接（对手断开后重连 / 换了对手）：次数重新算
+function PHEAL.reset()
+    PHEAL.fails, PHEAL.since, PHEAL.want, PHEAL.at, PHEAL.n = 0, nil, nil, nil, 0
+end
+
+-- 驱动里调（不在放招的调用栈里换替身：调用方放完招还要用 pup）
+function PHEAL.step()
+    if not PHEAL.want then return end
+    local why = PHEAL.want
+    PHEAL.want = nil
+    local pup = puppet()
+    if not valid(pup) or not MATCH.autoCreate then return end
+    out("!! 替身坏了：%s；状态 %s → 作废，新建一个（这次连接第 %d 次）", why, G.puppetDiag(pup), PHEAL.n + 1)
+    G.discardPuppet()
+    MATCH.autoCreate()
+    PHEAL.n, PHEAL.at, PHEAL.fails, PHEAL.since, PHEAL.diagKey = PHEAL.n + 1, now(), 0, nil, nil
+end
+
+-- §165.4 切刀斩到的时候，状态包里的 wc=（手上 WeaponConfig）还是切之前那把（w= 已经是新的），替身照它把刀又换回去 →
+-- 切刀斩被打断、补放也放不出（11-08 双开：GA_Hun_HeiMoShang_SWT_C 先放出来，同一帧"替身换装 → 白影"）。
+-- 按招名认出切到哪把（武器组里两格挑名字对得上的），1.5 秒内收到的 wc= 都按这把算
+-- §166 切刀斩 = "切到这把并出招"：父类 BP_SwitchAttack_Base 的 K2_CanActivateAbility 调 BPL_PBZCombatUtils 的
+-- Can Active Switch Attack（GetChangeWeaponAbilityWeapon 找这招属于武器组哪一格、和 GetCurrentWeapon 的当前序号比、
+-- 再看切武器冷却），放出来后 Change Weapon By Ability 自己切过去。所以这把必须在**另一格**：§165.4 把它装进当前格，
+-- 两格就只剩"当前格 = 这把、另一格 = 别的"，11-08 20:08–20:12 双开 13 次切刀斩里，切之前另一格恰好也是这把的 2 次
+-- （风雷剑、黑魔伤）放出来了，其余全 false。现在改成装进另一格、当前格不动，让技能自己切
+LO.SWT_ALIAS = { Chaos = { "CiGuHunDun" }, BronzeSword = { "TianXuanQingTongJian" }, Double = { "Double", "JueYing" },
+                 ChiZheCanJian = { "ChiZheCanJian", "ChiZheZuiJian" }, ZhanMa = { "ZhanMaBlade" } }
+-- 招名 → 用来认武器配置名的关键词：先查整段族名（ChiZheCanJian），再查第一段（ZiMingJian_New → ZiMingJian、
+-- ShuangYue_DB → ShuangYue、Chaos_SwitchFormFire → Chaos 的别名）
+function LO.swtKeys(n)
+    local fam = n:match("^GA_Hun_(.-)_SWT")
+    if not fam then return nil end
+    local fam1 = fam:match("^([^_]+)") or fam
+    return LO.SWT_ALIAS[fam] or LO.SWT_ALIAS[fam1] or (fam1 ~= fam and { fam, fam1 }) or { fam }
+end
+
+-- §166 把切刀斩那把装进替身武器组的另一格（当前格不动）。返回 另一格序号 或 nil, 原因
+function LO.swtStage(pup, cfg)
+    local slot = LO.slot()
+    local cur = LO.curIndex(pup, slot)
+    if not cur then return nil, "读不到当前序号" end
+    local other = math.max(cur, 0) == 0 and 1 or 0
+    local ok, err = LO.setSlot(pup, slot, other, cfg)
+    if not ok then return nil, err end
+    LO.offKey = nil                 -- 另一格被改了：切完 / 没切成，LO.dressOff 都按对方的另一把重装
+    return other
+end
+
+-- 返回 true = 已把这把装进另一格（之后放不出要调 LO.swtUnhold 让换装恢复）
+function LO.swtPin(pup, n)
+    local keys = LO.swtKeys(n)
+    if not keys then return end
+    -- 先看替身见过的两格；对方组里另一把可能从没拿过（11-08 实测白影），再查标准数值装备表的 30 级 / 铸魂配置、原配置
+    local cands, G_ = {}, STD.GEAR and STD.GEAR.MAIN or {}
+    local function add(c) if c then cands[#cands + 1] = c end end
+    add(NET.rwcCur); add(NET.rwcOff); add(NET.rwc)
+    for _, g in pairs(G_) do add(g.cfg) end
+    for _, g in pairs(G_) do add(g.base) end
+    for _, cfg in ipairs(cands) do do
+        local sh = cfg and LO.short(cfg) or ""
+        for _, k in ipairs(keys) do
+            if sh:find(k, 1, true) then
+                NET.rwcPin = { cfg = cfg, t = now() + 1.5 }
+                NET.rwc = cfg
+                local other, why = LO.swtStage(pup, cfg)
+                ST.swtPin = (ST.swtPin or 0) + 1
+                if other then
+                    -- 技能切过去之前别让 LO.dress 把这把装进当前格 / 把另一格换回去（切过去后手上 = 这把，换装自然不动）
+                    LO.swtHold = { cfg = cfg, t = now() + 1.0 }
+                    if ST.swtPin <= 10 then out("  切刀斩 %s：%s 装进另一格（序号 %d），让技能自己切过去（第 %d 次）", n, sh, other, ST.swtPin) end
+                    return true
+                end
+                -- 装不进另一格：退回 §165.4 的老办法（当前格直接换上）
+                LO.swtHold = nil
+                pcall(LO.dress, pup, getP1())
+                if ST.swtPin <= 10 then out("  切刀斩 %s：另一格装不上（%s），当前格先换上 %s（第 %d 次）", n, tostring(why), sh, ST.swtPin) end
+                return
+            end
+        end
+    end end
+end
+
+function LO.swtUnhold() LO.swtHold = nil end
+
+-- §166 换装要不要先等切刀斩自己切过去：手上还不是那把、1 秒内 → 先不动
+function LO.swtHolding(pup)
+    local h = LO.swtHold
+    if not h then return false end
+    if now() >= h.t or LO.heldConfig(pup) == h.cfg then LO.swtHold = nil; return false end
+    return true
+end
+
 -- 在替身身上激活技能（回放、网络共用）。sub = 本次会话的"武器不匹配替代表"
 activateOnPuppet = function(pup, n, sub, how)
     local asc, map = ascOf(pup), puppetAbMap(pup)
@@ -1533,6 +1762,12 @@ activateOnPuppet = function(pup, n, sub, how)
         return ok and r == true
     end
     local use = sub[n] or n
+    local staged = false
+    if use:find("_SWT", 1, true) then
+        local okP, r = pcall(LO.swtPin, pup, use)
+        staged = okP and r == true
+        if staged then ST.abMapKey = nil; map = puppetAbMap(pup) end      -- §166 另一格换了武器，技能表跟着变
+    end
     local okFire = fire(use)
     -- v0.23.4 替代不能一直粘着：2026-11-04 23:46:58 双刃切刀斩第一次被换成斩马刀的成功了，之后 13/14 次都是直接放斩马刀的、
     -- 失败也不回头试原招。替代失败（或替身后来换上了对方的武器）就回到原招，原招成了把替代清掉
@@ -1601,6 +1836,7 @@ activateOnPuppet = function(pup, n, sub, how)
     -- §157 切刀斩（*_SWT）和对方的 w= 同一个包到：替身换装每 8 帧才轮一次，这时手上还是上一把，SWT 放不出。
     -- 先当场换装再放一次（11-08 双开实测：GA_Hun_Double_SWT_C 比"替身换装 → 绝影"早约 1 秒，放不出）
     if not okFire and use:match("_SWT_C$") then
+        LO.swtUnhold()                  -- §166 装进另一格也没放出来：放开换装，走老办法（当前格也换上）
         local p1 = getP1()
         if valid(p1) and pcall(LO.dress, pup, p1) and fire(use) then
             okFire = true
@@ -1618,11 +1854,24 @@ activateOnPuppet = function(pup, n, sub, how)
         end
     end
     pupAction(use, how .. " 返回=" .. tostring(okFire))
+    if tostring(how):match("^远端#%d+$") then PHEAL.note(pup, okFire, map[use] ~= nil, use) end     -- §162 只算第一次放（不算补放 / 续放）
     -- v0.23.4 放不出来时记下替身当时的状态（每招前 3 次），下一轮按这个找原因：手上武器、技能在不在、杀气、在放什么
     if not okFire then
         ST.failN = ST.failN or {}
         ST.failN[use] = (ST.failN[use] or 0) + 1
         if use:match("_Stance_C$") then LO.offKey = nil end     -- v0.26.1 架势放不出：另一格可能被蓝图改回去了，下一轮重装（§76）
+        -- §166 切刀斩装进另一格还是放不出：剩下的门槛多半是切武器冷却（Can Active Switch Attack 里 GetCurrentChangeWeaponCooldown），
+        -- 记一次武器组件上和冷却 / 切武器有关的函数，下次按它查
+        if staged and not ST.swtDiag then
+            ST.swtDiag = true
+            local cwc = rawProp(pup, "Character Weapons Component")
+            local fs = {}
+            for _, pat in ipairs({ "Cooldown", "ChangeWeapon", "SwitchWeapon" }) do
+                for _, f in ipairs(valid(cwc) and LO.funcsLike(cwc, pat) or {}) do fs[#fs + 1] = f end
+            end
+            out("  切刀斩 %s 装进另一格也放不出；当前序号 %s；武器组件相关函数：%s", use, tostring(LO.curIndex(pup, LO.slot())),
+                #fs > 0 and table.concat(fs, " ") or "（没有）")
+        end
         if ST.failN[use] <= 3 then
             local act = {}
             for a in pairs(activeAbilities(pup) or {}) do act[#act + 1] = a end
@@ -1818,7 +2067,7 @@ end
 -- §108 med = 血瓶（喝药，默认开 = 原版；用户 2026-11-06"房间设置里可以做不能使用血瓶的功能么"）
 -- §128.2 npos = 对手位置严格跟随（开 = §128.1 全程跟网络位置、动画不带位移，默认；关 = 动画带位移 + §128 冲过头停住）。
 --   伤害在挨打方本机判、替身位置影响挨不挨打，所以两边要一致（用户 2026-11-06"改成房主设置吧"）；状态包键 npos=
--- §144 std = 标准数值（双方按基准存档的属性 / 天赋 / 30 级武器打，默认关；武林盟主服务器不发 std= 就是关）
+-- §144 std = 标准数值（双方按基准存档的属性 / 天赋 / 30 级武器打，默认关；武林盟主按服务器的 std=，不发就是关，§169）
 NET.FLAG_KEYS, NET.FLAG_DEF = { "ctr", "bal", "med", "npos", "std" }, { ctr = 1, bal = 0, med = 1, npos = 1, std = 0 }
 NET.flagCfg, NET.rflag = { ctr = 1, bal = 0, med = 1, npos = 1, std = 0 }, {}
 -- §144.1 锁住不让开的设置（用户 2026-11-07"完全平衡功能先锁定成不可打开"）：面板不显示、读到 1 也当关、发出去恒为 0
@@ -1849,7 +2098,6 @@ function NET.flag(k)         -- 房间设置：主机 / 没联机 = 自己的，
     if NET.FLAG_LOCKED[k] then return false end     -- §144.1 锁住的：谁设成开都当关（包括旧版主机发来的 std=1）
     local rk = NET.rkRules()                 -- §110 武林盟主：服务器定的
     if rk and rk[k] ~= nil then return rk[k] == 1 end
-    if rk and k == "std" then return false end      -- §144 排位：服务器没定标准数值就是关，不跟主机
     if (MATCH.session and MATCH.session.role) == "client" then
         local r = NET.rflag[k]
         if r == nil then r = NET.FLAG_DEF[k] end
@@ -1876,15 +2124,18 @@ end
 --   0 = 每场（默认）：一场对局只在第 1 回合开始时给，之后的回合接着用剩下的；1 = 每局：每个回合开始都重置成设定值
 -- §113.4 ultx = 精纯杀气获取倍率（百分比，只能取 RES_STEPS 里的值；用户"精纯杀气的获取倍率能加房间设置改么"）：
 --   对局中把自己的 UltimateChargeGainRateMultiplier（游戏的获取倍率属性，平时 1.0）设成 对局前的值 × ultx%，结束还原；每回合都写，不管每场 / 每局
-NET.RES_KEYS, NET.RES_DEF, NET.RES_MAX = { "ult0", "ultx", "sp0", "resm" }, { ult0 = 0, ultx = 100, sp0 = 3, resm = 0 },
-                                         { ult0 = 3, ultx = 300, sp0 = 6, resm = 1 }   -- §113.3 默认精纯杀气改 0
+NET.RES_KEYS, NET.RES_DEF, NET.RES_MAX = { "ult0", "ultx", "sp0", "resm", "acc" }, { ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 0 },
+                                         { ult0 = 3, ultx = 300, sp0 = 6, resm = 1, acc = 3 }   -- §170.1 acc = 饰品等级   -- §113.3 默认精纯杀气改 0
 NET.RES_STEPS = { ultx = { 0, 25, 50, 75, 100, 150, 200, 300 } }
 NET.RES_ATTR = { ult0 = "UltimateChargeCount", sp0 = "SpiritShadow" }
 NET.RES_NAME = { ult0 = { "开局精纯杀气", "STARTING ULTIMATE CHARGES" }, ultx = { "精纯杀气获取", "ULTIMATE CHARGE GAIN" },
-                 sp0 = { "开局暗源（影之武装）", "STARTING PHANTOM EDGE CHARGES" }, resm = { "开局资源", "STARTING RESOURCES" } }
+                 sp0 = { "开局暗源（影之武装）", "STARTING PHANTOM EDGE CHARGES" }, resm = { "开局资源", "STARTING RESOURCES" },
+                 acc = { "饰品", "ACCESSORIES" } }
 -- 值显示成文字的（其余显示数字）：{ 中文, 英文 }，调用方自己套 T()（T 在后面才定义）
-NET.RES_TEXT = { resm = { [0] = { "每场给一次", "ONCE PER MATCH" }, [1] = { "每局重置", "EVERY ROUND" } } }
-NET.resCfg, NET.rres = { ult0 = 0, ultx = 100, sp0 = 3, resm = 0 }, {}
+NET.RES_TEXT = { resm = { [0] = { "每场给一次", "ONCE PER MATCH" }, [1] = { "每局重置", "EVERY ROUND" } },
+                 acc = { [0] = { "原样", "AS EQUIPPED" }, [1] = { "未强化", "UNREFINED" },
+                         [2] = { "强化满", "FULLY REFINED" }, [3] = { "失效", "DISABLED" } } }
+NET.resCfg, NET.rres = { ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 0 }, {}
 function NET.resValid(k, n)
     if n == nil or n ~= math.floor(n) then return false end
     if NET.RES_STEPS[k] then
@@ -2234,12 +2485,39 @@ function STD.addTalents(actor, label)
     return added
 end
 -- 自己的属性写成基准（第一次碰到的属性记下对局前的值）；health = true 时顺手回满血（回合开始）
+-- §170.5 饰品从标准数值里拿出来（用户 11-09"不如彻底把饰品从标准数值里提出来"）：锁的 7 个属性 = 基准 + 身上饰品给的
+-- （加的先加、乘的后乘；读饰品效果自己的 Modifiers）。以前直接锁基准，加血 / 加攻击的饰品在标准数值里不起作用
+function STD.accBonus(p1)
+    local add, mul, madd, parts = {}, {}, {}, {}
+    for _, e in ipairs(G.geMods(p1, function(n) return n:find("_Accessory_", 1, true) ~= nil end) or {}) do
+        for _, md in ipairs(e.mods) do
+            if STD.ATTR[md.a] then
+                if md.op == 0 then add[md.a] = (add[md.a] or 0) + md.v
+                elseif md.op == 1 then madd[md.a] = (madd[md.a] or 0) + (md.v - 1)      -- MultiplyAdditive：几个 ×1.25 是加起来（实测两份 = ×1.5）
+                elseif md.op == 4 then mul[md.a] = (mul[md.a] or 1) * md.v end         -- MultiplyCompound：连乘
+                parts[#parts + 1] = string.format("%s %s op%d %.3f", e.n, md.a, md.op, md.v)
+            end
+        end
+    end
+    local sig = table.concat(parts, "，")
+    if sig ~= STD.bonusSig then STD.bonusSig = sig; out("标准数值：饰品给锁定属性的加成：%s", sig ~= "" and sig or "（无）") end
+    for a, v in pairs(madd) do mul[a] = (mul[a] or 1) * (1 + v) end
+    return add, mul
+end
+-- §170.5 对局前的属性要在饰品换级（ACC.apply）之前记：倒计时里先调这个，writeAttrs 记 saved 时优先用它
+function STD.capture(p1)
+    if not (STD.active() and valid(p1)) or STD.pre then return end
+    STD.pre = {}
+    for _, a in ipairs(STD.ORDER) do STD.pre[a] = attrOf(p1, a) end
+end
 function STD.writeAttrs(p1, health)
     local parts = {}
+    local okB, add, mul = pcall(STD.accBonus, p1)
+    if not okB then add, mul = {}, {} end
     for _, a in ipairs(STD.ORDER) do
-        local want, c = STD.ATTR[a], attrOf(p1, a)
+        local want, c = (STD.ATTR[a] + (add[a] or 0)) * (mul[a] or 1), attrOf(p1, a)
         if c then
-            if STD.saved and STD.saved[a] == nil then STD.saved[a] = c end
+            if STD.saved and STD.saved[a] == nil then STD.saved[a] = (STD.pre and STD.pre[a]) or c end
             if math.abs(c - want) > 0.01 then
                 NET.resWrite(p1, a, want)
                 parts[#parts + 1] = string.format("%s %.0f→%.0f（读回 %s）", a, c, want, tostring(attrOf(p1, a)))
@@ -2448,6 +2726,247 @@ function STD.gearOff(p1)
     end
     out("标准数值（装备）：摘掉 30 级效果 %d 个，换回原配置 %d 格%s", n, #slots, bad > 0 and ("（失败 " .. bad .. " 格）") or "")
 end
+-- ============================================================ §170 / §170.1 饰品等级（房间设置 acc=）
+-- 饰品效果的资源名带等级：GE_Accessory_<名>_LvN（加属性 / 触发后的增益）、GA_Accessory_* / BP_GA_Accessory_*_LvN_C（触发型被动）。
+-- Lv1 = 没精炼，Lv2 / Lv3 = 精炼 1 / 2 次。房间设置 acc（用户 11-09"饰品 初始 / 强化满 / 失效 可作为房间属性设置么"）：
+--   0 = 原样（各用各的；§170.5 起和标准数值无关）、1 = 未强化（一律 Lv1）、2 = 强化满（一律最高级）、3 = 失效（饰品效果、技能全摘）。
+-- 自己：每回合倒计时 / 开打时换（ACC.apply），对局中每 2 秒再查（触发出来的增益），回自由活动时换回（ACC.restore）。
+-- 替身：LO.syncPas 按同一规则换对方 pas= 里的饰品技能；加属性那部分随 att= 过来（对方按同一设置换过了）。
+-- 只改运行时，不动存档里的精炼等级。效果等级表从 IoStore 扫（游戏包 Accessories/New，Combo_DamageBuff 在 Combo 子目录）
+ACC = { DIR = "/PBZCombatAsset/Prototypes/GameplayEffects/Accessories/New/", COMBO = { Combo_DamageBuff = true }, GE_LV = {} }
+for b, l in ("ActHit:12 ActHitShachi:12 AnimMovement:12 Attack:12 BigHit:12 Bleed:12 Bleed_EnemyAmp:12 Bleed_PlayerBuff:12 BreakAttack:12 BreakDrink:12 BreakDrink_MaxShachi:2 BreakRecover:12 BreakRegen:12 BreakShield:12 Chaos:123 Combo:123 Combo_DamageBuff:123 Control:12 Counter:12 Counter_Effect:2 Deflect:12 Double:12 Drink:12 DrinkCost:12 EasyExecution:12 Electrified:12 ElementRegen:123 Elemental:12 ElementalResistance:12 EvadePhantom:12 Execution:12 ExecutionSwitchCool:12 Execution_Effect:2 Frost:12 Health:12 HealthResistance:123 HeavyAttackCost:12 HeavyAttackDamage:12 HeavyAttackShachi:12 Ignite:12 Long:12 Loot:12 LowHealth:12 LowShachi:12 MagicWeapon:123 MagicWeapon_SummonBerserk:123 MartialWeapon:123 PerfectFrame:123 PhysicalResistance:12 Poison:12 PoisonRegen:12 PowerWeapon:123 RandomDrink:123 RandomDrink_FireBreathe:123 RandomDrink_FullRegen:12 RandomDrink_GhostFire:123 RandomDrink_MaxShachi:12 RandomDrink_PoisonFog:123 RandomDrink_Shockwave:23 Ranged:12 RangedWeapon:123 Regen:12 ResistBleed:12 ResistFire:12 ResistIce:12 ResistNonBreak:12 ResistPoison:12 ResistRanged:12 ResistThunder:12 Resistance:12 Rider:12 Shachi:12 ShachiAttack:12 ShachiCool:12 ShachiRegen:12 ShachiWeapon:123 SpiritShadow:123 Stance:123 Stealth:12 Summon:123 SummonDuration:12 SwitchEndure:12 SwitchEndure_Endure:12 Tang:12 TimerEndure:12 TimerEndure_Cooldown:12 UltimateBreak:12 UltimateCharge:123"):gmatch("([%w_]+):(%d+)") do ACC.GE_LV[b] = l end
+function ACC.gePath(base, lv)
+    local n = "GE_Accessory_" .. base .. "_Lv" .. lv
+    return ACC.DIR .. (ACC.COMBO[base] and "Combo/" or "") .. n .. "." .. n .. "_C"
+end
+-- 这一局按哪种：0 原样 / 1 未强化 / 2 强化满 / 3 失效
+function ACC.mode()
+    local m = (MATCH.res and MATCH.res.acc) or NET.resOf("acc") or 0
+    return m
+end
+-- 名字 n 在 mode 下该换成什么：nil = 不动、false = 摘掉、字符串 = 换成这个名字
+-- n 可以是技能类名（…_LvN_C）或效果短名（GE_Accessory_…_LvN）
+function ACC.target(n, mode)
+    if mode == 0 or not n:find("_Accessory_", 1, true) then return nil end
+    if mode == 3 then return false end
+    local tail = n:sub(-2) == "_C" and "_C" or ""
+    local pre, lv = n:match("^(.-_Accessory_.+)_Lv(%d)" .. tail .. "$")
+    lv = tonumber(lv)
+    if not pre then return nil end                       -- 没等级的被动（如 BP_GA_Accessory_Ignite_Passive_C）：原样
+    local have                                          -- 某一级存不存在
+    if tail == "" then
+        local l = ACC.GE_LV[pre:sub(14)] or ""
+        have = function(k) return l:find(tostring(k), 1, true) ~= nil end
+    else
+        local idx = LO.index()
+        have = function(k) return idx and idx.map and idx.map[pre .. "_Lv" .. k .. "_C"] ~= nil end
+    end
+    if mode == 1 then
+        if lv <= 1 then return nil end
+        return have(1) and (pre .. "_Lv1" .. tail) or false   -- 没有 Lv1 = 只有精炼后才有：摘掉
+    end
+    for k = 3, lv + 1, -1 do                             -- mode 2：升到存在的最高级
+        if have(k) then return pre .. "_Lv" .. k .. tail end
+    end
+    return nil
+end
+-- 替身被动同步用：对方 pas= 里的一个名字 → 替身该给的名字（nil = 不给）
+function ACC.pasName(n, mode)
+    local t = ACC.target(n, mode)
+    if t == nil then return n end
+    return t or nil
+end
+-- 读 ASC 上全部技能格：返回 { {n=类短名, h=Handle, cls=类}, ... }，pick(n) 为真的才要
+function ACC.specs(asc, pick)
+    local specs = {}
+    eachArr(rawProp(rawProp(asc, "ActivatableAbilities"), "Items"), function(_, spec)
+        local ab = rawProp(spec, "Ability")
+        local okC, cls = false, nil
+        if valid(ab) then okC, cls = pcall(function() return ab:GetClass() end) end      -- 空对象不调 GetClass（v0.27.7）
+        local n = okC and shortName(full(cls)) or nil
+        if n and pick(n) then specs[#specs + 1] = { n = n, h = rawProp(rawProp(spec, "Handle"), "Handle"), cls = cls } end
+    end)
+    return specs
+end
+-- 倒计时 / 开打 / 对局中每 2 秒：按 ACC.mode() 换自己身上的饰品技能和效果。ACC.mine 记着换掉的东西，回自由活动时换回
+function ACC.apply(p1)
+    local mode = ACC.mode()
+    if mode == 0 or not valid(p1) then return end
+    local asc = ascOf(p1)
+    if not valid(asc) then return end
+    local mine = ACC.mine
+    local first = mine == nil
+    if first then mine = { ga = {}, gaGiven = {}, ge = {}, geAdded = {}, mode = mode }; ACC.mine = mine end
+    -- ① 技能（先换技能：它自己挂的效果跟着换，下面 ② 再看剩下的）
+    local swapped = {}
+    for _, s in ipairs(ACC.specs(asc, function(n) return not mine.gaGiven[n] and ACC.target(n, mode) ~= nil end)) do   -- 遍历完再清
+        if LO.clearAbility(asc, s.h) then
+            mine.ga[#mine.ga + 1] = { n = s.n, cls = s.cls }
+            local t = ACC.target(s.n, mode)
+            local tag = s.n .. "→"
+            if t then
+                LO.gaveTried = LO.gaveTried or {}
+                LO.gaveTried[pathOf(p1) .. "|" .. t] = nil          -- 自己身上每场可能要再给一次
+                local cls1 = LO.give(p1, t, {})
+                if cls1 then
+                    pcall(function() asc:TryActivateAbilityByClass(cls1, true) end)
+                    mine.gaGiven[t] = true
+                    tag = tag .. t:match("_Lv%d_C$")
+                else tag = tag .. "（给不了）" end
+            else tag = tag .. "（摘掉）" end
+            swapped[#swapped + 1] = tag
+        end
+    end
+    -- ② 效果：按份数换（§170.2 同一个效果可能生效两份，二周目饰品增伤实测 0.3 × 2；换成目标级也挂同样份数）
+    local cnt = G.geCounts(p1)
+    local geTags = {}
+    for n, c in pairs(cnt or {}) do
+        local t = ACC.target(n, mode)
+        if t ~= nil and not mine.geAdded[n] then          -- 我们自己挂的不再换
+            local base, lv = n:match("^GE_Accessory_(.+)_Lv(%d)$")
+            local path = base and ACC.gePath(base, lv) or (ACC.DIR .. n .. "." .. n .. "_C")
+            if LO.removeGE(p1, path, "饰品（" .. ACC.MODE_NAME[mode] .. "）：摘掉 " .. n .. " ×" .. c) and first then
+                mine.ge[#mine.ge + 1] = { path = path, n = n, c = c }          -- 只还开局时就在的（触发出来的临时增益不还）
+            end
+            local tag = n .. "×" .. c
+            if t then
+                local tb, tl = t:match("^GE_Accessory_(.+)_Lv(%d)$")
+                local tp = ACC.gePath(tb, tl)
+                for _ = 1, c - (cnt[t] or 0) do
+                    if LO.applyGE(p1, tp, "饰品（" .. ACC.MODE_NAME[mode] .. "）：挂 " .. t) then mine.geAdded[t] = tp end
+                end
+                tag = tag .. "→Lv" .. tl
+            else tag = tag .. "（摘掉）" end
+            geTags[#geTags + 1] = tag
+        end
+    end
+    if #swapped + #geTags > 0 then
+        out("饰品（%s）：技能 %s；效果 %s", ACC.MODE_NAME[mode], #swapped > 0 and table.concat(swapped, " ") or "-",
+            #geTags > 0 and table.concat(geTags, " ") or "-")
+    elseif first then
+        out("饰品（%s）：身上没有要换的", ACC.MODE_NAME[mode])
+    end
+end
+ACC.MODE_NAME = { [0] = "原样", [1] = "未强化", [2] = "强化满", [3] = "失效" }
+-- 回自由活动：摘掉我们给的、把换掉的技能和开局时就在的效果换回去
+function ACC.restore(p1)
+    local mine = ACC.mine
+    ACC.mine = nil
+    if not (mine and valid(p1)) then return end
+    local asc = ascOf(p1)
+    if not valid(asc) then return end
+    local cleared = 0
+    if next(mine.gaGiven) then
+        for _, s in ipairs(ACC.specs(asc, function(n) return mine.gaGiven[n] end)) do
+            if LO.clearAbility(asc, s.h) then cleared = cleared + 1 end
+        end
+    end
+    local nAdd = 0
+    for _, path in pairs(mine.geAdded) do LO.removeGE(p1, path, "饰品：摘掉对局里挂的"); nAdd = nAdd + 1 end
+    local back = 0
+    for _, g in ipairs(mine.ga) do                       -- 换掉几格还几格（原来同名两格的也还两格）
+        if valid(g.cls) and LO.giveClass(asc, g.cls) then back = back + 1 end
+    end
+    -- 效果补到开局前的份数（§170.2；还回的技能自己可能已经挂上了一部分，只补差的）
+    local now, nBack, short = G.geCounts(p1) or {}, 0, {}
+    for _, e in ipairs(mine.ge) do
+        for _ = 1, e.c - (now[e.n] or 0) do
+            if LO.applyGE(p1, e.path, "饰品：换回 " .. e.n) then nBack = nBack + 1 end
+        end
+    end
+    local after = G.geCounts(p1) or {}
+    for _, e in ipairs(mine.ge) do if (after[e.n] or 0) ~= e.c then short[#short + 1] = e.n .. " " .. (after[e.n] or 0) .. "/" .. e.c end end
+    out("饰品（%s）：换回——清掉对局技能 %d 个、摘对局效果 %d 个；还回技能 %d 个、效果 %d 份%s", ACC.MODE_NAME[mine.mode] or "?", cleared, nAdd, back, nBack,
+        #short > 0 and ("；!! 份数对不上：" .. table.concat(short, " ")) or "；份数和开局前一样")
+end
+-- §170.3 诊断：每次进世界后 1 / 3 / 10 / 30 / 60 秒记一次身上的饰品效果份数和饰品技能格数（查"每个饰品效果挂了两份"从哪来）
+ACC.DIAG_AT = { 0, 1, 3, 10, 30, 60 }
+function ACC.diag(p1, tn)
+    if ST.stableTicks == 1 then ACC.dg = { t0 = tn, i = 1, why = "进世界" } end
+    local pup = ST.secondPawn                        -- 新替身出来了也重新记一轮（实测：份数是在 AI 对手出来时变成两份的）
+    local pp = valid(pup) and pathOf(pup) or nil
+    if pp and pp ~= ACC.dgPup then ACC.dgPup = pp; ACC.dg = { t0 = tn, i = 1, why = "替身 " .. shortName(pp) .. " 出来" } end
+    local d = ACC.dg
+    if not d or d.i > #ACC.DIAG_AT or tn - d.t0 < ACC.DIAG_AT[d.i] then return end
+    local at = ACC.DIAG_AT[d.i]
+    d.i = d.i + 1
+    local ge, n = {}, 0
+    for k, c in pairs(G.geCounts(p1) or {}) do if k:find("_Accessory_", 1, true) then ge[#ge + 1] = k:gsub("^GE_Accessory_", "") .. "×" .. c; n = n + c end end
+    table.sort(ge)
+    local ga, m = {}, 0
+    local asc = ascOf(p1)
+    if valid(asc) then
+        for _, sp in ipairs(ACC.specs(asc, function(x) return x:find("_Accessory_", 1, true) ~= nil end)) do ga[sp.n] = (ga[sp.n] or 0) + 1; m = m + 1 end
+    end
+    local gl = {}
+    for k, c in pairs(ga) do gl[#gl + 1] = k .. "×" .. c end
+    table.sort(gl)
+    out("饰品诊断（%s %d 秒，角色 %s）：效果 %d 份 %s；技能 %d 格 %s", d.why, at, shortName(pathOf(p1)), n, table.concat(ge, " "), m, table.concat(gl, " "))
+end
+-- §170.4 修"替身一出来，我身上的饰品效果 / 技能就多一份"（11-09 诊断：进世界 1–60 秒都是 ×1，替身 BP_Renewal_Hun 生成那一刻变 ×2——
+-- 游戏按背包里装着的饰品给"玩家角色"再上一遍）。做法：没替身时每 5 秒记一次自己身上的饰品份数（基准）；有替身、且不在 ACC 换级中时，
+-- 多出来的技能格清掉、多出来的效果摘掉再按基准份数挂回（摘一份的接口不确定，所以整个摘、按数补）
+ACC.base, ACC.baseAt, ACC.dedupAt, ACC.dedupN = nil, -100, -100, 0
+function ACC.snap(p1)
+    local ge = {}
+    for k, c in pairs(G.geCounts(p1) or {}) do if k:find("_Accessory_", 1, true) then ge[k] = c end end
+    local ga = {}
+    local asc = ascOf(p1)
+    if valid(asc) then
+        for _, sp in ipairs(ACC.specs(asc, function(x) return x:find("_Accessory_", 1, true) ~= nil end)) do ga[sp.n] = (ga[sp.n] or 0) + 1 end
+    end
+    return ge, ga
+end
+function ACC.dedupe(p1, tn)
+    local pup = ST.secondPawn
+    if not valid(pup) then
+        if tn - ACC.baseAt >= 5 then
+            ACC.baseAt = tn
+            local ge, ga = ACC.snap(p1)
+            ACC.base = { pp = pathOf(p1), ge = ge, ga = ga }
+        end
+        return
+    end
+    local b = ACC.base
+    if ACC.mine or not b or b.pp ~= pathOf(p1) or tn - ACC.dedupAt < 1 then return end
+    ACC.dedupAt = tn
+    local ge, ga = ACC.snap(p1)
+    local asc = ascOf(p1)
+    local fixed = {}
+    for n, c in pairs(ga) do
+        local want = b.ga[n] or 1                     -- 替身在时新装的饰品不在基准里：没替身时饰品从来都是一份（11-09 实测），按 1 算
+        if c > want then
+            local sps = ACC.specs(asc, function(x) return x == n end)
+            local k = 0
+            for i = #sps, 1, -1 do                       -- 清后加的那几格
+                if c - k <= want then break end
+                if LO.clearAbility(asc, sps[i].h) then k = k + 1 end
+            end
+            fixed[#fixed + 1] = n .. " 技能 " .. c .. "→" .. (c - k)
+        end
+    end
+    for n, c in pairs(ge) do
+        local want = b.ge[n] or 1
+        if c > want then
+            local base, lv = n:match("^GE_Accessory_(.+)_Lv(%d)$")
+            local path = base and ACC.gePath(base, lv) or (ACC.DIR .. n .. "." .. n .. "_C")
+            LO.removeGE(p1, path, nil)
+            for _ = 1, want do LO.applyGE(p1, path, "饰品去重：挂回 " .. n) end
+            fixed[#fixed + 1] = n .. " " .. c .. "→" .. want
+        end
+    end
+    if #fixed > 0 then
+        ACC.dedupN = ACC.dedupN + 1
+        if ACC.dedupN <= 20 then out("饰品去重（替身出来后我身上多了一份，第 %d 次）：%s", ACC.dedupN, table.concat(fixed, "，")) end
+    end
+end
+-- 对局中每 2 秒（跟着 STD.tick 的调用点）：触发出来的饰品增益也按设置换
+ACC.at = -100
+function ACC.tick(tn)
+    if not ACC.mine or MATCH.state == "idle" or tn - ACC.at < 2.0 then return end
+    ACC.at = tn
+    ACC.apply(getP1())
+end
 -- 诊断：换套前后的 Actor / ActorComponent 数（和上一次比），看新建的武器对象会不会被回收（21:07 崩溃 = UObject 撑满）
 function STD.countLog(tag)
     local a, c = G.objCounts()
@@ -2529,7 +3048,7 @@ function STD.restore(p1)
     STD.gearOff(p1)
     STD.disabled, STD.forceTimes, STD.seen, STD.settleUntil, STD.verify = false, {}, nil, -100, nil
     local s = STD.saved
-    STD.saved = nil
+    STD.saved, STD.pre = nil, nil
     if s and valid(p1) then
         for _, a in ipairs(STD.ORDER) do
             local v, c = s[a], attrOf(p1, a)
@@ -2812,7 +3331,7 @@ CFG.init()
 -- 开局 / 跟随时定下 MATCH.* 的地方调的就是它们，不用改。规则还没拿到（rk=1 但 rkrules 空）时不拿本机设置冒充：主机不让开局
 -- （F1 / startMatchNow），那时各取值函数照旧。rkrules 里缺的键按原版默认，坏值不认（也按默认）。
 -- lobby.txt 在 NETUI 段才读得到（netuiRead），这里先放个空的，那边换掉
-NET.RK_DEF = { bo = 3, dm = 100, ab = 0, ctr = 1, bal = 0, med = 1, npos = 1, ult0 = 0, ultx = 100, sp0 = 3, resm = 0 }   -- §113 ult0 / sp0 / resm：服务器不发就是 0 / 3 / 每场（§113.3）；§113.4 ultx 获取倍率 100%；§138 npos 对手位置严格跟随（以前不在表里：排位跟主机自己的设置，固定规则页还误显示"关"）
+NET.RK_DEF = { bo = 3, dm = 100, ab = 0, ctr = 1, bal = 0, med = 1, npos = 1, std = 0, ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 0 }   -- §170.1 acc 饰品等级：服务器不发就是原样；§169 std 标准数值：服务器发 std=1 就开，不发就关（以前不在表里，排位写死关）；§113 ult0 / sp0 / resm：服务器不发就是 0 / 3 / 每场（§113.3）；§113.4 ultx 获取倍率 100%；§138 npos 对手位置严格跟随（以前不在表里：排位跟主机自己的设置，固定规则页还误显示"关"）
 NET.rkLobby = function() return nil end
 NET.rkCache = {}
 function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }；空 / 一个认识的键都没有 → nil
@@ -3389,7 +3908,7 @@ local function applyRemoteResult(p1, r)
     local pr = PRED.onResult(r, kind, tn)
     if kind == "parry" or kind == "block" then
         -- 我屏幕上代表对方的替身播格挡动作；只有连续第 3 次精防我才吃硬直，其余可以继续打
-        local me = fire and staggerOn(p1, ST.p1Weapon) or "继续攻击"
+        local me = fire and STG.start(p1, ST.p1Weapon, tn) or "继续攻击"     -- §161 硬直期间锁出招
         local pupTxt
         if pr.skip then
             pupTxt = "替身已经预播了格挡 " .. tostring(pr.m) .. "（预测对了）"
@@ -3659,6 +4178,43 @@ function NOCTR.check(p1, name, tn)
     if NOCTR.n <= NOCTR.LOGS or NOCTR.n % 20 == 0 then
         out("红蓝光反击已关：%s → %s（第 %d 次）", name, #gone > 0 and ("已取消 " .. table.concat(gone, ",")) or "没取消到实例",
             NOCTR.n)
+    end
+    return true
+end
+
+-- ============================================================ §161 连续 3 次被精防的硬直锁住出招
+-- 以前硬直只是给我 PlayAnimMontage 一段 C_Failed，不挂标签、不拦技能：硬直中按攻击，攻击技能的动作直接把它顶掉（用户 2026-11-08）。
+-- 现在：硬直开始后 untilT 之前（= 硬直动作时长，读不到用 DEF，最多 MAX 秒），我身上新出现的攻击技能（isAttackAbility，
+--   含影之武装 / 完美闪避反击）→ 立刻 K2_CancelAbility、不发给对方，硬直动作被顶掉的话重播并跳回原来播到的位置。
+--   被打中（当前是受击动作）就不重播，受击优先；离开交手阶段不拦。闪避 / 格挡不拦（原版被弹开能不能闪还没核对）
+STG = { DEF = 1.0, MAX = 2.0, untilT = nil, at = 0, name = nil, n = 0, LOGS = 20 }
+function STG.active(tn) return STG.untilT ~= nil and tn < STG.untilT and MATCH.state == "fight" end
+-- 第 3 次精防触发时调（代替 staggerOn）：播硬直、记锁定到什么时候；返回日志里的一句
+function STG.start(p1, weaponId, tn)
+    local name = staggerNameFor(weaponId)
+    local asset = montageByName(name)
+    local dur = asset and valid(p1) and playOn(p1, asset)
+    STG.name, STG.at = dur and name or nil, tn
+    STG.untilT = dur and tn + math.min(dur, STG.MAX) or nil
+    return string.format("硬直 %s（武器 %s）%s", name, tostring(weaponId),
+        dur and string.format("已播，%.2f 秒内锁出招", math.min(dur, STG.MAX)) or "失败")
+end
+-- netSend 看到我新出现的技能时调：拦了返回 true（调用方不发这招）
+function STG.check(p1, name, tn)
+    if not (STG.active(tn) and isAttackAbility(name)) then return false end
+    local gone = G.cancelAbilities(p1, isAttackAbility)
+    local m = montageOf(p1)
+    local back = ""
+    if m ~= STG.name and not LO.isHitMontage(m) then
+        local asset = montageByName(STG.name)
+        local ok = asset and playOn(p1, asset)
+        if ok then G.montageSetPos(p1, tn - STG.at) end
+        back = ok and string.format("，硬直从 %.2f 秒处重播", tn - STG.at) or "，硬直重播失败"
+    end
+    STG.n = STG.n + 1
+    if STG.n <= STG.LOGS or STG.n % 20 == 0 then
+        out("硬直中出招：%s → %s%s（第 %d 次）", name, #gone > 0 and ("已取消 " .. table.concat(gone, ",")) or "没取消到实例",
+            back, STG.n)
     end
     return true
 end
@@ -4000,6 +4556,390 @@ ANIM.SEED = {
     GA_Hun_Chaos_SwitchFormPhysic_SWT_C = "Hun_YuCongBlade_Skill_06_Montage",
 }
 
+-- §165.2 BEGIN 动作表（tools/gen_anim_seed.py 生成，704 招，别手改）
+ANIM.SEED2 = {
+    GA_BrutalAxe_Combo_C = "ShaChi_BrutalAxe_Combo_Montage", GA_BrutalAxe_Normal_C = "ShaChi_BrutalAxe_Charge_Montage",
+    GA_BrutalAxe_Sprint_C = "ShaChi_BrutalAxe_Charge_Sprint_Montage", GA_DuYan_Bow_Laser_C = "AM_Hun_UnnamedBow_Charge1",
+    GA_DuYan_Bow_Normal_C = "AM_Hun_UnnamedBow_Charge", GA_HorseCart_Charge_C = "AM_GetOnHorseCart",
+    GA_HuangJinHuoChong_Dash_C = "Hun_HuangJinHuoChong_SpecialSkill_02_Montage",
+    GA_HuangJinHuoChong_DeflectCounter_C = "Hun_HuangJinHuoChong_SpecialAttack_06_Montage1",
+    GA_HuangJinHuoChong_Normal_02_C = "Hun_ShaChi_HuoChong_Attack_07_Montage",
+    GA_HuangJinHuoChong_Normal_04_C = "Hun_ShaChi_HuoChong_Attack_07_Montage", GA_Hun_Air_Double_AAA_C = "AM_Hun_Air_Double_AAA_Start",
+    GA_Hun_Air_Double_AA_C = "AM_Hun_Air_Double_AA", GA_Hun_Air_Tang_AA_C = "AM_Hun_Air_Tang_AA_Start",
+    GA_Hun_BaiYing_AAAAA_C = "Hun_BaiYing_AAAAA_Montage", GA_Hun_BaiYing_AAAA_C = "Hun_BaiYing_AAAA_Montage",
+    GA_Hun_BaiYing_AAA_C = "Hun_BaiYing_AAA_Montage", GA_Hun_BaiYing_AA_C = "Hun_BaiYing_AA_Montage",
+    GA_Hun_BaiYing_A_C = "Hun_BaiYing_A_Montage", GA_Hun_BaiYing_A_DashDraw_C = "AM_Hun_Long_A_DashDraw",
+    GA_Hun_BaiYing_A_Dash_C = "AM_Hun_Long_A_Dash", GA_Hun_BaiYing_Air_A_C = "Hun_Long_JumpAttackA_Montage",
+    GA_Hun_BaiYing_Air_A_Draw_C = "Hun_Long_JumpAttackA_Montage", GA_Hun_BaiYing_Air_B_C = "Hun_Long_JumpAttackB_Montage",
+    GA_Hun_BaiYing_Air_B_Draw_C = "Hun_Long_JumpAttackB_Montage", GA_Hun_BaiYing_BBB_C = "Hun_BaiYing_BBB_Montage",
+    GA_Hun_BaiYing_BB_C = "Hun_BaiYing_BB_Montage", GA_Hun_BaiYing_B_C = "Hun_BaiYing_B_Montage",
+    GA_Hun_BaiYing_B_DashDraw_C = "AM_Hun_Long_B_DashDraw", GA_Hun_BaiYing_B_Dash_C = "AM_Hun_Long_B_Dash",
+    GA_Hun_BaiYing_C_C = "Hun_BaiYing_C_Montage", GA_Hun_BaiYing_SWT_Power_C = "Hun_BaiYing_AAAA_Montage",
+    GA_Hun_BaiYing_SpeicalAssault_C = "RTG_Hun_BaiYing_Skill_07_A_Montage",
+    GA_Hun_BronzeSword_AAAA_C = "Hun_QingTongJian_Attack_AAAA_Montage",
+    GA_Hun_BronzeSword_AAABB_C = "Hun_QingTongJian_Attack_AAABB_Montage",
+    GA_Hun_BronzeSword_AAAB_C = "Hun_QingTongJian_Attack_AAAB_Montage", GA_Hun_BronzeSword_AAA_C = "Hun_QingTongJian_Attack_AAA_Montage",
+    GA_Hun_BronzeSword_AABB_C = "Hun_QingTongJian_Attack_AABB_Montage", GA_Hun_BronzeSword_AAB_C = "Hun_QingTongJian_Attack_AAB_Montage",
+    GA_Hun_BronzeSword_AA_C = "Hun_QingTongJian_Attack_AA_Montage", GA_Hun_BronzeSword_ABB_C = "Hun_QingTongJian_Attack_ABB_Montage",
+    GA_Hun_BronzeSword_AB_C = "Hun_QingTongJian_Attack_AB_Montage", GA_Hun_BronzeSword_A_C = "Hun_QingTongJian_Attack_A_Montage",
+    GA_Hun_BronzeSword_A_Dash_C = "Hun_QingTongJian_Dash_A_Montage", GA_Hun_BronzeSword_A_Draw_C = "Hun_QingTongJian_Attack_A_Montage",
+    GA_Hun_BronzeSword_BA_C = "Hun_QingTongJian_Attack_A_Montage", GA_Hun_BronzeSword_BBB_C = "Hun_QingTongJian_Attack_BBB_Montage",
+    GA_Hun_BronzeSword_BB_C = "Hun_QingTongJian_Attack_BB_Montage", GA_Hun_BronzeSword_B_C = "Hun_QingTongJian_Attack_B_Montage",
+    GA_Hun_BronzeSword_B_Dash_C = "Hun_QingTongJian_Dash_B_Montage", GA_Hun_BronzeSword_B_Hold_C = "Hun_QingTongJian_Attack_Hold_B_Montage",
+    GA_Hun_BronzeSword_C_C = "Hun_QingTongJian_Skill_01_Montage", GA_Hun_BronzeSword_SWT_C = "Hun_QingTongJian_Attack_SWT_Montage",
+    GA_Hun_Chaos_AAAAA_C = "Hun_YuCongBlade_Attack_AAAAA_Montage", GA_Hun_Chaos_AAAA_C = "Hun_YuCongBlade_Attack_AAAA_Montage",
+    GA_Hun_Chaos_AAABB_Physics_C = "AM_Hun_Tang_AAABB", GA_Hun_Chaos_AAAB_Physics_C = "Hun_YuCongBlade_Type01_BBB_Montage",
+    GA_Hun_Chaos_AAA_C = "Hun_YuCongBlade_Attack_AAA_Montage", GA_Hun_Chaos_AABB_Physics_C = "Hun_YuCongBlade_Type03_BBB_Montage",
+    GA_Hun_Chaos_AAB_Physics_C = "AM_Hun_Tang_AAB", GA_Hun_Chaos_AA_C = "Hun_YuCongBlade_Attack_AA_Montage",
+    GA_Hun_Chaos_ABB_Physics_C = "Hun_YuCongBlade_Type03_BB_Montage", GA_Hun_Chaos_AB_Physics_C = "Hun_CanGangRen_Attack_AB_Montage",
+    GA_Hun_Chaos_A_C = "Hun_YuCongBlade_Attack_A_Montage", GA_Hun_Chaos_A_DashDraw_C = "Hun_CanGangRen_Dash_A_Montage",
+    GA_Hun_Chaos_A_Dash_C = "Hun_CanGangRen_Dash_A_Montage", GA_Hun_Chaos_A_Draw_C = "Hun_YuCongBlade_Attack_A_Montage",
+    GA_Hun_Chaos_BBB_Physics_C = "Hun_YuCongBlade_Type03_BBB_Montage", GA_Hun_Chaos_BB_Physics_C = "Hun_YuCongBlade_Type03_BB_Montage",
+    GA_Hun_Chaos_B_DashDraw_C = "Hun_CanGangRen_Dash_B_Montage", GA_Hun_Chaos_B_Dash_C = "Hun_CanGangRen_Dash_B_Montage",
+    GA_Hun_Chaos_B_Draw_C = "Hun_YuCongBlade_Type03_B_Montage", GA_Hun_Chaos_B_Hold_Physics_C = "Hun_YuCongBlade_Skill_01_Montage",
+    GA_Hun_Chaos_B_Physics_C = "Hun_YuCongBlade_Type03_B_Montage", GA_Hun_Chaos_C_C = "Hun_YuCongBlade_Unique_Skill_Montage",
+    GA_Hun_Chaos_SWT_Power_C = "Hun_YuCongBlade_Skill_05_Montage", GA_Hun_Chaos_SwitchFormPhysic_SWT_C = "Hun_YuCongBlade_Skill_06_Montage",
+    GA_Hun_ChiRen_AAAABB_C = "Hun_ChiRen_Attack_AAAABB_Montage", GA_Hun_ChiRen_AAAAB_C = "Hun_ChiRen_Attack_AAAAB_Montage",
+    GA_Hun_ChiRen_AAAA_C = "Hun_ChiRen_Attack_AAAA_Montage", GA_Hun_ChiRen_AAABB_C = "Hun_ChiRen_Attack_AAABB_Montage",
+    GA_Hun_ChiRen_AAAB_C = "Hun_ChiRen_Attack_AAAB_Montage", GA_Hun_ChiRen_AAA_C = "Hun_ChiRen_Attack_AAA_Montage",
+    GA_Hun_ChiRen_AABB_C = "Hun_ChiRen_Attack_AABB_Montage", GA_Hun_ChiRen_AAB_C = "Hun_ChiRen_Attack_AAB_Montage",
+    GA_Hun_ChiRen_AA_C = "Hun_ChiRen_Attack_AA_Montage", GA_Hun_ChiRen_ABB_C = "Hun_ChiRen_Attack_ABB_Montage",
+    GA_Hun_ChiRen_AB_C = "Hun_ChiRen_Attack_AB_Montage", GA_Hun_ChiRen_A_C = "Hun_ChiRen_Attack_A_Montage",
+    GA_Hun_ChiRen_A_Draw_C = "Hun_ChiRen_Attack_A_Montage", GA_Hun_ChiRen_BBB_C = "Hun_ChiRen_Attack_BBB_Montage",
+    GA_Hun_ChiRen_BB_C = "Hun_ChiRen_Attack_BB_Montage", GA_Hun_ChiRen_BD_C = "Hun_ChiRen_Attack_A_Montage",
+    GA_Hun_ChiRen_BSup_C = "Hun_WangMingZhanMaDao_Attack_AAAB_Montage", GA_Hun_ChiRen_B_C = "Hun_ChiRen_Attack_B_Montage",
+    GA_Hun_ChiRen_B_DashDraw_C = "Hun_Horizontal_B_DashDraw_Montage", GA_Hun_ChiRen_B_Dash_C = "Hun_Horizontal_B_Dash_Fixed_Montage",
+    GA_Hun_ChiRen_B_Draw_C = "Hun_ChiRen_Attack_B_Montage", GA_Hun_ChiRen_C_C = "Hun_ZhiRen_Unique_Skill_01_Montage",
+    GA_Hun_ChiRen_SWT_C = "Hun_Horizontal_AAAA_Montage", GA_Hun_ChiZheCanJian_C_C = "Hun_ChiZheCanJian_Drunk_Unique_Skill_Montage",
+    GA_Hun_ChiZheCanJian_Drunk_AAAAA_C = "Hun_ChiZheCanJian_Drunk_Attack_EEEEE_Montage",
+    GA_Hun_ChiZheCanJian_Drunk_AAAA_C = "Hun_ChiZheCanJian_Drunk_Attack_EEEE_Montage1",
+    GA_Hun_ChiZheCanJian_Drunk_AAA_C = "Hun_ChiZheCanJian_Drunk_Attack_EEE_Montage",
+    GA_Hun_ChiZheCanJian_Drunk_AA_C = "Hun_ChiZheCanJian_Drunk_Attack_EE_Montage",
+    GA_Hun_ChiZheCanJian_Drunk_A_C = "Hun_ChiZheCanJian_Drunk_Attack_E_Montage",
+    GA_Hun_ChiZheCanJian_Drunk_A_DashChild_C = "Hun_ChiZheCanJian_Drunk_Attack_E_Montage",
+    GA_Hun_ChiZheCanJian_Normal_AAAAA_C = "Hun_ChiZheCanJian_Awake_Attack_AAAAA_Montage",
+    GA_Hun_ChiZheCanJian_Normal_AAAA_C = "Hun_ChiZheCanJian_Awake_Attack_AAAA_Montage",
+    GA_Hun_ChiZheCanJian_Normal_AAA_C = "Hun_ChiZheCanJian_Awake_Attack_AAA_Montage",
+    GA_Hun_ChiZheCanJian_Normal_AA_C = "Hun_ChiZheCanJian_Awake_Attack_AA_Montage",
+    GA_Hun_ChiZheCanJian_Normal_AA_DashChild_C = "Hun_ChiZheCanJian_Awake_Attack_AA_Montage",
+    GA_Hun_ChiZheCanJian_Normal_A_C = "Hun_ChiZheCanJian_Awake_Attack_A_Montage",
+    GA_Hun_ChiZheCanJian_Normal_BBB_C = "Hun_ChiZheCanJian_Awake_Attack_ABBB_Montage",
+    GA_Hun_ChiZheCanJian_Normal_BB_C = "Hun_ChiZheCanJian_Awake_Attack_ABB_Montage",
+    GA_Hun_ChiZheCanJian_Normal_B_C = "Hun_ChiZheCanJian_Awake_Attack_B_Montage",
+    GA_Hun_ChiZheCanJian_Normal_B_DashChild_C = "Hun_ChiZheCanJian_Awake_Attack_B_Montage",
+    GA_Hun_ChiZheCanJian_SWT_C = "Hun_ChiZheCanJian_Drunk_Attack_EEFD_Montage",
+    GA_Hun_ChiZheCanJian_Tipsy_BBB_C = "Hun_ChiZheCanJian_Tipsy_Attack_ABB_Montage",
+    GA_Hun_ChiZheCanJian_Tipsy_BB_C = "Hun_ChiZheCanJian_Tipsy_Attack_BB_Montage",
+    GA_Hun_ChiZheCanJian_Tipsy_B_C = "Hun_ChiZheCanJian_Tipsy_Attack_B_Montage", GA_Hun_Double_AAAAAA_C = "AM_Hun_Double_AAAAAA",
+    GA_Hun_Double_AAAAA_C = "AM_Hun_Double_AAAAA", GA_Hun_Double_AAAA_C = "AM_Hun_Double_AAAA",
+    GA_Hun_Double_AAABBB_C = "AM_Hun_Double_AAABBB", GA_Hun_Double_AAABB_C = "AM_Hun_Double_AAABB",
+    GA_Hun_Double_AAAB_C = "AM_Hun_Double_AAAB", GA_Hun_Double_AAA_C = "AM_Hun_Double_AAA", GA_Hun_Double_AABB_C = "AM_Hun_Double_AABB",
+    GA_Hun_Double_AAB_C = "AM_Hun_Double_AAB", GA_Hun_Double_AA_C = "AM_Hun_Double_AA", GA_Hun_Double_ABB_C = "AM_Hun_Double_ABB",
+    GA_Hun_Double_AB_C = "AM_Hun_Double_AB", GA_Hun_Double_ATBBB_C = "AM_Hun_Double_AAABB", GA_Hun_Double_ATBB_C = "AM_Hun_Double_AB",
+    GA_Hun_Double_ATB_C = "AM_Hun_Double_AAB", GA_Hun_Double_A_C = "AM_Hun_Double_A",
+    GA_Hun_Double_A_DashDraw_Short_C = "AM_Hun_Double_A_DashDraw", GA_Hun_Double_A_Dash_Short_C = "AM_Hun_Double_A_Dash",
+    GA_Hun_Double_A_Draw_C = "AM_Hun_Double_A_Draw", GA_Hun_Double_Air_A_C = "Hun_Tang_JumpAttackB_Montage",
+    GA_Hun_Double_Air_A_Draw_C = "Hun_Tang_JumpAttackB_Montage", GA_Hun_Double_Air_B_C = "Hun_Double_JumpAttackA_Montage",
+    GA_Hun_Double_Air_B_Draw_C = "Hun_Double_JumpAttackA_Montage", GA_Hun_Double_BBBB_C = "AM_Hun_Double_BBBB",
+    GA_Hun_Double_BBB_C = "AM_Hun_Double_BBB", GA_Hun_Double_BB_C = "AM_Hun_Double_BB", GA_Hun_Double_BTA_C = "AM_Hun_Double_A_DashDraw",
+    GA_Hun_Double_B_C = "AM_Hun_Double_B", GA_Hun_Double_B_DashDraw_C = "AM_Hun_Double_B_DashDraw",
+    GA_Hun_Double_B_Dash_C = "AM_Hun_Double_B_Dash", GA_Hun_Double_B_Draw_C = "AM_Hun_Double_B_Draw",
+    GA_Hun_Double_JueYing_C_Air_C = "Hun_Double_Crow_Near_Montage", GA_Hun_Double_JueYing_C_C = "Hun_Double_Crow_Near_Montage",
+    GA_Hun_Double_SWT_C = "AM_Hun_Double_PD_L1", GA_Hun_Double_SWT_Tutorial_C = "AM_Hun_Double_A_Draw",
+    GA_Hun_DualHook_AAAAA_C = "Hun_BieLiCanGou_AAAAA_Montage", GA_Hun_DualHook_AAAA_C = "Hun_BieLiCanGou_AAAA_Montage",
+    GA_Hun_DualHook_AAABB_C = "Hun_BieLiCanGou_AAABB_Montage", GA_Hun_DualHook_AAAB_C = "Hun_BieLiCanGou_AB_Montage",
+    GA_Hun_DualHook_AAA_C = "Hun_BieLiCanGou_AAA_Montage", GA_Hun_DualHook_AABB_C = "Hun_BieLiCanGou_AABB_Montage",
+    GA_Hun_DualHook_AAB_C = "Hun_BieLiCanGou_AAB_Montage", GA_Hun_DualHook_AA_C = "Hun_BieLiCanGou_AA_Montage",
+    GA_Hun_DualHook_ABB_C = "Hun_BieLiCanGou_ABB_Montage", GA_Hun_DualHook_AB_C = "Hun_BieLiCanGou_AAAB_Montage",
+    GA_Hun_DualHook_A_C = "Hun_BieLiCanGou_A_Montage", GA_Hun_DualHook_A_DashDraw_C = "Hun_BieLiCanGou_DashA_Montage",
+    GA_Hun_DualHook_A_Dash_C = "Hun_BieLiCanGou_DashA_Montage", GA_Hun_DualHook_A_Draw_C = "Hun_BieLiCanGou_A_Montage",
+    GA_Hun_DualHook_A_Pursure_02_C = "Hun_BieLiCanGou_A_Pursue_Montage", GA_Hun_DualHook_Air_B_C = "Hun_Double_JumpAttackA_Montage",
+    GA_Hun_DualHook_Air_B_Draw_C = "Hun_Double_JumpAttackA_Montage", GA_Hun_DualHook_BBBB_C = "Hun_BieLiCanGou_BBBB_Montage",
+    GA_Hun_DualHook_BBB_C = "Hun_BieLiCanGou_BBB_Montage", GA_Hun_DualHook_BB_C = "Hun_BieLiCanGou_AABB_Montage",
+    GA_Hun_DualHook_B_C = "Hun_BieLiCanGou_B_Montage", GA_Hun_DualHook_B_DashDraw_C = "Hun_BieLiCanGou_DashB_Montage",
+    GA_Hun_DualHook_B_Dash_C = "Hun_BieLiCanGou_DashB_Montage", GA_Hun_DualHook_B_Draw_C = "Hun_BieLiCanGou_B_Montage",
+    GA_Hun_DualHook_B_Pursure_C = "Hun_BieLiCanGou_Skill_02_Montage", GA_Hun_DualHook_C_C = "Hun_BieLiCanGou_Unique_Skill_01_Montage",
+    GA_Hun_DualHook_DB_C = "GuiChai_Yellow_Special_Defence_Start_Montage",
+    GA_Hun_DualHook_DB_SWT_C = "GuiChai_Yellow_Special_Defence_Start_Montage",
+    GA_Hun_DualHook_SWT_Power_C = "GuiChai_Yellow_Special_Defence_Start_Montage",
+    GA_Hun_FengLeiJian_AAAA_C = "Hun_BaiShanDual_Attack_AAAA_Montage", GA_Hun_FengLeiJian_AAABB_C = "Hun_BaiShanDual_Attack_AAABB_Montage",
+    GA_Hun_FengLeiJian_AAAB_C = "Hun_BaiShanDual_Attack_AAAB_Montage", GA_Hun_FengLeiJian_AAA_C = "Hun_BaiShanDual_Attack_AAA_Montage",
+    GA_Hun_FengLeiJian_AABAB_C = "Hun_BaiShanDual_Attack_AABAB_Montage", GA_Hun_FengLeiJian_AABA_C = "Hun_BaiShanDual_Attack_AABA_Montage",
+    GA_Hun_FengLeiJian_AABB_C = "Hun_BaiShanDual_Attack_AABB_Montage", GA_Hun_FengLeiJian_AAB_C = "Hun_BaiShanDual_Attack_AAB_Montage",
+    GA_Hun_FengLeiJian_AA_C = "Hun_BaiShanDual_Attack_AA_Montage", GA_Hun_FengLeiJian_AB_C = "AM_Hun_Double_AB",
+    GA_Hun_FengLeiJian_A_C = "Hun_BaiShanDual_Attack_A_Montage", GA_Hun_FengLeiJian_A_DashDraw_C = "AM_Hun_Double_A_DashDraw",
+    GA_Hun_FengLeiJian_A_Dash_C = "AM_Hun_Double_A_Dash", GA_Hun_FengLeiJian_A_Draw_C = "AM_Hun_Double_A_Draw",
+    GA_Hun_FengLeiJian_Air_A_C = "Hun_Tang_JumpAttackB_Montage", GA_Hun_FengLeiJian_Air_A_Draw_C = "Hun_Tang_JumpAttackB_Montage",
+    GA_Hun_FengLeiJian_Air_B_C = "Hun_Double_JumpAttackA_Montage", GA_Hun_FengLeiJian_Air_B_Draw_C = "Hun_Double_JumpAttackA_Montage",
+    GA_Hun_FengLeiJian_BBBB_C = "Hun_BaiShanDual_Attack_BBBB_Montage", GA_Hun_FengLeiJian_BBB_C = "Hun_BaiShanDual_Attack_BBB_Montage",
+    GA_Hun_FengLeiJian_BB_C = "Hun_BaiShanDual_Attack_BB_Montage", GA_Hun_FengLeiJian_B_C = "Hun_BaiShanDual_Attack_B_Montage",
+    GA_Hun_FengLeiJian_B_DashDraw_C = "AM_Hun_Double_B_DashDraw", GA_Hun_FengLeiJian_B_Dash_C = "AM_Hun_Double_B_Dash",
+    GA_Hun_FengLeiJian_B_Draw_C = "Hun_BaiShanDual_Attack_B_Montage", GA_Hun_FengLeiJian_B_Hold_C = "Hun_BaiShanDual_Hold_B_02_Montage",
+    GA_Hun_FengLeiJian_C_C = "Hun_BaiShanDual_Skill_02_Montage",
+    GA_Hun_FengLeiJian_FengLeiState_SpecailAttack_02_C = "Hun_BaiShanDual_Skill_03_Montage",
+    GA_Hun_FengLeiJian_SWT_Power_C = "Hun_BaiShanDual_Attack_AABB_Montage", GA_Hun_GuiTouBlade_AAAA_C = "Hun_Horizontal_AAA_Montage",
+    GA_Hun_GuiTouBlade_AAABB_C = "Hun_Horizontal_BB_Montage", GA_Hun_GuiTouBlade_AAAB_C = "Hun_Horizontal_B_Montage",
+    GA_Hun_GuiTouBlade_AAA_C = "Hun_AHuaBlade_AAA_Montage", GA_Hun_GuiTouBlade_AABB_C = "Hun_AHuaBlade_AAB_Ex_Montage",
+    GA_Hun_GuiTouBlade_AAB_C = "Hun_AHuaBlade_AAB_Montage", GA_Hun_GuiTouBlade_AA_C = "Hun_AHuaBlade_AA_Montage",
+    GA_Hun_GuiTouBlade_ABB_C = "Hun_AHuaBlade_AB_Ex_Montage", GA_Hun_GuiTouBlade_AB_C = "Hun_AHuaBlade_AB_Montage",
+    GA_Hun_GuiTouBlade_A_C = "Hun_AHuaBlade_A_Montage", GA_Hun_GuiTouBlade_A_DashDraw_C = "Hun_Horizontal_A_Dash_Montage",
+    GA_Hun_GuiTouBlade_A_Dash_C = "Hun_Horizontal_A_Dash_Montage", GA_Hun_GuiTouBlade_A_Draw_C = "Hun_AHuaBlade_Switch_A_Montage",
+    GA_Hun_GuiTouBlade_BBB_C = "Hun_AHuaBlade_BB_Ex_Montage", GA_Hun_GuiTouBlade_BB_C = "Hun_Horizontal_AA_Montage",
+    GA_Hun_GuiTouBlade_BB_UnCharge_C = "Hun_Horizontal_AA_Montage",
+    GA_Hun_GuiTouBlade_BB_UnCharge_Reinforced_C = "Hun_Horizontal_AA_Montage", GA_Hun_GuiTouBlade_B_C = "Hun_Horizontal_A_Montage",
+    GA_Hun_GuiTouBlade_B_DashDraw_C = "Hun_AHuaBlade_Draw_Dash_B_02_Montage",
+    GA_Hun_GuiTouBlade_B_Dash_C = "Hun_AHuaBlade_Dash_B_02_Montage", GA_Hun_GuiTouBlade_B_Draw_C = "Hun_Horizontal_A_Draw_Montage",
+    GA_Hun_GuiTouBlade_B_Hold_C = "Hun_AHuaBlade_B_Hold_Montage", GA_Hun_GuiTouBlade_B_Hold_Start_C = "Hun_AHuaBlade_B_Hold_Montage",
+    GA_Hun_GuiTouBlade_C_C = "Hun_AHuaBlade_C_Montage", GA_Hun_GuiTouBlade_SWT_C = "Hun_AHuaBlade_SnapB_Montage",
+    GA_Hun_HeiMoShang_AAAAAA_C = "Hun_HeiMoShang_BBBB_Montage", GA_Hun_HeiMoShang_AAAAABB_C = "Hun_HeiMoShang_Skill_01_Montage",
+    GA_Hun_HeiMoShang_AAAAAB_C = "Hun_HeiMoShang_AAABB_Montage", GA_Hun_HeiMoShang_AAAAA_C = "Hun_HeiMoShang_AAAAA_Montage",
+    GA_Hun_HeiMoShang_AAAAB_Alt_C = "Hun_HeiMoShang_AAAAB_Montage", GA_Hun_HeiMoShang_AAAA_C = "Hun_HeiMoShang_AAAA_Montage",
+    GA_Hun_HeiMoShang_AAABB_C = "Hun_HeiMoShang_AAABB_Montage", GA_Hun_HeiMoShang_AAAB_C = "Hun_HeiMoShang_AAAB_Montage",
+    GA_Hun_HeiMoShang_AAA_C = "Hun_HeiMoShang_AAA_Montage", GA_Hun_HeiMoShang_AABB_C = "Hun_HeiMoShang_AABB_Montage",
+    GA_Hun_HeiMoShang_AAB_C = "Hun_HeiMoShang_AAB_Montage", GA_Hun_HeiMoShang_AA_C = "Hun_HeiMoShang_AA_Montage",
+    GA_Hun_HeiMoShang_ABB_C = "Hun_HeiMoShang_ABB_Montage", GA_Hun_HeiMoShang_AB_C = "Hun_HeiMoShang_AB_Montage",
+    GA_Hun_HeiMoShang_A_C = "Hun_HeiMoShang_A_Montage", GA_Hun_HeiMoShang_A_DashDraw_C = "AM_Hun_Tang_A_DashDraw",
+    GA_Hun_HeiMoShang_A_Dash_C = "AM_Hun_Tang_A_Dash", GA_Hun_HeiMoShang_A_Draw_C = "Hun_HeiMoShang_A_Montage",
+    GA_Hun_HeiMoShang_BBBB_C = "Hun_HeiMoShang_Skill_01_Montage", GA_Hun_HeiMoShang_BBB_C = "Hun_HeiMoShang_BBB_Montage",
+    GA_Hun_HeiMoShang_BB_C = "Hun_HeiMoShang_BB_Montage", GA_Hun_HeiMoShang_B_C = "Hun_HeiMoShang_B_Montage",
+    GA_Hun_HeiMoShang_B_DashDraw_C = "AM_Hun_Tang_B_DashDraw", GA_Hun_HeiMoShang_B_Dash_C = "AM_Hun_Tang_B_Dash",
+    GA_Hun_HeiMoShang_B_Draw_C = "Hun_HeiMoShang_B_Montage", GA_Hun_HeiMoShang_C1_C = "Hun_HeiMoShang_JueXing_Montage",
+    GA_Hun_HeiMoShang_SWT_C = "Hun_HeiMoShang_Skill_01_Montage", GA_Hun_Horizontal_AAAA_C = "Hun_Horizontal_AAAA_Montage",
+    GA_Hun_Horizontal_AAAB_C = "Hun_Horizontal_AAAB_Montage", GA_Hun_Horizontal_AAA_C = "Hun_Horizontal_AAA_Montage",
+    GA_Hun_Horizontal_AAB_C = "Hun_Horizontal_AAB_Montage", GA_Hun_Horizontal_AA_C = "Hun_Horizontal_AA_Montage",
+    GA_Hun_Horizontal_AB_C = "Hun_Horizontal_AB_Montage", GA_Hun_Horizontal_A_C = "Hun_Horizontal_A_Montage",
+    GA_Hun_Horizontal_A_DashDraw_C = "Hun_Horizontal_A_Dash_Montage", GA_Hun_Horizontal_A_Dash_C = "Hun_Horizontal_A_Dash_Montage",
+    GA_Hun_Horizontal_A_Draw_C = "Hun_Horizontal_A_Draw_Montage", GA_Hun_Horizontal_BB_C = "Hun_Horizontal_BB_Montage",
+    GA_Hun_Horizontal_B_C = "Hun_Horizontal_B_Montage", GA_Hun_Horizontal_B_DashDraw_C = "Hun_Horizontal_B_DashDraw_Montage",
+    GA_Hun_Horizontal_B_Dash_C = "Hun_Horizontal_B_Dash_Fixed_Montage", GA_Hun_Horizontal_B_Draw_C = "Hun_Horizontal_B_Draw_Montage",
+    GA_Hun_Horizontal_B_NoCost_C = "Hun_Horizontal_B_Montage", GA_Hun_Horizontal_BladeWave_C = "Hun_DangKouXiongRen_Skill_01_Montage",
+    GA_Hun_Horizontal_C_C = "AM_Hun_Horizontal_C", GA_Hun_Horizontal_CounterAttack_01_C = "Hun_Horizontal_CounterAttack_02_Montage",
+    GA_Hun_Horizontal_CounterAttack_02_C = "Hun_Horizontal_CounterAttack_02_Placeholder_Montage",
+    GA_Hun_Horizontal_SWT_Power_C = "Hun_Horizontal_CounterAttack_02_Montage", GA_Hun_HuoLiuXing_AAAA_C = "Hun_HuoLiuXing_Attack_D_Montage",
+    GA_Hun_HuoLiuXing_AAA_C = "Hun_HuoLiuXing_Attack_C_Montage", GA_Hun_HuoLiuXing_AA_C = "Hun_HuoLiuXing_Attack_B_Montage",
+    GA_Hun_HuoLiuXing_A_C = "Hun_HuoLiuXing_Attack_A_Montage", GA_Hun_HuoLiuXing_A_Short_C = "Hun_HuoLiuXing_Attack_A_Montage",
+    GA_Hun_HuoLiuXing_DB_C = "ShaChi_Hook_CCC_HuoLiuXing_Placeholder_Montage", GA_Hun_Iron_AAAAA_C = "Hun_CanGangRen_Attack_AAAAA_Montage",
+    GA_Hun_Iron_AAAA_C = "Hun_CanGangRen_Attack_AAAA_Montage", GA_Hun_Iron_AAABB_C = "Hun_CanGangRen_Attack_AAABB_Montage",
+    GA_Hun_Iron_AAAB_C = "Hun_CanGangRen_Attack_AAAB_Montage", GA_Hun_Iron_AAA_C = "Hun_CanGangRen_Attack_AAA_Montage",
+    GA_Hun_Iron_AABB_C = "Hun_CanGangRen_Attack_AABB_Montage", GA_Hun_Iron_AAB_C = "Hun_CanGangRen_Attack_AAB_Montage",
+    GA_Hun_Iron_AA_C = "Hun_CanGangRen_Attack_AA_Montage", GA_Hun_Iron_ABB_C = "Hun_CanGangRen_Attack_ABB_Montage",
+    GA_Hun_Iron_AB_C = "Hun_CanGangRen_Attack_AB_Montage", GA_Hun_Iron_A_C = "Hun_CanGangRen_Attack_A_Montage",
+    GA_Hun_Iron_A_DashDraw_C = "Hun_CanGangRen_Dash_A_Montage", GA_Hun_Iron_A_Dash_C = "Hun_CanGangRen_Dash_A_Montage",
+    GA_Hun_Iron_A_Draw_C = "Hun_CanGangRen_Attack_A_Montage", GA_Hun_Iron_BBB_C = "Hun_CanGangRen_Attack_BBB_Montage",
+    GA_Hun_Iron_BB_C = "Hun_CanGangRen_Attack_BB_Montage", GA_Hun_Iron_BChargeAttack_C = "Hun_CanGangRen_Skill_02_End_Montage",
+    GA_Hun_Iron_BCharge_C = "Hun_CanGangRen_Skill_02_Montage", GA_Hun_Iron_B_C = "Hun_CanGangRen_Attack_B_Montage",
+    GA_Hun_Iron_B_DashDraw_C = "Hun_CanGangRen_Dash_B_Montage", GA_Hun_Iron_B_Dash_C = "Hun_CanGangRen_Dash_B_Montage",
+    GA_Hun_Iron_B_Draw_C = "Hun_CanGangRen_Attack_B_Draw_Montage", GA_Hun_Iron_C_C = "Hun_CanGangRen_Unique_Skill_Montage",
+    GA_Hun_Iron_SWT_C = "Hun_CanGangRen_Attack_BB_Montage", GA_Hun_Jade_AAAAAA_C = "Hun_YuShuangHuan_Attack_AAAAAA_Montage",
+    GA_Hun_Jade_AAAAA_C = "Hun_YuShuangHuan_Attack_AAAAA_Montage", GA_Hun_Jade_AAAA_C = "AM_Hun_Jade_AAAA",
+    GA_Hun_Jade_AAABB_C = "Hun_YuShuangHuan_SimpleExE_Multi_01_Montage", GA_Hun_Jade_AAAB_C = "Hun_Jade_AAAB_New_Montage",
+    GA_Hun_Jade_AAA_C = "Hun_YuShuangHuan_Attack_AAA_Montage", GA_Hun_Jade_AABB_C = "Hun_Jade_AAABB_01_Montage",
+    GA_Hun_Jade_AA_C = "Hun_YuShuangHuan_Attack_AA_Montage", GA_Hun_Jade_ABB_C = "AM_Hun_Jade_ABB", GA_Hun_Jade_AB_C = "AM_Hun_Jade_AB",
+    GA_Hun_Jade_A_C = "AM_Hun_Jade_A", GA_Hun_Jade_A_DashDraw_C = "AM_Hun_Jade_A_DashDraw", GA_Hun_Jade_A_Dash_C = "AM_Hun_Jade_A_Dash",
+    GA_Hun_Jade_A_Draw_C = "AM_Hun_Jade_A_Draw", GA_Hun_Jade_BBBB_C = "Hun_Jade_BB_01_Montage", GA_Hun_Jade_BBB_C = "AM_Hun_Jade_BBB",
+    GA_Hun_Jade_BB_C = "AM_Hun_Jade_BB", GA_Hun_Jade_B_C = "AM_Hun_Jade_B", GA_Hun_Jade_B_DashDraw_C = "AM_Hun_Jade_B_DashDraw",
+    GA_Hun_Jade_B_Dash_C = "Hun_Jade_B_Dash_Montage", GA_Hun_Jade_B_Draw_C = "AM_Hun_Jade_B_Draw",
+    GA_Hun_Jade_C_Range_C = "AM_Hun_Jade_C_Range", GA_Hun_Jade_DB_C = "Hun_ShuangYue_Skill_03_BanBen_02_Montage",
+    GA_Hun_Jade_SWT_C = "Hun_Jade_B_New_Montage", GA_Hun_JigSaw_AAAA_C = "Hun_Horizontal_AAA_Montage",
+    GA_Hun_JigSaw_AAA_C = "Hun_AHuaBlade_AAA_Montage", GA_Hun_JigSaw_AA_C = "Hun_AHuaBlade_AA_Montage",
+    GA_Hun_JigSaw_A_C = "Hun_AHuaBlade_A_Montage", GA_Hun_Jigsaw_AAAB_C = "AM_Hun_Jigsaw_AAAB_Miss",
+    GA_Hun_Jigsaw_AAB_C = "AM_Hun_Jigsaw_AAB", GA_Hun_Jigsaw_AB_C = "AM_Hun_Jigsaw_AB",
+    GA_Hun_Jigsaw_A_DashDraw_C = "Hun_SawBlade_Dash_Switch_A_Miss_Montage", GA_Hun_Jigsaw_A_Dash_C = "Hun_SawBlade_Dash_A_Miss_Montage",
+    GA_Hun_Jigsaw_A_Draw_C = "Hun_SawBlade_Switch_A_Miss_Montage", GA_Hun_Jigsaw_Air_A_C = "Hun_Long_JumpAttackA_Montage",
+    GA_Hun_Jigsaw_Air_A_Draw_C = "Hun_Long_JumpAttackA_Montage", GA_Hun_Jigsaw_Air_B_C = "Hun_Long_JumpAttackB_Montage",
+    GA_Hun_Jigsaw_Air_B_Draw_C = "Hun_Long_JumpAttackB_Montage", GA_Hun_Jigsaw_BB_C = "Hun_SawBlade_BB_Miss_Montage",
+    GA_Hun_Jigsaw_B_C = "AM_Hun_Jigsaw_B_Miss", GA_Hun_Jigsaw_B_DashDraw_C = "Hun_SawBlade_Dash_Switch_B_Miss_Montage",
+    GA_Hun_Jigsaw_B_Dash_C = "Hun_SawBlade_Dash_B_Miss_Montage", GA_Hun_Jigsaw_C_C = "Hun_SawBlade_Unique_Skill_Montage",
+    GA_Hun_Jigsaw_RAAA_C = "Hun_SawBlade_Skill_AAA_Montage", GA_Hun_Jigsaw_RAA_C = "Hun_SawBlade_Skill_AA_Montage",
+    GA_Hun_Jigsaw_RA_C = "Hun_SawBlade_Skill_A_Montage", GA_Hun_Jigsaw_RBB_C = "Hun_SawBlade_Skill_BB_Montage",
+    GA_Hun_Jigsaw_RB_C = "Hun_SawBlade_Skill_B_Montage", GA_Hun_Jigsaw_SA_C = "Hun_Jigsaw_SA_Montage",
+    GA_Hun_Jigsaw_SB_C = "Hun_Jigsaw_SB_Montage", GA_Hun_Long_A_DashDraw_C = "AM_Hun_Long_A_DashDraw",
+    GA_Hun_Long_A_Dash_C = "AM_Hun_Long_A_Dash", GA_Hun_Long_Air_A_C = "Hun_Long_JumpAttackA_Montage",
+    GA_Hun_Long_Air_A_Draw_C = "Hun_Long_JumpAttackA_Montage", GA_Hun_Long_Air_B_C = "Hun_Long_JumpAttackB_Montage",
+    GA_Hun_Long_Air_B_Draw_C = "Hun_Long_JumpAttackB_Montage", GA_Hun_Long_BCharge_C = "AM_Hun_Long_BCharge",
+    GA_Hun_Long_CounterA_C = "Hun_WangMingZhanMaDao_Attack_BB_Montage", GA_Hun_Long_CounterB_C = "Hun_Long_CounterB_Montage",
+    GA_Hun_LuanYing_AAAAA_C = "Hun_LuanYing_AAAAA_Montage", GA_Hun_LuanYing_AAAA_C = "Hun_LuanYing_AAAA_Montage",
+    GA_Hun_LuanYing_AAA_C = "Hun_LuanYing_AAA_Montage", GA_Hun_LuanYing_AA_C = "Hun_LuanYing_AA_Montage",
+    GA_Hun_LuanYing_A_C = "Hun_LuanYing_A_Montage", GA_Hun_LuanYing_A_DashDraw_C = "Hun_LuanYing_B_Montage",
+    GA_Hun_LuanYing_DashA_C = "AM_Hun_LuanYing_B_Dash", GA_Hun_LuanYing_Draw_A_C = "Hun_LuanYing_A_Montage",
+    GA_Hun_LuanYing_P2_AAAB_C = "Hun_LuanYing_P2_AAAB_Montage", GA_Hun_LuanYing_P2_AAB_C = "Hun_LuanYing_P2_AAB_Montage",
+    GA_Hun_LuanYing_P2_AB_C = "Hun_LuanYing_P2_AB_Montage", GA_Hun_LuanYing_P2_BBB_C = "Hun_LuanYing_P2_BBB_Montage",
+    GA_Hun_LuanYing_P2_BB_C = "Hun_LuanYing_P2_BB_Montage", GA_Hun_LuanYing_P2_B_C = "Hun_LuanYing_P2_B_Montage",
+    GA_Hun_LuanYing_P2_CA_C = "Hun_LuanYing_P2_Unique_Skill_Montage", GA_Hun_LuanYing_SWT_P2_C = "Hun_LuanYing_P2_Buff_Montage",
+    GA_Hun_Lute_AAA_C = "Hun_ShaChi_Lute_Attack_AAA_Montage", GA_Hun_Lute_AA_C = "Hun_ShaChi_Lute_Attack_AA_Montage",
+    GA_Hun_Lute_A_C = "Hun_ShaChi_Lute_Attack_A_Montage", GA_Hun_Lute_SKill_C = "Hun_ShaChi_Lute_Skill_01_Start_Montage",
+    GA_Hun_Mojian_AAA_C = "Hun_Shachi_MJZ_AAA_attack_Montage", GA_Hun_Mojian_AA_C = "Hun_Shachi_MJZ_AA_attack_Montage",
+    GA_Hun_Mojian_A_C = "Hun_Shachi_MJZ_A_attack_Montage", GA_Hun_Mojian_A_Short_C = "Hun_Shachi_MJZ_A_Attack_Short_Montage1",
+    GA_Hun_Mojian_UpRunGEx_01_C = "Hun_Shachi_MJZ_UpRunExecution_0_Montage", GA_Hun_PoJun_AAAA_C = "Hun_PoJun_Attack_AAAA_Montage",
+    GA_Hun_PoJun_AAAB_C = "Hun_PoJun_Attack_AAAB_Montage", GA_Hun_PoJun_AAA_C = "Hun_PoJun_Attack_AAA_Montage",
+    GA_Hun_PoJun_AAB_C = "Hun_PoJun_Attack_AAB_Montage", GA_Hun_PoJun_AA_C = "Hun_PoJun_Attack_AA_Montage",
+    GA_Hun_PoJun_AB_C = "Hun_PoJun_Attack_AB_Montage", GA_Hun_PoJun_A_C = "Hun_PoJun_Attack_A_Montage",
+    GA_Hun_PoJun_A_DashDraw_C = "Hun_PoJun_Attack_Draw_A_Montage", GA_Hun_PoJun_A_Dash_C = "Hun_PoJun_Dash_A_Montage",
+    GA_Hun_PoJun_A_Draw_C = "Hun_PoJun_Attack_A_Montage", GA_Hun_PoJun_BB_C = "Hun_PoJun_Attack_BB_Montage",
+    GA_Hun_PoJun_B_C = "Hun_PoJun_Attack_B_Montage", GA_Hun_PoJun_B_DashDraw_C = "Hun_PoJun_Attack_Draw_B_Montage",
+    GA_Hun_PoJun_B_Dash_C = "Hun_PoJun_Attack_Dash_B_Montage", GA_Hun_PoJun_B_Draw_C = "Hun_PoJun_Attack_B_Montage",
+    GA_Hun_PoJun_C_C = "Hun_PoJun_Attack_C_Montage", GA_Hun_PoJun_DB_02_C = "Hun_PoJun_Attack_CC_Montage",
+    GA_Hun_PoJun_DB_C = "Hun_PoJun_SpecialSkill_01_Montage", GA_Hun_ShachiHook_CAA_C = "ShaChi_Hook_CAA_Montage",
+    GA_Hun_ShachiHook_CA_C = "ShaChi_Hook_CA_Montage", GA_Hun_ShachiHook_CBB_C = "ShaChi_Hook_CBB_Montage",
+    GA_Hun_ShachiHook_CB_C = "ShaChi_Hook_CB_Montage", GA_Hun_ShachiHook_CCCC_C = "ShaChi_Hook_CCCC_Montage",
+    GA_Hun_ShachiHook_CCC_C = "ShaChi_Hook_CCC_Montage", GA_Hun_ShachiHook_CC_C = "ShaChi_Hook_CC_Montage",
+    GA_Hun_ShachiHook_CDD_C = "ShaChi_Hook_CDD_Montage", GA_Hun_ShachiHook_CD_C = "ShaChi_Hook_CD_Montage",
+    GA_Hun_ShachiHook_C_C = "ShaChi_Hook_C_Montage", GA_Hun_ShachiHook_Drag_C = "ShaChi_Hook_Skill_01_Montage",
+    GA_Hun_ShachiHook_HookMove_C = "ShaChi_Hook_Skill_02_Start_Montage", GA_Hun_ShuangYue_AAAAAA_C = "Hun_ShuangYue_Attack_AAAAAA_Montage",
+    GA_Hun_ShuangYue_AAAAA_C = "Hun_ShuangYue_Attack_AAAAA_Montage", GA_Hun_ShuangYue_AAAA_C = "Hun_ShuangYue_Attack_AAAA_Montage",
+    GA_Hun_ShuangYue_AAABB_C = "Hun_ShuangYue_Attack_AAABB_Montage", GA_Hun_ShuangYue_AAAB_C = "Hun_ShuangYue_Attack_AAAB_Montage",
+    GA_Hun_ShuangYue_AAA_C = "Hun_ShuangYue_Attack_AAA_Montage", GA_Hun_ShuangYue_AABB_C = "Hun_ShuangYue_Attack_AABB_Montage",
+    GA_Hun_ShuangYue_AAB_C = "Hun_ShuangYue_Attack_AAB_Montage", GA_Hun_ShuangYue_AA_C = "Hun_ShuangYue_Attack_AA_Montage",
+    GA_Hun_ShuangYue_ABB_C = "Hun_ShuangYue_Attack_ABB_Montage", GA_Hun_ShuangYue_AB_C = "Hun_ShuangYue_Attack_AB_Montage",
+    GA_Hun_ShuangYue_A_C = "Hun_ShuangYue_Attack_A_Montage", GA_Hun_ShuangYue_A_DashDraw_C = "Hun_ShuangYue_Dash_A_Montage",
+    GA_Hun_ShuangYue_A_Dash_C = "Hun_ShuangYue_Dash_A_Montage", GA_Hun_ShuangYue_A_Draw_C = "Hun_ShuangYue_Attack_A_Montage",
+    GA_Hun_ShuangYue_BBBB_C = "Hun_ShuangYue_Attack_BBBB_Montage", GA_Hun_ShuangYue_BBB_C = "Hun_ShuangYue_Attack_BBB_Montage",
+    GA_Hun_ShuangYue_BB_C = "Hun_ShuangYue_Attack_BB_Montage", GA_Hun_ShuangYue_B_C = "Hun_ShuangYue_Attack_B_Montage",
+    GA_Hun_ShuangYue_B_DashDraw_C = "Hun_ShuangYue_Dash_B_Montage", GA_Hun_ShuangYue_B_Dash_C = "Hun_ShuangYue_Dash_B_Montage",
+    GA_Hun_ShuangYue_B_Draw_C = "Hun_ShuangYue_Attack_B_Montage", GA_Hun_ShuangYue_C_C = "Hun_ShuangYue_Unique_Skill_Montage",
+    GA_Hun_ShuangYue_DB_C = "Hun_ShuangYue_Skill_02_Montage", GA_Hun_ShuangYue_DB_SWT_C = "Hun_ShuangYue_Skill_02_Montage",
+    GA_Hun_ShuangYue_PBB_C = "Hun_ShuangYue_Skill_03_Montage", GA_Hun_ShuangYue_PB_C = "Hun_ShuangYue_Skill_01_Montage",
+    GA_Hun_ShuangYue_SWT_C = "Hun_ShuangYue_Skill_02_Montage", GA_Hun_SlitheringSword_AAAAA_C = "AM_Hun_SlitheringSword_AAAAA",
+    GA_Hun_SlitheringSword_AAAA_C = "AM_Hun_SlitheringSword_AAAA", GA_Hun_SlitheringSword_AAABB_C = "AM_Hun_SlitheringSword_AAABB",
+    GA_Hun_SlitheringSword_AAAB_C = "AM_Hun_SlitheringSword_AAAB", GA_Hun_SlitheringSword_AAA_C = "AM_Hun_SlitheringSword_AAA",
+    GA_Hun_SlitheringSword_AABB_C = "AM_Hun_SlitheringSword_AABB", GA_Hun_SlitheringSword_AAB_C = "AM_Hun_SlitheringSword_AAB",
+    GA_Hun_SlitheringSword_AA_C = "AM_Hun_SlitheringSword_AA", GA_Hun_SlitheringSword_ABB_C = "AM_Hun_SlitheringSword_ABB",
+    GA_Hun_SlitheringSword_AB_C = "AM_Hun_SlitheringSword_AB", GA_Hun_SlitheringSword_A_C = "AM_Hun_SlitheringSword_A1",
+    GA_Hun_SlitheringSword_A_DashDraw_C = "AM_Hun_SlitheringSword_A_DashDraw",
+    GA_Hun_SlitheringSword_A_Dash_C = "AM_Hun_SlitheringSword_A_Dash", GA_Hun_SlitheringSword_BBB_C = "AM_Hun_SlitheringSword_BBB",
+    GA_Hun_SlitheringSword_BB_C = "AM_Hun_SlitheringSword_BB", GA_Hun_SlitheringSword_B_C = "AM_Hun_SlitheringSword_B",
+    GA_Hun_SlitheringSword_B_DashDraw_C = "AM_Hun_SlitheringSword_B_DashDraw",
+    GA_Hun_SlitheringSword_B_Dash_C = "AM_Hun_SlitheringSword_B_Dash", GA_Hun_SlitheringSword_C_C = "AM_Hun_SlitheringSword_C_Normal",
+    GA_Hun_SlitheringSword_DA_C = "AM_Hun_SlitheringSword_DA_Start",
+    GA_Hun_SlitheringSword_DB4_C = "Hun_SoftSword_Stance_Attack_07_Montage",
+    GA_Hun_SlitheringSword_DB5_C = "Hun_SoftSword_Stance_Attack_06_Montage",
+    GA_Hun_SlitheringSword_EvalutionCombo_New_C = "Hun_SoftSword_Attack_01_Montage",
+    GA_Hun_SlitheringSword_Potential_C = "Hun_SoftSword_Skill_03_Montage", GA_Hun_SlitheringSword_SWT_C = "AM_Hun_SlitheringSword_SWT",
+    GA_Hun_SnakeDual_AAA_C = "AM_Hun_SnakeDual_AAA", GA_Hun_SnakeDual_AA_C = "AM_Hun_SnakeDual_AA",
+    GA_Hun_SnakeDual_ABAA_C = "AM_Hun_SnakeDual_BA2", GA_Hun_SnakeDual_ABABAA_C = "AM_Hun_SnakeDual_AAAA",
+    GA_Hun_SnakeDual_ABABA_C = "AM_Hun_SnakeDual_AA", GA_Hun_SnakeDual_ABABB_C = "AM_Hun_SnakeDual_BBBB",
+    GA_Hun_SnakeDual_ABAB_C = "AM_Hun_SnakeDual_BABB", GA_Hun_SnakeDual_ABA_C = "AM_Hun_SnakeDual_AB2",
+    GA_Hun_SnakeDual_ABB_C = "AM_Hun_SnakeDual_BB", GA_Hun_SnakeDual_AB_C = "AM_Hun_SnakeDual_AB1",
+    GA_Hun_SnakeDual_A_C = "AM_Hun_SnakeDual_A", GA_Hun_SnakeDual_A_Dash_C = "AM_Hun_SnakeDual_A_Dash",
+    GA_Hun_SnakeDual_A_Fast_C = "AM_Hun_SnakeDual_A", GA_Hun_SnakeDual_Air_A_Double_C = "Hun_Tang_JumpAttackB_Montage",
+    GA_Hun_SnakeDual_Air_A_Draw_Double_C = "Hun_Tang_JumpAttackB_Montage",
+    GA_Hun_SnakeDual_Air_B_Double_C = "Hun_Double_JumpAttackA_Montage",
+    GA_Hun_SnakeDual_Air_B_Draw_Double_C = "Hun_Double_JumpAttackA_Montage", GA_Hun_SnakeDual_BAA_C = "AM_Hun_SnakeDual_BAA",
+    GA_Hun_SnakeDual_BABAA_C = "AM_Hun_SnakeDual_BABA", GA_Hun_SnakeDual_BABABB_C = "AM_Hun_SnakeDual_BBBBB",
+    GA_Hun_SnakeDual_BABAB_C = "AM_Hun_SnakeDual_BA1", GA_Hun_SnakeDual_BABA_C = "AM_Hun_SnakeDual_BAB",
+    GA_Hun_SnakeDual_BABB_C = "AM_Hun_SnakeDual_BBBB", GA_Hun_SnakeDual_BAB_C = "AM_Hun_SnakeDual_BBB",
+    GA_Hun_SnakeDual_BA_C = "AM_Hun_SnakeDual_AAA", GA_Hun_SnakeDual_BB_C = "AM_Hun_SnakeDual_BB",
+    GA_Hun_SnakeDual_B_C = "AM_Hun_SnakeDual_B", GA_Hun_SnakeDual_B_Dash_C = "AM_Hun_SnakeDual_B_Dash",
+    GA_Hun_SnakeDual_B_Fast_C = "AM_Hun_SnakeDual_B", GA_Hun_SnakeDual_C_C = "AM_Hun_SnakeDual_C",
+    GA_Hun_SnakeDual_DA_C = "AM_Hun_SnakeDual_AA", GA_Hun_SnakeDual_DB_C = "AM_Hun_SnakeDual_BBBB",
+    GA_Hun_SnakeDual_SWT_C = "AM_Hun_SnakeDual_SWT", GA_Hun_Tang_A_DashDraw_C = "AM_Hun_Tang_A_DashDraw",
+    GA_Hun_Tang_Air_A_C = "Hun_Tang_JumpAttackB_Montage", GA_Hun_Tang_Air_A_Draw_C = "Hun_Tang_JumpAttackB_Montage",
+    GA_Hun_Tang_Air_B_C = "Hun_Tang_JumpAttackA_Montage", GA_Hun_Tang_Air_B_Draw_C = "Hun_Tang_JumpAttackA_Montage",
+    GA_Hun_Tang_B_DashDraw_C = "AM_Hun_Tang_B_DashDraw", GA_Hun_Tang_B_Draw_C = "AM_Hun_Tang_B_Draw",
+    GA_Hun_Tang_SWT_UI_C = "AM_Hun_Tang_A_Draw", GA_Hun_WoodenSword_AAAAA_C = "Hun_WoodenSword_Light_AAAAA_Montage",
+    GA_Hun_WoodenSword_AAAA_C = "Hun_WoodenSword_Light_AAAA_Montage", GA_Hun_WoodenSword_AAABB_C = "Hun_WoodenSword_AAABB_Montage",
+    GA_Hun_WoodenSword_AAAB_C = "Hun_WoodenSword_AAAB_Montage", GA_Hun_WoodenSword_AAA_C = "Hun_WoodenSword_Light_AAA_Montage",
+    GA_Hun_WoodenSword_AABB_C = "Hun_WoodenSword_AABB_Montage", GA_Hun_WoodenSword_AAB_C = "Hun_WoodenSword_AAAB_Montage",
+    GA_Hun_WoodenSword_AA_C = "Hun_WoodenSword_Light_AA_Montage", GA_Hun_WoodenSword_ABB_C = "Hun_Young_AB_Montage",
+    GA_Hun_WoodenSword_AB_C = "Hun_WoodenSword_ABB_Montage", GA_Hun_WoodenSword_A_C = "Hun_WoodenSword_Light_A_Montage",
+    GA_Hun_WoodenSword_A_DashDraw_C = "Hun_WoodenSword_A_Dash_Montage", GA_Hun_WoodenSword_A_Dash_C = "Hun_WoodenSword_A_Dash_Montage",
+    GA_Hun_WoodenSword_A_Draw_C = "Hun_WoodenSword_Light_A_Draw_Placeholder_Montage",
+    GA_Hun_WoodenSword_Air_A_C = "Hun_WoodenSword_Tang_JumpAttackB_Montage",
+    GA_Hun_WoodenSword_Air_A_Draw_C = "Hun_WoodenSword_Tang_JumpAttackB_Montage",
+    GA_Hun_WoodenSword_Air_B_C = "Hun_WoodenSword_Tang_JumpAttackA_Montage",
+    GA_Hun_WoodenSword_Air_B_Draw_C = "Hun_WoodenSword_Tang_JumpAttackA_Montage", GA_Hun_WoodenSword_BBB_C = "Hun_WoodenSword_BBB_Montage",
+    GA_Hun_WoodenSword_BB_C = "Hun_WoodenSword_BB_Montage", GA_Hun_WoodenSword_B_C = "Hun_WoodenSword_B_Montage",
+    GA_Hun_WoodenSword_B_DashDraw_C = "Hun_WoodenSword_B_DashDraw_Montage", GA_Hun_WoodenSword_B_Dash_C = "Hun_WoodenSword_B_Dash_Montage",
+    GA_Hun_WoodenSword_B_Draw_C = "Hun_WoodenSword_B_Draw_Montage", GA_Hun_WoodenSword_C_C = "Hun_MaleThug_UniqueSkill_Montage",
+    GA_Hun_WoodenSword_SWT_New_C = "AM_Hun_Tang_A_DashDraw", GA_Hun_XieShan_AAAAA_C = "Hun_ShanZi_AAAAA_Montage",
+    GA_Hun_XieShan_AAAA_C = "Hun_ShanZi_AAAA_Montage", GA_Hun_XieShan_AAABB_C = "Hun_ShanZi_AAABB_Montage",
+    GA_Hun_XieShan_AAAB_C = "Hun_ShanZi_AAAB_Montage", GA_Hun_XieShan_AAA_C = "Hun_ShanZi_AAA_Montage",
+    GA_Hun_XieShan_AABB_C = "Hun_ShanZi_AABB_Montage", GA_Hun_XieShan_AAB_C = "Hun_ShanZi_AAB_Montage",
+    GA_Hun_XieShan_AA_C = "Hun_ShanZi_AA_Montage", GA_Hun_XieShan_ABB_C = "Hun_ShanZi_ABB_Montage",
+    GA_Hun_XieShan_AB_C = "Hun_ShanZi_AB_Montage", GA_Hun_XieShan_A_C = "Hun_ShanZi_A_Montage",
+    GA_Hun_XieShan_A_DashDraw_New_C = "Hun_ShanZi_Dash_A_Montage", GA_Hun_XieShan_A_Dash_C = "Hun_ShanZi_Dash_A_Montage",
+    GA_Hun_XieShan_A_Draw_New_C = "Hun_ShanZi_A_Montage", GA_Hun_XieShan_BBB_C = "Hun_ShanZi_BBB_Montage",
+    GA_Hun_XieShan_BB_C = "Hun_ShanZi_BB_Montage", GA_Hun_XieShan_B_C = "Hun_ShanZi_B_Montage",
+    GA_Hun_XieShan_B_DashDraw_New_C = "Hun_ShanZi_Dash_B_Montage", GA_Hun_XieShan_B_Dash_C = "Hun_ShanZi_Dash_B_Montage",
+    GA_Hun_XieShan_B_Draw_New_C = "Hun_ShanZi_B_Montage", GA_Hun_XieShan_C_C = "Hun_ShanZi_Unique_Skill_Montage",
+    GA_Hun_XieShan_DB_C = "Hun_ShanZi_Skill_05_Montage", GA_Hun_XieShan_SWT_02_C = "Hun_YuuBlade_Unique_Skill_03_Montage",
+    GA_Hun_YanYueDao_AAAA_C = "Hun_YanYueDao_Attack_AAAA_Montage", GA_Hun_YanYueDao_AAA_C = "Hun_YanYueDao_Attack_AAA_Montage",
+    GA_Hun_YanYueDao_AA_C = "Hun_YanYueDao_Attack_AA_Montage", GA_Hun_YanYueDao_A_C = "Hun_YanYueDao_Attack_A_Montage",
+    GA_Hun_YanYueDao_A_Dash_C = "Hun_YanYueDao_Dash_A_Montage", GA_Hun_YanYueDao_BB_C = "Hun_YanYueDao_Attack_BB_Montage",
+    GA_Hun_YanYueDao_B_C = "Hun_YanYueDao_Attack_B_Montage", GA_Hun_YanYueDao_B_Dash_C = "Hun_YanYueDao_Dash_B_Montage",
+    GA_Hun_YanYueDao_B_Reinforced_C = "RTG_HUN_YuDing_Skill_05_FullEnd", GA_Hun_YanYueDao_C_C = "Hun_YanYueDao_Skill_03_Start_Montage",
+    GA_Hun_YanYueDao_SWT_C = "Hun_YanYueDao_SimpleExE_Multi_01_Montage",
+    GA_Hun_YanYueDao_SpecialSkill_C = "Hun_YanYueDao_Skill_01_A_Montage", GA_Hun_YuuBlade_AAAAA_C = "Hun_YuuBlade_AAAAAA_Montage",
+    GA_Hun_YuuBlade_AAAAB_C = "Hun_YuuBlade_BBBB_Montage", GA_Hun_YuuBlade_AAAA_C = "Hun_YuuBlade_BBB_Montage",
+    GA_Hun_YuuBlade_AAAB_C = "Hun_YuuBlade_AB_Montage", GA_Hun_YuuBlade_AAA_C = "Hun_YuuBlade_B_Montage",
+    GA_Hun_YuuBlade_AAB_C = "Hun_YuuBlade_AAA_Montage", GA_Hun_YuuBlade_AA_C = "Hun_YuuBlade_AA_Montage",
+    GA_Hun_YuuBlade_AB_C = "Hun_YuuBlade_BB_Montage", GA_Hun_YuuBlade_A_C = "Hun_YuuBlade_A_Montage",
+    GA_Hun_YuuBlade_A_DashDraw_C = "Hun_YuuBlade_Dash_A_Montage", GA_Hun_YuuBlade_A_Dash_C = "Hun_YuuBlade_Dash_A_Montage",
+    GA_Hun_YuuBlade_A_Draw_C = "Hun_YuuBlade_A_Montage", GA_Hun_YuuBlade_BBBB_C = "Hun_YuuBlade_AABB_Montage",
+    GA_Hun_YuuBlade_BBB_C = "Hun_YuuBlade_AAAAAB_Montage", GA_Hun_YuuBlade_BB_C = "Hun_YuuBlade_AAAAA_Montage",
+    GA_Hun_YuuBlade_B_C = "Hun_YuuBlade_ABB_Montage", GA_Hun_YuuBlade_B_DashDraw_C = "Hun_YuuBlade_Dash_B_Montage",
+    GA_Hun_YuuBlade_B_Dash_C = "Hun_YuuBlade_Dash_B_Montage", GA_Hun_YuuBlade_B_Draw_C = "Hun_YuuBlade_ABB_Montage",
+    GA_Hun_YuuBlade_C_C = "Hun_YuuBlade_Buff_Montage", GA_Hun_YuuBlade_FastHeavyAttack_C = "Hun_YuuBlade_Heavy_QuickSlash_Montage",
+    GA_Hun_YuuBlade_FastLightAttack_C = "Hun_YuuBlade_Light_QuickSlash_Montage",
+    GA_Hun_YuuBlade_SWT_C = "Hun_YuuBlade_Unique_Skill_03_Montage", GA_Hun_ZhanMa_AAAA_C = "Hun_WangMingZhanMaDao_Attack_AAAA_Montage",
+    GA_Hun_ZhanMa_AAAB_C = "Hun_WangMingZhanMaDao_Attack_AAAB_Montage", GA_Hun_ZhanMa_AAA_C = "Hun_WangMingZhanMaDao_Attack_AAA_Montage",
+    GA_Hun_ZhanMa_AAB_C = "Hun_WangMingZhanMaDao_Attack_AAB_Montage", GA_Hun_ZhanMa_AA_C = "Hun_WangMingZhanMaDao_Attack_AA_Montage",
+    GA_Hun_ZhanMa_AB_C = "Hun_WangMingZhanMaDao_Attack_AB_Montage", GA_Hun_ZhanMa_A_C = "Hun_WangMingZhanMaDao_Attack_A_Montage",
+    GA_Hun_ZhanMa_A_DashDraw_C = "Hun_Horizontal_A_Dash_Montage", GA_Hun_ZhanMa_A_Dash_C = "Hun_Horizontal_A_Dash_Montage",
+    GA_Hun_ZhanMa_A_Draw_C = "Hun_WangMingZhanMaDao_Attack_A_Montage", GA_Hun_ZhanMa_Air_A_C = "Hun_Long_JumpAttackA_Montage",
+    GA_Hun_ZhanMa_Air_A_Draw_C = "Hun_Long_JumpAttackA_Montage", GA_Hun_ZhanMa_Air_B_C = "Hun_Long_JumpAttackB_Montage",
+    GA_Hun_ZhanMa_Air_B_Draw_C = "Hun_Long_JumpAttackB_Montage", GA_Hun_ZhanMa_BB_C = "Hun_WangMingZhanMaDao_Attack_BB_Montage",
+    GA_Hun_ZhanMa_B_C = "Hun_WangMingZhanMaDao_Attack_B_Montage", GA_Hun_ZhanMa_B_DashDraw_C = "Hun_Horizontal_B_DashDraw_Montage",
+    GA_Hun_ZhanMa_B_Dash_C = "Hun_Horizontal_B_Dash_Fixed_Montage", GA_Hun_ZhanMa_B_Draw_C = "Hun_WangMingZhanMaDao_Attack_B_Montage",
+    GA_Hun_ZhanMa_C_C = "Hun_WangMingZhanMaDao_Unique_Skill_02_Montage", GA_Hun_ZhanMa_DB_C = "Hun_WangMingZhanMaDao_Skill_02_Montage",
+    GA_Hun_ZhanMa_SA_C = "Hun_WangMingZhanMaDao_Skill_03_Montage", GA_Hun_ZhanMa_SWT_C = "Hun_Horizontal_SWT_Montage",
+    GA_Hun_ZiMingJian_New_AAAAA_C = "Hun_ZiMing_AAAAA", GA_Hun_ZiMingJian_New_AAAA_C = "Hun_ZiMing_AAAA",
+    GA_Hun_ZiMingJian_New_AAABB_C = "Hun_ZiMing_AAABB", GA_Hun_ZiMingJian_New_AAAB_C = "Hun_ZiMing_AAAB",
+    GA_Hun_ZiMingJian_New_AAA_C = "Hun_ZiMing_AAA", GA_Hun_ZiMingJian_New_AABB_C = "Hun_ZiMing_AABB",
+    GA_Hun_ZiMingJian_New_AAB_C = "Hun_ZiMing_AAB", GA_Hun_ZiMingJian_New_AA_C = "Hun_ZiMing_AA",
+    GA_Hun_ZiMingJian_New_ABB_C = "Hun_ZiMing_ABB", GA_Hun_ZiMingJian_New_AB_C = "Hun_ZiMing_AB",
+    GA_Hun_ZiMingJian_New_A_C = "Hun_ZiMing_A", GA_Hun_ZiMingJian_New_A_DashDraw_C = "Hun_ZiMing_A_Dash",
+    GA_Hun_ZiMingJian_New_A_Dash_C = "Hun_ZiMing_A_Dash", GA_Hun_ZiMingJian_New_A_Draw_C = "Hun_ZiMing_A",
+    GA_Hun_ZiMingJian_New_BBB_C = "Hun_ZiMing_BBB", GA_Hun_ZiMingJian_New_BB_C = "Hun_ZiMing_BB",
+    GA_Hun_ZiMingJian_New_B_C = "Hun_ZiMing_B", GA_Hun_ZiMingJian_New_B_DashDraw_C = "Hun_ZiMing_B_Dash",
+    GA_Hun_ZiMingJian_New_B_Dash_C = "Hun_ZiMing_B_Dash", GA_Hun_ZiMingJian_New_B_Draw_C = "Hun_ZiMing_B",
+    GA_Hun_ZiMingJian_New_CCC_C = "Hun_ZiMing_Unique_Skill_B_Montage", GA_Hun_ZiMingJian_New_CC_C = "Hun_ZiMing_Unique_Skill_A_Montage",
+    GA_Hun_ZiMingJian_New_C_C = "Hun_ZiMing_Unique_Skill_Montage", GA_Hun_ZiMingJian_New_DB_C = "Hun_ZiMing_Summon_Start_Montage",
+    GA_Hun_ZiMingJian_New_SWT_Power_C = "Hun_ZiMing_SWT_Power", GA_JinGua_Air_C = "Hun_ShaChi_JinGua_SpecialAttack_08_Montage",
+    GA_JinGua_ExtraAttack_C = "Hun_ShaChi_JinGua_Skill_05_Montage", GA_JinGua_Normal_C = "Hun_ShaChi_JinGua_SpecialAttack_03_Montage",
+    GA_JinGua_RoAttack_C = "Hun_ShaChi_JinGua_Skill_06_Start_Montage", GA_LionHead_C = "AM_Hun_LionHead_Start_1",
+    GA_LionHead_Dash_C = "Hun_LionDancer_Skill_02_Montage", GA_LionHead_DoubleFireBall_C = "Hun_LionDancer_Skill_01_Montage",
+    GA_LionHead_FireBall_C = "Hun_LionDancer_Skill_01_Montage", GA_Lute_Dash_C = "Hun_ShaChi_Lute_Dash_B_Montage",
+    GA_MiaoShouFeiDao_DB_C = "AM_Hun_Unarm_Dash_F", GA_MiaoShouFeiDao_Escape_01_C = "Hun_ShaChi_MiaoShouFeiDao_SpecialAttack_B_Montage",
+    GA_MiaoShouFeiDao_Escape_02_C = "Hun_ShaChi_MiaoShouFeiDao_SpecialAttack_B_Montage",
+    GA_MiaoShouFeiDao_Escape_03_C = "Hun_ShaChi_MiaoShouFeiDao_SpecialAttack_B_Montage",
+    GA_MiaoShouFeiDao_Normal_01_C = "Hun_FeiZei_ZongHuoZei_Attack_01_Montage",
+    GA_MiaoShouFeiDao_Normal_02_C = "Hun_FeiZei_NiShuiZei_Attack_01_Montage",
+    GA_MiaoShouFeiDao_Normal_03_C = "Hun_FeiZei_NiShuiZei_Attack_01_Montage", GA_TanLang_ExtraAttack_C = "Hun_LangYa_Skill_01_A_Montage",
+    GA_TanLang_Normal_C = "Hun_LangYa_Skill_01_Start_Montage", GA_TanLang_SpeicalAttack_C = "Hun_LangYa_Skill_02_Montage",
+    GA_ThunderSpear_Dash_C = "Hun_ShaChi_LeiTingQiang_Skill_05_Montage",
+    GA_ThunderSpear_DeflectCounter_C = "SpearMan_SpecialAttack_08_BanBen1_Montage",
+    GA_ThunderSpear_DodgeAttack_01_C = "Hun_ShaChi_LeiTingQiang_Skill_04_Montage",
+    GA_ThunderSpear_Normal_01_C = "Hun_ShaChi_LeiTingQiang_Skill_01_Montage",
+    GA_ThunderSpear_Normal_02_C = "Hun_ShaChi_LeiTingQiang_Skill_02_Montage",
+    GA_ThunderSpear_Normal_03_C = "Hun_ShaChi_LeiTingQiang_Skill_03_Montage",
+    GA_ThunderSpear_SpecialAttack_04_C = "Hun_ShaChi_LeiTingQiang_Skill_06_BanBen01_Montage",
+    GA_TieKuangQuanTao_Charge_AAA_C = "Hun_QuanTao_Attack_AAA_Montage", GA_TieKuangQuanTao_Charge_AA_C = "Hun_QuanTao_Attack_AA_Montage",
+    GA_TieKuangQuanTao_Charge_A_C = "Hun_QuanTao_Attack_A_Montage", GA_TigerCannon_C = "AM_Hun_TigerCannon_Prepare",
+    GA_TigerCannon_Dash_C = "Hun_ShaChi_DonCanon_SpecialSkill_01_Montage", GA_TigerCannon_Ultimate_C = "LeiDang_CriticalArt_02_Montage",
+    GA_UnnamedBow_C = "AM_Hun_UnnamedBow_Charge", GA_UnnamedBow_Dash_C = "ArrowMan_DuYan_SpecialAttack_04_B_Montage",
+    GA_UnnamedBow_DeflectCounter_C = "ArrowMan_DuYan_SpecialAttack_04_B_Montage", GA_XuKongHuaShan_Reborn_C = "AM_Hun_Tang_DF_L_ForReborn",
+    GA_XuKongHuaShan_Skill_C = "Hun_Shaqi_ShanZi_Skill_01_Montage", GA_XueDiZi_AAA_C = "Hun_ShaChi_XueDiZi_Skill_01_C_Montage",
+    GA_XueDiZi_AA_C = "Hun_ShaChi_XueDiZi_Skill_01_B_Montage", GA_XueDiZi_A_C = "Hun_ShaChi_XueDiZi_Skill_01_A1_Montage",
+    GA_XueDiZi_EvolutionAttack_C = "Hun_ShaChi_XueDiZi_Variants_Skill_01_Montage",
+    GA_XueDiZi_SpecialAttack_C = "Hun_ShaChi_XueDiZi_Skill_02_Montage", GA_YouLongCha_Dash_C = "Hun_ShaChi_YouLongCha_Skill_02_Montage",
+    GA_YouLongCha_Normal_C = "Hun_ShaChi_YouLongCha_Attack_Montage",
+    GA_YouLongHead_WaterCannon_C = "Hun_ShaChi_YouLongTou_Skill_01_Start_Montage",
+    GA_YouLongHead_Water_C = "Hun_ShaChi_YouLongTou_Skill_01_Start_Montage", GA_ZhuoBiDun_C = "Hun_ShaChi_ZhuoBiDun_Entry_Montage",
+    GA_ZhuoBiDun_Slide_C = "Hun_ShaChi_ZhuoBiDun_Skill_03_Montage",
+}
+-- §165.2 END
+
 -- 受击 / 格挡 / 破防 / 闪避不是这一招的动作，不学
 function ANIM.learn(ga, mon)
     if not (ga and mon and mon ~= "") then return end
@@ -4009,7 +4949,7 @@ function ANIM.learn(ga, mon)
     ANIM.map[ga] = mon
 end
 
-function ANIM.expect(ga) return ANIM.map[ga] or ANIM.SEED[ga] end
+function ANIM.expect(ga) return ANIM.map[ga] or ANIM.SEED[ga] or ANIM.SEED2[ga] end
 
 function ANIM.log(fmt, ...)
     ANIM.logs = ANIM.logs + 1
@@ -4055,6 +4995,12 @@ function ANIM.step(tn)
         end
         local cut = name and cutMontage(p.pup)
         local gone = G.cancelMoves(p.pup)
+        -- §165.3 大招补放会再耗一格充能，替身只有 1 格 → 播 C_Failed（黑魔伤 C1 实测）；补放前再补一格
+        -- §165.7 只补"对方确认放成功、发来过的那一招"，每个招式号只补一次（ULT.okFor）
+        if ULT.isUlt(p.name) then
+            if ULT.okFor(p.id, p.name) then ULT.topUp(p.pup)
+            else ANIM.pend = nil; out("◇ 远端#%d %s 不是对方确认过的大招，不补放", p.id, p.name); return end
+        end
         local ok = activateOnPuppet(p.pup, p.name, NET.sub, "补放 远端#" .. p.id)
         ANIM.log("◇ 远端#%d %s 放成功 %.2f 秒，替身动作还是 %s（该是 %s）：停掉 %s、取消 %s，重放 %s", p.id, p.name, tn - p.at,
             tostring(name), want, tostring(cut), #gone > 0 and table.concat(gone, ",") or "无", ok and "成功" or "失败")
@@ -4114,7 +5060,10 @@ end
 -- 没充能时按大招，游戏照样激活 C_C 技能、播 C_Failed——以前这也当一招发出去，假对手随机回"中招"，真人对战时对面的替身
 -- 若有充能会真放出来。现在：发送方把大招压住，看到 C_Failed 就丢掉，放出来了（动作带 Unique，或压满 HOLD_TICKS 帧没失败）才发；
 -- 接收方收到大招 = 对方一定放成功了，激活前把替身的充能补到至少 1 格（替身自己不攒充能，以前用一次就再也放不出）
-ULT.PAT, ULT.HOLD_TICKS, ULT.held, ULT.dropped, ULT.topped = { "_C_C$" }, 3, {}, 0, 0
+-- §165.3 大招不全叫 _C_C：黑魔伤 C1、玉双轮 C_Range、乱影 CA / P2_CA（没充能时都播 *_C_Failed，2026-11-08 双开实测）；
+-- 绝影空中大招 JueYing_C_Air：替身没充能时返回 true 但不变鸟、什么动作都没有（用户 20:29 实测）
+ULT.PAT, ULT.HOLD_TICKS, ULT.held, ULT.dropped, ULT.topped =
+    { "_C_C$", "_C_Air_C$", "^GA_Hun_HeiMoShang_C1_C$", "^GA_Hun_Jade_C_Range_C$", "^GA_Hun_LuanYing_P?2?_?CA_C$" }, 3, {}, 0, 0
 
 function ULT.isUlt(n)
     for _, p in ipairs(ULT.PAT) do if n:find(p) then return true end end
@@ -4146,6 +5095,20 @@ function ULT.flushHeld(p1, hm, tn)
         end
     end
     ULT.held = keep
+end
+
+-- §165.7 补放只认对方发来过的大招：对方压住大招、确认没 C_Failed 才发（ULT.flushHeld），收到时记下招式号 → 招名；补放用掉就删
+ULT.ok, ULT.okN = {}, 0
+function ULT.mark(id, name)
+    if id == nil then return end
+    ULT.ok[id] = name
+    ULT.okN = ULT.okN + 1
+    if ULT.okN > 64 then ULT.ok, ULT.okN = { [id] = name }, 1 end     -- 只留最近的，防止越攒越多
+end
+function ULT.okFor(id, name)
+    if id == nil or ULT.ok[id] ~= name then return false end
+    ULT.ok[id] = nil
+    return true
 end
 
 function ULT.topUp(pup)
@@ -5209,7 +6172,7 @@ end
 -- 远端一个出招事件在替身身上放出来（以前直接写在 netRecv 里；排队的空中招到时也走这里，判定窗口从真放出来时开）
 function AIR.fire(p1, pup, e, tn)
     if BOWN.defer(pup, e, tn, AIR.fire) then return true end      -- §139.3 独眼弓 R2：等对方松手再射
-    if ULT.isUlt(e.name) then ULT.topUp(pup) end        -- v0.27.2 对方放成功了才会发来：替身充能至少 1 格
+    if ULT.isUlt(e.name) then ULT.topUp(pup); ULT.mark(e.id, e.name) end    -- v0.27.2 对方放成功了才会发来：替身充能至少 1 格；§165.7 记下可补放
     local before = select(3, LAT.activeMontage(pup))
     if CHG.PRE[e.name] then CHG.upgrade(pup, e.name, CHG.PRE[e.name]); CHG.potDiag(pup, "放之前") end    -- §92.7
     if LO.isEdgeAttack(e.name) then ST.pupEdgeAt = tn end      -- v0.23.7 影之武装伤害系数
@@ -5325,6 +6288,190 @@ function DGE.step(pup, tn)
         DGE.logs = DGE.logs + 1
         out("  对方闪避 %s，替身是 %s → 换成对方的：%s（换过 %d 次，本来就对 %d 次）", w.m, cur ~= "" and cur or "（没动作）",
             ok and "已播" or "播放失败（本机没有这个动作）", DGE.fixed, DGE.same)
+    end
+end
+
+-- §160 冰冻以挨打方为准（内测 2026-11-08 16:24 v0.30.2："落下白影的武技，他身上那个 y 的追加攻击键都出来了，但对面还是在移动"）。
+-- Y = 白影的冰冻突袭 GA_Hun_BaiYing_SpeicalAssault（处决类，Weapon_Hun_BaiYing 自带的 SpecialAttack 通道：目标身上有
+-- CharacterState.StatusInfliction.Frost.Effect 就出提示；它不看 CanNotBeExecuted，所以对局里禁处决也拦不住）。
+-- 冻住 = 冰冻积累 Frost_Accumulation 攒满后上的 GE_Frost（Hitreact.State.Frozen，站住不能动）。积累是各算各的：
+-- A 本机是真 A 砍替身 B，每一刀都算（替身不会格挡 / 闪避，B 那边格挡 / 闪开的也算）→ 替身先冻住、出 Y；
+-- B 本机是替身 A 砍真 B，B 自己的游戏判 → 没冻。和杀气一样（替身杀气在本机保持满值，破防只听 brk=），只听挨打方。
+-- §160.5 扩到所有异常状态（用户 11-08"那异常状态能矫正么"→"好，让它做"）：点燃 / 中毒（四段）/ 感电 / 流血 / 混沌同一个结构
+-- （积累属性攒满 → 挂 GE → CharacterState.StatusInfliction.* 标签）；雷 / 血爆是瞬发、水没有挂状态的 GE，只压积累。
+-- 发送方 inf=<类型>:<生效次数>:<段 0=没生效>:<积累>,…（只列有东西的类型，全没有 = "-"）；接收方 INF.step 逐类型：
+--   对方生效、替身没有 / 段不对 → 给替身上那一段的 GE（冰冻 → 攻击方出 Y；追击照常发 ev=，对方替身放冰冻突袭在他那边判，双开实测打得中）；
+--   对方没生效、替身有 → 跟着对方上的马上撤；本机自己积出来的等 grace（含往返）秒对方还没有就撤（对方确实中了的话 inf= 会先到）；
+--   替身的积累比对方多 → 压回对方的值（本机多积的是对方没认的刀）。旧版对方没有 inf= → 不动替身（和以前一样）
+-- 类型表（资产名字表，HANDOVER §160.5）：lv[i] = 第 i 段 { 标签, 上的 GE, 撤时连带撤的 GE… }
+INF = { ROOT = "CharacterState.StatusInfliction", GE_DIR = "/PBZCombatAsset/Prototypes/GameplayEffects/Inflictions/",
+        EVERY = 3, ACC_EVERY = 9, GRACE = 0.15, GRACE_MAX = 0.6, ACC_SLACK = 1.0, LOG_MAX = 60, logs = 0,
+        st = { mirror = 0, strip = 0, clamp = 0 }, me = {}, pup = {}, r = nil,
+        TYPES = {
+            { id = "frost", name = "冰冻", acc = "Frost_Accumulation",
+              lv = { { "CharacterState.StatusInfliction.Frost.Effect", "GE_Frost" } } },
+            { id = "ignite", name = "点燃", acc = "Ignite_Accumulation",
+              lv = { { "CharacterState.StatusInfliction.Ignite", "GE_Ignite" } } },
+            { id = "poison", name = "中毒", acc = "Poison_Accumulation",
+              lv = { { "CharacterState.StatusInfliction.Poison.Phase0", "GE_Poison_Phase0" },
+                     { "CharacterState.StatusInfliction.Poison.Phase1", "GE_Poison_Phase1" },
+                     { "CharacterState.StatusInfliction.Poison.Phase2", "GE_Poison_Phase2" },
+                     { "CharacterState.StatusInfliction.Poison.Phase3", "GE_Poison_Phase3" } } },
+            { id = "elec", name = "感电", acc = "Electrified_Accumulation",
+              lv = { { "CharacterState.StatusInfliction.Electrified", "GE_Electrified" } } },
+            { id = "bleed", name = "流血", acc = "Bleed_Accumulation",
+              lv = { { "CharacterState.StatusInfliction.Bleed.Small", "GE_BleedSmall" } } },
+            { id = "chaos", name = "混沌",
+              lv = { { "CharacterState.StatusInfliction.Chaos", "GE_ChaosEffect", "GE_Chaos" } } },
+            { id = "thunder", name = "雷", acc = "Thunder_Accumulation", lv = {} },
+            { id = "bburst", name = "血爆", acc = "BloodBurst_Accumulation", lv = {} },
+            { id = "water", name = "水", acc = "Water_Accumulation", lv = {} },
+        } }
+
+function INF.say(fmt, ...)
+    if INF.logs >= INF.LOG_MAX then return end
+    INF.logs = INF.logs + 1
+    out(fmt, ...)
+end
+
+function INF.gePath(short) return INF.GE_DIR .. short .. "." .. short .. "_C" end
+
+-- 每个类型现在在第几段（0 = 没生效）。先问父标签：身上没有任何异常状态时只问一次
+function INF.levels(actor)
+    local res = {}
+    local any = G.tagsMatching(actor, { INF.ROOT })
+    if not (any and #any > 0) then return res end
+    for _, ty in ipairs(INF.TYPES) do
+        local tags = {}
+        for i, l in ipairs(ty.lv) do tags[i] = l[1] end
+        if #tags > 0 then
+            local hit = G.tagsMatching(actor, tags) or {}
+            local set = {}
+            for _, h in ipairs(hit) do set[h] = true end
+            for i = #ty.lv, 1, -1 do
+                if set[ty.lv[i][1]] then res[ty.id] = i; break end
+            end
+        end
+    end
+    return res
+end
+
+-- 发送方：每 EVERY 帧看一次自己身上的异常状态（积累每 ACC_EVERY 帧读一次），返回 inf= 的值
+function INF.mine(p1, tn)
+    if INF.wire and ST.ticks % INF.EVERY ~= 0 then return INF.wire end
+    local lv = INF.levels(p1)
+    local readAcc = INF.wire == nil or ST.ticks % INF.ACC_EVERY == 0
+    local parts = {}
+    for _, ty in ipairs(INF.TYPES) do
+        local s = INF.me[ty.id] or { n = 0, lv = 0, acc = 0 }
+        INF.me[ty.id] = s
+        local l = lv[ty.id] or 0
+        if l > s.lv then
+            s.n = s.n + 1
+            if s.lv == 0 then s.onAt = tn end
+            INF.say("※ 我%s了（%s第 %d 次%s，inf= 告诉对方，他那边替身也跟着）", ty.name, s.lv == 0 and "" or "加重，",
+                s.n, #ty.lv > 1 and string.format("，第 %d 段", l) or "")
+        elseif l == 0 and s.lv > 0 then
+            INF.say("※ 我%s结束了（%.1f 秒）", ty.name, tn - (s.onAt or tn))
+        end
+        s.lv = l
+        if readAcc and ty.acc then s.acc = attrOf(p1, ty.acc) or s.acc end
+        if s.n > 0 or s.lv > 0 or s.acc >= 0.5 then
+            parts[#parts + 1] = string.format("%s:%d:%d:%.0f", ty.id, s.n, s.lv, s.acc)
+        end
+    end
+    INF.wire = #parts > 0 and table.concat(parts, ",") or "-"
+    return INF.wire
+end
+
+-- 接收方：记下对方的异常状态；旧版没有 inf= → INF.r = nil，不动替身。没列出的类型 = 0 次、没生效、积累 0
+function INF.onPacket(t, tn)
+    if not t.inf or t.inf == "" then INF.r = nil; return end
+    local r = {}
+    for id, n, l, acc in t.inf:gmatch("(%a+):(%d+):(%d+):([%d%.]+)") do
+        r[id] = { n = tonumber(n), lv = tonumber(l), acc = tonumber(acc) }
+    end
+    INF.r = r
+end
+
+function INF.reset()
+    INF.r, INF.pup = nil, {}
+end
+
+function INF.grace()
+    local rtt = LAT.rttMs and LAT.rttMs()
+    return math.min(INF.GRACE + (rtt and rtt * 1.5 / 1000 or 0.15), INF.GRACE_MAX)
+end
+
+-- 撤掉替身身上这个类型所有段的 GE（含连带的）
+function INF.strip(pup, ty)
+    local ok = false
+    for _, l in ipairs(ty.lv) do
+        for k = 2, #l do ok = LO.removeGE(pup, INF.gePath(l[k])) or ok end
+    end
+    return ok
+end
+
+-- 接收方每 EVERY 帧：替身的异常状态逐类型跟对方走。p.ours = 替身这次的状态是跟着对方的（对方一结束马上撤）
+function INF.step(pup, tn)
+    local R = INF.r
+    if not R or REP.on or ST.ticks % INF.EVERY ~= 0 then return end
+    local plv = INF.levels(pup)
+    local readAcc = ST.ticks % INF.ACC_EVERY == 0
+    for _, ty in ipairs(INF.TYPES) do
+        local r = R[ty.id] or { n = 0, lv = 0, acc = 0 }
+        local p = INF.pup[ty.id] or {}
+        INF.pup[ty.id] = p
+        if readAcc and ty.acc and r.lv == 0 then
+            local pacc = attrOf(pup, ty.acc)
+            if pacc and pacc > r.acc + INF.ACC_SLACK then
+                setAttr(pup, ty.acc, r.acc)
+                INF.st.clamp = INF.st.clamp + 1
+                if INF.st.clamp <= 5 or INF.st.clamp % 50 == 0 then
+                    INF.say("  替身%s积累 %.0f，对方 %.0f → 压回对方的（本机多积的是对方没认的刀，第 %d 次）", ty.name, pacc, r.acc, INF.st.clamp)
+                end
+            end
+        end
+        local cur = plv[ty.id] or 0
+        if #ty.lv == 0 then
+            -- 瞬发类：只压积累
+        elseif r.lv > 0 then
+            p.localAt = nil
+            local key = r.n .. ":" .. r.lv
+            if cur == r.lv then
+                p.ours, p.key = true, key
+            elseif p.key ~= key or (cur > 0 and tn - (p.fixAt or -1e9) >= INF.grace()) then
+                -- 每次生效（每一段）只上一次，上不上去都不反复试（替身的 GE 先到时掉了也不补）；
+                -- 替身在别的段上（本机自己积到更重的中毒）→ 隔 grace 换回对方那一段
+                p.key, p.fixAt = key, tn
+                if cur > 0 then INF.strip(pup, ty) end
+                local ge = ty.lv[math.min(r.lv, #ty.lv)][2]
+                local ok = LO.applyGE(pup, INF.gePath(ge), "替身" .. ty.name)
+                p.ours = ok or nil
+                INF.st.mirror = INF.st.mirror + 1
+                INF.say("※ 对方%s（第 %d 次%s）→ 替身也%s：%s", ty.name, r.n, #ty.lv > 1 and string.format("，第 %d 段", r.lv) or "",
+                    ty.name, ok and ("已上 " .. ge .. (ty.id == "frost" and "（出 Y 追击提示）" or "")) or "上不去")
+            end
+        elseif cur > 0 then
+            local why
+            if p.ours then
+                why = "对方的结束了"
+            else
+                p.localAt = p.localAt or tn
+                if tn - p.localAt >= INF.grace() then
+                    why = string.format("本机自己积出来的，对方没有（对方积累 %.0f，等了 %.2f 秒）", r.acc, tn - p.localAt)
+                end
+            end
+            if why then
+                local ok = INF.strip(pup, ty)
+                if ty.acc then setAttr(pup, ty.acc, r.acc) end
+                p.ours, p.localAt = nil, nil
+                INF.st.strip = INF.st.strip + 1
+                INF.say("※ 替身撤掉%s（%s）：%s", ty.name, why, ok and "已撤" or "撤不掉")
+            end
+        else
+            p.ours, p.localAt = nil, nil
+        end
     end
 end
 
@@ -5597,7 +6744,8 @@ local function netSend(p1, tn)
         for n in pairs(act) do
             if not NET.prevAbs[n] and (n:find("Clone", 1, true) or n:find("Summon", 1, true))
                 and not n:find("Passive", 1, true) then ST.p1SummonAt = tn end      -- §118 我放了召唤（认替身分身时用）
-            if not NET.prevAbs[n] and replayable(n) and not NOCTR.check(p1, n, tn) then   -- §105.3 红蓝光反击关着时拦掉
+            if not NET.prevAbs[n] and replayable(n) and not NOCTR.check(p1, n, tn)   -- §105.3 红蓝光反击关着时拦掉
+                and not STG.check(p1, n, tn) then                                     -- §161 硬直中出招拦掉
                 -- v0.27.2 大招先压住，看这一帧 / 下几帧的动作：C_Failed（没充能）就不发，放出来了才发（ULT.flushHeld）
                 if ULT.isUlt(n) then ULT.held[#ULT.held + 1] = { name = n, ts = LAT.ms(tn), n = 0 }
                 else ULT.emit(n, tn, LAT.ms(tn)) end
@@ -5663,7 +6811,11 @@ local function netSend(p1, tn)
     end
     -- v0.17.2：生效的天赋 / 饰品被动（每 3 秒重算）
     if not NET.pasStr or ST.ticks % 90 == 0 then NET.pasStr = LO.encodePas(p1) end
-    if not NET.wgeStr or ST.ticks % 90 == 30 then NET.wgeStr = LO.encodeWge(p1) end    -- §118 武器效果（升级 / 形态 GE）
+    -- §163 换了武器 / 影之武装（wc= / wcs= 变了）5 帧后也重算：影之武装的升级只在装着时挂在身上，换上马上放招时别等 3 秒
+    if NET.wgeW ~= (NET.wcStr or "") .. "|" .. (NET.wcsStr or "") then
+        NET.wgeW, NET.wgeAt = (NET.wcStr or "") .. "|" .. (NET.wcsStr or ""), ST.ticks + 5
+    end
+    if not NET.wgeStr or ST.ticks % 90 == 30 or ST.ticks == NET.wgeAt then NET.wgeStr = LO.encodeWge(p1) end    -- §118 武器效果（升级 / 形态 GE）
     -- §109 皮肤（每 3 秒读一次；只在菜单里能换）
     if NET.ofStr == nil or ST.ticks % 90 == 45 then NET.ofStr = LO.encodeOutfit(p1) or "" end
     NET.seq = NET.seq + 1
@@ -5689,9 +6841,11 @@ local function netSend(p1, tn)
         .. "cfgh=" .. CFG.wire() .. "\n"       -- §158 我的数值表哈希（只有主机的算数；客机对不上就来要）
         .. "ult0=" .. NET.resCfg.ult0 .. "\nsp0=" .. NET.resCfg.sp0 .. "\nresm=" .. NET.resCfg.resm .. "\n"   -- §113 我的开局精纯杀气 / 暗源 / 每场每局（只有主机的算数）
         .. "ultx=" .. NET.resCfg.ultx .. "\n"   -- §113.4 我的精纯杀气获取倍率 %（只有主机的算数）
+        .. "acc=" .. NET.resCfg.acc .. "\n"     -- §170.1 我的饰品等级设置（只有主机的算数）
         .. "med=" .. (NET.medN or 0) .. ":" .. (NET.medT or "-") .. "\n"   -- §103 喝药动作（次数:动作名）
         .. "sub=" .. (NET.subN or 0) .. ":" .. (NET.subT or "-") .. "\n"   -- §111 技能里面换的动作（紫冥剑召唤；次数:动作名）
         .. "dg=" .. (NET.dgN or 0) .. ":" .. (NET.dgT or "-") .. "\n"     -- §118 闪避动作（次数:动作名）
+        .. "inf=" .. INF.mine(p1, tn) .. "\n"                               -- §160 我身上的异常状态（类型:次数:段:积累,…），对方替身跟着
         .. "wge=" .. (NET.wgeStr or "") .. "\n"                                -- §118 我身上的武器效果 GE（替身也上）
         .. "gd=" .. (BLK.on and 1 or 0) .. "\n"                            -- §104 我在不在格挡（对方据此预测替身的反应）
         .. "tc=" .. TOUCH.wire(tn) .. "\n"                                 -- §107 我哪几招在本机碰到了替身（本地 AI 据此回报）
@@ -5741,7 +6895,7 @@ function NET.recvOne(p1, tn, t)
         if seq > NET.lastSeq - 100 then return end   -- 乱序到达的旧包，丢掉
         out("远端序号回退 %d -> %d（对方重启了？），重置", NET.lastSeq, seq)
         NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.subIn, NET.resAtk = 0, nil, 0, nil, nil, nil, nil, {}
-        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil
+        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil; INF.reset()
     end
     if NET.lastSeq == -1 or NET.lastRecvAt < tn - 5 then
         out("开始收到远端 v2 状态 seq=%d 地图=%s 武器=%s", seq, tostring(t.map), tostring(t.w))
@@ -5749,7 +6903,7 @@ function NET.recvOne(p1, tn, t)
         -- v0.18.2（17:13 实测）：换了个对手 / 对方重启后序号反而更大时，上面的"序号回退"不触发，招式号还停在上一个对手的 #14，
         -- 新对手的 #1–#14 全被当成"已处理"丢掉。断了 5 秒以上再收到就算新连接，各计数清零（旧事件早超过 EV_KEEP 了）
         NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.subIn, NET.resAtk = 0, nil, 0, nil, nil, nil, nil, {}
-        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil      -- §104 换了对手：防住率从先验重新学
+        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil; INF.reset()      -- §104 换了对手：防住率从先验重新学
     end
     NET.lastSeq, NET.lastRecvAt, NET.rx = seq, tn, NET.rx + 1
     local pktAge = LAT.onPacket(t, tn)                                         -- v0.27.0 往返 / 时钟差 / 包龄
@@ -5832,6 +6986,9 @@ function NET.recvOne(p1, tn, t)
         NET.hrIn = hn2
     end
     NET.rwc = (t.wc and t.wc ~= "") and t.wc or nil                                     -- v0.17.0 对方手上的 WeaponConfig
+    if NET.rwcPin then                                  -- §165.4 切刀斩刚换上的那把，1.5 秒内不让旧的 wc= 换回去
+        if now() < NET.rwcPin.t then NET.rwc = NET.rwcPin.cfg else NET.rwcPin = nil end
+    end
     -- v0.26.1 对方武器组的另一把（§76）：真人在组里两把之间切，上一把拿过的不同武器就是另一格。LO.dressOff 给替身装上
     if NET.rwc and NET.rwc ~= NET.rwcCur then
         if NET.rwcCur then NET.rwcOff = NET.rwcCur end
@@ -5893,6 +7050,7 @@ function NET.recvOne(p1, tn, t)
     end
 
     DGE.onPacket(t, tn)            -- §118 dg=：对方往哪边翻（出招事件已经在上面放了）
+    INF.onPacket(t, tn)            -- §160 inf=：对方身上的异常状态
     CHG.onPacket(t, tn)            -- §92 rel=：对方的蓄力招松手了
 
     -- 对方对"我的招式"的判定
@@ -6225,6 +7383,7 @@ local function netStep()
         end
         NET.lastErr = drivePuppet(pup, tgt, NET.vel, yaw)
         DGE.step(pup, tn)          -- §118 替身闪避方向跟对方一样
+        INF.step(pup, tn)          -- §160 替身的冰冻 / 点燃 / 中毒…跟对方一样（本机自己积出来的撤掉）
         AIR.step(p1, pup, tn)      -- v0.24.2 对方在空中 → 替身起跳；排队的空中招
         HOV.watchPuppet(pup, tn, AIR.rair == true)   -- §99 对方在地上替身却往下掉 / 被引擎藏起 → 悬空、重新显示
         LAT.step(tn)               -- v0.27.0 追帧：等替身开始播这招的蒙太奇
@@ -6953,54 +8112,95 @@ local function refillPotions(why)
 end
 
 -- ---- v0.26.2 安全放置（§79）。用户 2026-11-05："4 做个保护"——11:50 回合归位把人放进了墙里（K2_SetActorLocation 不查碰撞）。
--- 回合归位（只对 AI）、连上时放到主机身边、切图后掉出地图拉回都走这里：
+-- 回合归位（只对 AI）、连上时放到主机身边、切图后掉出地图拉回、退出观战都走这里：
 --   1) G.teleportTo（引擎的传送：落点卡进几何体就在附近找空位，找不到返回 false）
 --   2) 放不下就沿"起点 → 落点"往起点缩：2/3、1/3 处再试。起点是对方站着的地方（主机身上 / 开局时主机站的点），能站
 --   3) 都放不下就留在原地，只记日志，不硬塞
---   4) 放下后 SAFE_GUARD 秒内比落点低 SAFE_FALL 以上（落在地图外的虚空里）→ 放回起点（对方站的地方）；没有起点放回传送前的位置。
---      不优先放回传送前：切图到达时"传送前"就是还没加载出地面的落点（MAPGO 防掉落那种情况）
-local SAFE_FALL, SAFE_GUARD = 1500.0, 3.0
-local SAFE = { guard = nil }
+--   4) 放下后 SAFE_GUARD 秒内掉出地图 → 放回去（见 SAFE.step）
+-- §168 线上反馈"传送太容易掉虚空"，加强：
+--   a) 落点先探地（HOV.floor 往下 SAFE.DEPTH）：近处（传送距离 ≤ HOV.FAR，地形肯定加载了）下面没地的点直接不用；
+--      有地的点优先；都没地就留在原地（以前照放 → 悬崖边 / 主机脚下在你这边是空的就掉下去）
+--   b) 远处（地形可能还没加载，探不出来）照放，但由这里统一悬空等地（HOV.hold，带 back = 传送前站稳的地方、alts = 其余候选点）
+--   c) 防掉落 3 → 10 秒；除了掉了 SAFE_FALL，还看"在往下掉、掉了 SAFE.VOID 以上、下面 SAFE.VOID_DEPTH 都没地"= 虚空，早点拉回
+--   d) 拉回时：起点下面有地 → 起点；否则传送前站稳的地方（GROUND）；都没有才按以前放回起点。拉回后悬空等地站住
+local SAFE_FALL, SAFE_GUARD = 1500.0, 10.0
+local SAFE = { guard = nil, VOID = 400.0, DEPTH = 800.0, VOID_DEPTH = 3000.0 }
 
-local function safePlace(actor, target, anchor, yaw, why)
+local function safePlace(actor, target, anchor, yaw, why, alts)
     if not valid(actor) then return nil end
-    local from = anchor or try("safe from", function() return actor:K2_GetActorLocation() end)
+    local was = try("safe from", function() return actor:K2_GetActorLocation() end)
+    local from = anchor or was
+    local back = GROUND.get(mapName(actor))
     local cands = { target }
+    for _, a in ipairs(alts or {}) do cands[#cands + 1] = a end
     if anchor then
         for _, f in ipairs({ 2 / 3, 1 / 3 }) do
             cands[#cands + 1] = { X = anchor.X + (target.X - anchor.X) * f, Y = anchor.Y + (target.Y - anchor.Y) * f,
                                   Z = anchor.Z + (target.Z - anchor.Z) * f }
         end
     end
-    for i, c in ipairs(cands) do
+    local far = was ~= nil and math.sqrt((target.X - was.X) ^ 2 + (target.Y - was.Y) ^ 2) > HOV.FAR
+    -- 试的顺序：下面有地的 → 不知道的 → （只有远处）探出来没地的
+    local order, fls, noFloor = {}, {}, 0
+    for i, c in ipairs(cands) do fls[i] = HOV.floor(actor, c, SAFE.DEPTH) end
+    for _, want in ipairs({ true, "nil", false }) do
+        for i = 1, #cands do
+            local f = fls[i]
+            if (want == "nil" and f == nil) or (want ~= "nil" and f == want) then
+                if f == false and not far then noFloor = noFloor + 1 else order[#order + 1] = i end
+            end
+        end
+    end
+    for _, i in ipairs(order) do
+        local c = cands[i]
         local ok, how = G.teleportTo(actor, c, yaw)
         if ok then
             local cm = rawProp(actor, "CharacterMovement")
             if valid(cm) then pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end) end
-            if from then SAFE.guard = { actor = actor, from = from, z = c.Z, till = now() + SAFE_GUARD, why = why } end
-            if i > 1 then out("%s：原落点放不下（会卡进地形），改放到往回缩的第 %d 个点 (%.0f, %.0f, %.0f)", why, i - 1, c.X, c.Y, c.Z) end
+            if from then SAFE.guard = { actor = actor, from = from, back = back, z = c.Z, till = now() + SAFE_GUARD, why = why } end
+            if i > 1 then out("%s：原落点放不下（会卡进地形 / 下面没地），改放到第 %d 个候选点 (%.0f, %.0f, %.0f)", why, i, c.X, c.Y, c.Z) end
             if how then out("%s：%s", why, how) end
+            if far then     -- §99 / §168 跳得远：落点的地形可能还没加载，先悬空等地；等不到放回传送前站稳的地方
+                local rest = {}
+                for j, o in ipairs(cands) do if j ~= i then rest[#rest + 1] = o end end
+                HOV.hold(actor, { X = c.X, Y = c.Y, Z = c.Z }, why, now(), { back = back, alts = rest })
+            end
             return c
         end
     end
-    out("!! %s：%d 个落点都放不下（会卡进地形），留在原地", why, #cands)
+    if noFloor > 0 then
+        out("!! %s：%d 个落点下面没地（悬崖 / 虚空，存档进度不同时主机脚下在你这边可能是空的），%d 个放不下，留在原地",
+            why, noFloor, #cands - noFloor)
+    else
+        out("!! %s：%d 个落点都放不下（会卡进地形），留在原地", why, #cands)
+    end
     return nil
 end
 
--- lobbyStep 每次调：放下后往下掉太多 → 放回起点 / 原处
+-- lobbyStep 每次调：放下后掉出地图 → 放回起点 / 传送前站稳的地方
 function SAFE.step()
     local g = SAFE.guard
     if not g then return end
     if ST.spec and ST.spec.on then SAFE.guard = nil; return end      -- §141 观战时角色藏着、冻着，不挪它
     if now() > g.till or not valid(g.actor) then SAFE.guard = nil; return end
+    if HOV.has(g.actor) then return end     -- 悬空等地中，HOV 管
     local loc = try("safe guard", function() return g.actor:K2_GetActorLocation() end)
-    if loc and loc.Z < g.z - SAFE_FALL then
-        SAFE.guard = nil
-        pcall(function() g.actor:K2_SetActorLocation(g.from, false, {}, true) end)
-        local cm = rawProp(g.actor, "CharacterMovement")
-        if valid(cm) then pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end) end
-        out("!! %s 之后掉出地图（往下掉了 %.0f，落点外面是虚空？），放回 (%.0f, %.0f, %.0f)", g.why, g.z - loc.Z, g.from.X, g.from.Y, g.from.Z)
+    if not loc then return end
+    local drop = g.z - loc.Z
+    local void = drop > SAFE_FALL
+    if not void and drop > SAFE.VOID then
+        local st = G.airOf(g.actor)
+        void = st ~= nil and st.falling and HOV.floor(g.actor, loc, SAFE.VOID_DEPTH) == false
     end
+    if not void then return end
+    SAFE.guard = nil
+    local to, what = g.from, "起点"
+    if g.back and HOV.floor(g.actor, g.from, SAFE.DEPTH) ~= true then to, what = g.back, "传送前站的地方" end
+    pcall(function() g.actor:K2_SetActorLocation(to, false, {}, true) end)
+    local cm = rawProp(g.actor, "CharacterMovement")
+    if valid(cm) then pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end) end
+    out("!! %s 之后掉出地图（往下掉了 %.0f，落点外面是虚空？），放回%s (%.0f, %.0f, %.0f)", g.why, drop, what, to.X, to.Y, to.Z)
+    HOV.hold(g.actor, to, g.why .. "（掉下去放回）", now(), { back = (to ~= g.back) and g.back or nil })
 end
 
 local function setArena(x, y, z, yaw)
@@ -7568,7 +8768,8 @@ local function matchRows(tn)
         if MATCH.flags and MATCH.flags.ctr == false then rules[#rules + 1] = T("无红蓝光反击", "NO RED/BLUE COUNTERS") end   -- §105.3
         if MATCH.flags and MATCH.flags.bal then rules[#rules + 1] = T("武器平衡", "WEAPON BALANCE") end                     -- §106.5
         if MATCH.flags and MATCH.flags.med == false then rules[#rules + 1] = T("禁用血瓶", "NO POTIONS") end                -- §108
-        if STD.active() then rules[#rules + 1] = T("标准数值", "STANDARD STATS") end                                         -- §144
+        if STD.active() then rules[#rules + 1] = T("标准数值", "STANDARD STATS") end
+        do local am = ACC.mode(); if am ~= 0 then rules[#rules + 1] = T("饰品" .. ACC.MODE_NAME[am], "ACCESSORIES " .. ({ "UNREFINED", "FULLY REFINED", "DISABLED" })[am]) end end   -- §170.1                                         -- §144
         if CFG.srcNote and (STD.active() or (MATCH.flags and MATCH.flags.bal)) then
             rules[#rules + 1] = T("数值表用本地（和主机不一致）", "LOCAL TABLES (HOST MISMATCH)")                               -- §158
         end
@@ -7718,6 +8919,8 @@ local function enter(p1, s, tn, why)
         refill(p1)
         if MATCH.round == 1 then CFG.begin() end                    -- §158 这一场用主机的数值表（客机收齐了）还是本地的
         if MATCH.round == 1 then STD.lv, STD.eq.at = {}, -100 end   -- §148 两场之间可能升过级 / 换过配装：等级缓存每场重读
+        STD.capture(p1)                                                 -- §170.5 先记对局前的属性（饰品还没换）
+        ACC.apply(p1)                                                   -- §170.1（§170.5 先于标准数值：锁定属性要按换过的饰品算） 饰品等级
         STD.apply(p1, "第 " .. MATCH.round .. " 回合倒计时")         -- §144 标准数值（先于 §113：精纯杀气 / 暗源的上限由它定）
         NET.resApply(p1, "第 " .. MATCH.round .. " 回合倒计时")      -- §113
         if MATCH.round == 1 then NET.attrDiffLog(p1) end             -- §116.2 只读：我和替身的属性差在哪
@@ -7735,6 +8938,8 @@ local function enter(p1, s, tn, why)
         REL.send("mend", string.format("%d %d %d", MATCH.id, MATCH.me, MATCH.op))
     end
     if s == "fight" then
+        STD.capture(p1)                                                 -- §170.5 先记对局前的属性（饰品还没换）
+        ACC.apply(p1)                                                   -- §170.1（§170.5 先于标准数值：锁定属性要按换过的饰品算）
         STD.apply(p1, "第 " .. MATCH.round .. " 回合开打")           -- §144
         NET.resApply(p1, "第 " .. MATCH.round .. " 回合开打")        -- §113 倒计时里的回满效果可能补满了它们，开打再写一次
         out("== 第 %d 回合 开打 ==", MATCH.round)
@@ -7748,6 +8953,7 @@ local function enter(p1, s, tn, why)
         -- v0.17.10：对局外不再锁血（见下面"陪练保护"），对局一结束就解锁，不管还连没连着
         if not LO.IDLE_LOCK or tn - NET.lastRecvAt > 1.0 then unlockSelf(p1, why or "对局结束") end
         standUp(p1); standUp(puppet())
+        ACC.restore(p1)          -- §170.1 饰品换回（§170.5 先于标准数值还原：还原的属性是饰品没换时记的）
         STD.restore(p1)          -- §144 先还原血上限等，再回满
         CFG.finish()             -- §158 数值表换回本地
         refill(p1)
@@ -7899,13 +9105,14 @@ function MAPGO.besideHost(p1)
     local want = { X = NET.pos.X + math.cos(r + math.pi / 2) * 300.0, Y = NET.pos.Y + math.sin(r + math.pi / 2) * 300.0,
                    Z = NET.pos.Z + 30.0 }
     local face0 = math.deg(math.atan(NET.pos.Y - want.Y, NET.pos.X - want.X))
-    local was = try("beside from", function() return p1:K2_GetActorLocation() end)
-    local pos = safePlace(p1, want, { X = NET.pos.X, Y = NET.pos.Y, Z = NET.pos.Z + 30.0 }, face0, "放到主机身边")
-    if not pos then return nil end
-    -- §99 同一张大地图里跳得远：落点的地形可能还没加载（20:33 内测"往下掉了 1537"），先悬空等它
-    if was and math.sqrt((pos.X - was.X) ^ 2 + (pos.Y - was.Y) ^ 2) > HOV.FAR then
-        HOV.hold(p1, { X = pos.X, Y = pos.Y, Z = pos.Z }, "放到主机身边", now())
+    -- §168 右边 3 米下面没地（悬崖边 / 虚空）就试左、后、前、近一点的两侧；safePlace 挑下面有地的
+    local alts = {}
+    for _, o in ipairs({ { -math.pi / 2, 300.0 }, { math.pi, 300.0 }, { 0.0, 300.0 }, { math.pi / 2, 150.0 }, { -math.pi / 2, 150.0 } }) do
+        alts[#alts + 1] = { X = NET.pos.X + math.cos(r + o[1]) * o[2], Y = NET.pos.Y + math.sin(r + o[1]) * o[2], Z = NET.pos.Z + 30.0 }
     end
+    -- §99 同一张大地图里跳得远：落点的地形可能还没加载（20:33 内测"往下掉了 1537"）→ safePlace 里悬空等它（§168 挪进 safePlace）
+    local pos = safePlace(p1, want, { X = NET.pos.X, Y = NET.pos.Y, Z = NET.pos.Z + 30.0 }, face0, "放到主机身边", alts)
+    if not pos then return nil end
     local face = math.deg(math.atan(NET.pos.Y - pos.Y, NET.pos.X - pos.X))
     setYaw(p1, face)
     pcall(function() getP1PC():SetControlRotation({ Pitch = -10.0, Yaw = face, Roll = 0.0 }) end)
@@ -7926,7 +9133,12 @@ function MAPGO.go(p1, confirmed)
         return false
     end
     MAPGO.armAt = nil
-    local target, pos = NET.rmap, { X = NET.pos.X, Y = NET.pos.Y, Z = NET.pos.Z }
+    local dirty = MAPGO.dirty()       -- §168.1 切图也会自动存档
+    if dirty then
+        out("!! 不能前往主机所在地图：游戏会自动存档，%s（会被写进存档）", dirty)
+        return false
+    end
+    local target, pos = NET.rmap, MAPGO.landPos()
     -- 2026-11-05 09:07 实测崩溃：传送后加载中（09:07:34）模组还在动旧世界的对象。先藏替身、丢掉旧引用、冻结所有循环（MAPGO.freeze，驱动段）再传
     MAPGO.freeze(target, mapName(p1))
     local ok, err = G.travelTo(target, pos, NET.yaw, MAPGO_LIFT)
@@ -7942,25 +9154,44 @@ function MAPGO.go(p1, confirmed)
     return true
 end
 
+-- §168.5 游戏传送的落点：主机右侧 1.5 米（游戏放好人以后模组不挪，所以在这里就避开和主机叠在一起）
+MAPGO.LAND_SIDE = 150.0
+function MAPGO.landPos()
+    local r = math.rad((NET.yaw or 0) + 90.0)
+    return { X = NET.pos.X + math.cos(r) * MAPGO.LAND_SIDE, Y = NET.pos.Y + math.sin(r) * MAPGO.LAND_SIDE, Z = NET.pos.Z }
+end
+
 -- lobbyStep 每次（已连上）调：等待到达 / 超时；到达后的防掉落。返回 true = 刚到达
 function MAPGO.step(p1, myMap)
     local tc, arrived = os.time(), false
     local pd = MAPGO.pending
-    if pd and myMap == pd.map then
-        MAPGO.pending, MAPGO.guardTill, arrived = nil, tc + MAPGO_GUARD, true
-        out("== 已到达主机所在地图 %s（用时 %d 秒）==", myMap, tc - pd.at)
-    elseif pd and tc - pd.at > MAPGO_TIMEOUT then
+    -- §168.2 同地图走游戏传送：地图名一直相同，不能按地图名算到达（11-09 实测：调完游戏传送同一帧就"到了"，
+    -- 模组自己先把人挪到主机身边，游戏随后才出加载画面、重建世界）。等解冻（frozenSame 置 done）才算到；
+    -- 到了也不再自己改坐标（用户 11-09："只用游戏的传送功能，不要自己改坐标"）：不放到主机身边、不开防掉落拉回
+    if pd and pd.same and not pd.done then pd = nil end
+    -- §168.5 跨地图也统一：到了不挪、不开防掉落拉回（落点已经在调游戏传送时定在主机侧面，MAPGO.landPos）
+    if pd and (pd.same or myMap == pd.map) then
+        MAPGO.pending, arrived = nil, true
+        MAPGO.gameTp = sessionRole() == "client" or nil      -- 观战者不走"已加入主机"那段
+        out(pd.same and "== 同地图传送到了 %s（用时 %d 秒，位置由游戏定，模组不挪）==" or "== 已到达主机所在地图 %s（用时 %d 秒，位置由游戏定，模组不挪）==",
+            myMap, tc - pd.at)
+    elseif MAPGO.pending and tc - MAPGO.pending.at > MAPGO_TIMEOUT then
+        pd = MAPGO.pending
         MAPGO.pending = nil
         out("!! 前往 %s 超过 %d 秒还没到（现在在 %s），放弃；可以再试一次", pd.map, MAPGO_TIMEOUT, myMap)
     end
     if MAPGO.guardTill and tc > MAPGO.guardTill then MAPGO.guardTill = nil end
-    if MAPGO.guardTill and MATCH.joined and NET.pos and myMap == NET.rmap then
+    if MAPGO.guardTill and MATCH.joined and NET.pos and myMap == NET.rmap and not HOV.has(p1) then
         local loc = try("mapgo loc", function() return p1:K2_GetActorLocation() end)
         if loc and loc.Z < NET.pos.Z - MAPGO_FALL then
             local pos = MAPGO.besideHost(p1)
-            if not pos then     -- v0.26.2：身边放不下也不能让人一直掉，最后放到主机站的地方（主机能站）
-                pos = { X = NET.pos.X, Y = NET.pos.Y, Z = NET.pos.Z + 30.0 }
+            if not pos then     -- v0.26.2：身边放不下也不能让人一直掉
+                -- §168 主机身边都没地（主机脚下在你这边是空的）：放回自己最近站稳的地方，没有才放到主机站的地方；悬空等地
+                local back = GROUND.get(myMap)
+                pos = back or { X = NET.pos.X, Y = NET.pos.Y, Z = NET.pos.Z + 30.0 }
                 pcall(function() p1:K2_SetActorLocation(pos, false, {}, true) end)
+                HOV.hold(p1, pos, "掉出地图拉回", now())
+                if back then MAPGO.guardTill = nil end      -- 回到自己的地面了，不再按主机高度拉
             end
             local cm = rawProp(p1, "CharacterMovement")
             if valid(cm) then pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end) end
@@ -7985,14 +9216,74 @@ function MAPGO.toHost(p1, confirmed)
     local tc = os.time()
     if not confirmed and not (MAPGO.farArmAt and tc - MAPGO.farArmAt <= MAPGO_ARM_SEC) then
         MAPGO.farArmAt = tc
-        out("== 传送到主机身边（离主机 %.0f 米）：%d 秒内再按一次 F1 确认 ==", MAPGO.dist(p1) or -1, MAPGO_ARM_SEC)
+        out("== 传送到主机身边（离主机 %.0f 米%s）：%d 秒内再按一次 F1 确认 ==", MAPGO.dist(p1) or -1,
+            MAPGO.loadOff() and "" or "，走游戏的传送：会自动存档、出加载画面", MAPGO_ARM_SEC)
         return false
     end
     MAPGO.farArmAt = nil
+    local went, why = MAPGO.viaLoad(p1, tc)
+    if went then return true end
+    -- §168.4 用户 11-09："不确定那传送就都走游戏传送"：游戏传送用不了就不传（不再退回模组自己挪），只有 net/tp_load_off.txt 开着才照以前直接挪
+    if why ~= "off" then
+        out("!! 不能传送到主机身边：%s。自己走过去，或者处理好再按", why or "?")
+        MATCH.toast = { rows = { { c = T("不能传送", "CAN'T TELEPORT"), col = COL_ORANGE }, { c = why or "?", col = COL_LABEL } }, till = now() + TOAST_SEC }
+        return false
+    end
     local pos = MAPGO.besideHost(p1)
     MAPGO.far, MAPGO.guardTill = nil, tc + MAPGO_GUARD
     if pos then out("== 传送到主机身边 (%.0f, %.0f) ==", pos.X, pos.Y)
     else out("== 主机身边放不下，留在原地（自己走过去）==") end
+    return true
+end
+
+-- §168.1 同一张地图离得很远（> LOAD_DIST）：也走游戏敲钟传送（G.travelTo 同一个关卡），让游戏出加载画面、等落点的地形加载完再放人。
+-- 用户 11-08："基本都是同地图传送容易这样吧，跨地图会走游戏的 loading"。以前同地图只改坐标，落点那片还没加载就往下掉。
+-- 冻结 / 解冻和切图一样（MAPGO.freeze），解冻条件按同地图改（M4.mapgo.frozen）；到了以后照切图那样放到主机身边 + 防掉落。
+-- 游戏会先自动存档（确认提示里说了）。net/tp_load_off.txt 存在 = 不用这条，照以前直接挪（出问题时不用重新部署）
+MAPGO.LOAD_DIST = MAPGO_NEAR     -- §168.4 以前 200 米（估的、没实测）；现在要传就走游戏传送
+MAPGO.LOAD_OFF = NET_DIR .. "/tp_load_off.txt"
+function MAPGO.loadOff()
+    local f = io.open(MAPGO.LOAD_OFF, "r")
+    if f then f:close(); return true end
+    return false
+end
+-- 返回 nil = 能走游戏传送；否则原因（"off" = 开关关了，照以前直接挪）
+function MAPGO.loadable(p1)
+    if MAPGO.loadOff() then return "off" end
+    local d = MAPGO.dist(p1)
+    if not (d and d * 100.0 > MAPGO.LOAD_DIST) then return "离主机不到 50 米" end
+    if not G.isStoryMap(mapName(p1)) then return "这张图不能用游戏的传送" end
+    return nil
+end
+-- §168.1 游戏传送会先自动存档：模组的临时改动还挂着时不能触发（会被永久写进档）。
+-- 用户 11-08："只要没更改存档里有关养成的数据就行"。挂着 = 标准数值的强制配装 / 属性 / 否决存档、开局精纯杀气 / 暗源（还没还原）、
+-- 锁血、观战中、游戏自己在强制配装中。返回原因；nil = 干净
+function MAPGO.dirty()
+    if MATCH.role then return "对局中" end
+    if STD.saved or STD.veto then return "标准数值的临时配装 / 属性还没还原" end
+    if MATCH.resSaved then return "开局精纯杀气 / 暗源还没还原" end
+    if MATCH.lock then return "锁血还挂着" end
+    if ST.spec and ST.spec.on then return "观战中" end
+    if G.forcedActive() == true then return "游戏正在强制配装中" end
+    return nil
+end
+function MAPGO.viaLoad(p1, tc)
+    local no = MAPGO.loadable(p1)
+    if no then return false, no end
+    local dirty = MAPGO.dirty()
+    if dirty then return false, "游戏传送会自动存档，" .. dirty end
+    local map, pos = mapName(p1), MAPGO.landPos()
+    MAPGO.freeze(map, map, pos)
+    local ok, err = G.travelTo(map, pos, NET.yaw, MAPGO_LIFT)
+    if not ok then
+        ST.travel = nil
+        return false, "游戏传送失败：" .. tostring(err) .. "（已解除冻结）"
+    end
+    MAPGO.pending = { map = map, from = map, at = tc, same = true }
+    MAPGO.far = nil
+    MATCH.ready, MATCH.joined = false, nil        -- 到了以后放到主机身边（MAPGO.guardTill）、重新准备
+    out("== 传送到主机身边：同地图离得远，走游戏的传送 (%.0f, %.0f, %.0f)，会自动存档、等地形加载 ==", pos.X, pos.Y, pos.Z)
+    wireUpdate()
     return true
 end
 
@@ -8166,8 +9457,10 @@ end
 
 local function lobbyStep(p1, tn, lost)
     SAFE.step()     -- v0.26.2 放下后掉出地图 → 放回原处（§79）
+    GROUND.step(p1, tn)     -- §168 记最近站稳的地方（传送掉虚空时放回）
     if ST.spec then pcall(ST.spec.Q.tick, tn) end      -- §141.7 对手不准备超时 → 换下一位
     HOV.step(tn)    -- §99 悬空等地形加载（客机放到主机身边、替身瞬移到远处）
+    if PHEAL.want and lost < 1.0 and not PP.on and not (ST.spec and ST.spec.on) then PHEAL.step() end    -- §162 替身坏了换一个
     if ST.ticks % 30 == 0 then
         local kv = fileReadKV(SESSION_FILE)
         local was = MATCH.session and MATCH.session.role
@@ -8194,6 +9487,7 @@ local function lobbyStep(p1, tn, lost)
         MATCH.autoPup, MATCH.joined = nil, nil
     elseif fresh and not otherMap and not valid(puppet()) and ST.stableTicks > 150 and MATCH.autoCreate and not PP.on then
         out("== 对手已连上，自动生成对手角色 ==")
+        PHEAL.reset()       -- §162 新连接：换替身次数重新算
         MATCH.autoCreate()
         MATCH.autoPup = true
         MATCH.joined = nil
@@ -8221,7 +9515,10 @@ local function lobbyStep(p1, tn, lost)
             -- §156 不再自动传送：近就不动，远就提示（F1 连按两次 / 面板按钮）
             local d = MAPGO.dist(p1)
             MATCH.joined = true
-            if MAPGO.guardTill then     -- 刚切图过来（落在主机脚下）：照旧放到主机身边，防掉落继续管
+            if MAPGO.gameTp then        -- §168.2 刚走游戏传送过来：位置由游戏定，不挪
+                MAPGO.gameTp = nil
+                out("== 已加入主机：走游戏传送过来，离主机 %s 米，不挪 ==", d and string.format("%.0f", d) or "?")
+            elseif MAPGO.guardTill then     -- 刚切图过来（落在主机脚下）：照旧放到主机身边，防掉落继续管
                 local pos = MAPGO.besideHost(p1)
                 if pos then out("== 已加入主机：传送到主机身边 (%.0f, %.0f) ==", pos.X, pos.Y)
                 else out("== 已加入主机：主机身边放不下，留在原地（自己走过去）==") end
@@ -8238,6 +9535,11 @@ local function lobbyStep(p1, tn, lost)
     if MAPGO.far and sessionRole() == "client" then
         local d = MAPGO.dist(p1)
         if d and d <= MAPGO_NEAR / 100.0 then MAPGO.far = nil; out("== 已走到主机附近（%.0f 米），不用传送了 ==", d) end
+    elseif sessionRole() == "client" and MATCH.joined and not MATCH.role and not MAPGO.pending and NET.rmap == myMap then
+        -- §168.3 加入以后自己跑远了（11-09 实测：传过去以后又跑到地图另一边，还是显示准备、没有传送提示）：
+        -- 以前"离得远"只在刚加入时判一次。离开超过 2 倍 MAPGO_NEAR 就重新提示（留余量，别在边上来回闪）
+        local d = MAPGO.dist(p1)
+        if d and d > 2 * MAPGO_NEAR / 100.0 then MAPGO.far = true; out("== 离主机 %.0f 米了：对局外连按两次 F1（或联机面板\"传送到主机身边\"）过去 ==", d) end
     end
     -- 主机：双方都准备好就开局
     if not MATCH.role and sessionRole() ~= "client" and MATCH.ready and (NET.rrdy or 0) == 1 then
@@ -9152,7 +10454,149 @@ function NETUI.aiPickItems(lb, items, toPage)
     items[#items + 1] = { label = T("返回", "BACK"), act = toPage("aiload") }
 end
 
--- 面板里可选的行：{ label, act = function() } ；没有 act 的是说明行。NETUI.page = main / rooms / settings / thanks
+-- §171 房间设置的一项（用户 11-09"标准数值 / 武器平衡 / 饰品在最上，其他分类折叠，严格跟随挪到系统设置"）。
+-- k = bar / bo / dm / ab / NET.FLAG_KEYS / NET.RES_KEYS 里的键；s.lbl(值) = 显示，s.cli() = 客机看到的（主机定的），
+-- s.cfg() = 自己设的，s.click() = 换下一档，s.rk(规则) = 武林盟主服务器定的（noRk = 排位也按主机定）
+local function roomSpec(k)
+    local function onOff(on) return on and T("开", "ON") or T("关", "OFF") end
+    if k == "bar" then      -- v0.25.0 对手血条档位（HANDOVER §73）
+        local BARN = { [2] = T("血量 + 杀气", "HEALTH + SHACHI"), [1] = T("只显示血量", "HEALTH ONLY"), [0] = T("不显示", "HIDDEN") }
+        return { lbl = function(m) return T("对手血条：", "OPPONENT BAR: ") .. BARN[m] end, noRk = true,
+                 cli = NET.barMode, cfg = function() return NET.barCfg end, who = T("对手血条由主机设置", "THE HOST DECIDES THE OPPONENT BAR"),
+                 tail = T("（主机设置，客机照此显示）", " (HOST SETS IT FOR BOTH)"),
+                 click = function()
+                     local m = (NET.barCfg + 2) % 3     -- 2 → 1 → 0 → 2
+                     NET.barSet(m)
+                     out("联机面板：对手血条设为 %d（%s）", m, BARN[m])
+                 end }
+    elseif k == "bo" then   -- v0.26.3 局数：3 → 5 → 7 → 9 → 3
+        return { lbl = function(n) return string.format(T("局数：%d 局 %d 胜", "MATCH: BEST OF %d"), n, NET.toWin(n)) end,
+                 cli = NET.bestOf, cfg = function() return NET.boCfg end, rk = function(r) return r.bo end,
+                 who = T("局数由主机设置", "THE HOST DECIDES THE MATCH LENGTH"),
+                 click = function()
+                     local n = NET.boNext(NET.boCfg)
+                     NET.boSet(n)
+                     out("联机面板：局数设为 %d 局（先赢 %d 回合）", n, NET.toWin(n))
+                 end }
+    elseif k == "dm" then   -- §86 伤害倍率：50 → 75 → 100 → 150 → 200 → 300 → 50
+        return { lbl = function(n) return string.format(T("伤害倍率：%d%%", "DAMAGE: %d%%"), n) end,
+                 cli = NET.dmgPct, cfg = function() return NET.dmCfg end, rk = function(r) return r.dm end,
+                 who = T("伤害倍率由主机设置", "THE HOST DECIDES THE DAMAGE"),
+                 click = function()
+                     local n = NET.dmNext(NET.dmCfg)
+                     NET.dmSet(n)
+                     out("联机面板：伤害倍率设为 %d%%", n)
+                 end }
+    elseif k == "ab" then   -- §87 全部可格挡
+        return { lbl = function(on) return T("全部可格挡：", "ALL MOVES BLOCKABLE: ") .. onOff(on) end,
+                 cli = NET.allBlock, cfg = function() return NET.abCfg == 1 end, rk = function(r) return r.ab == 1 end,
+                 who = T("全部可格挡由主机设置", "THE HOST DECIDES THIS RULE"),
+                 click = function()
+                     local n = 1 - NET.abCfg
+                     NET.abSet(n)
+                     out("联机面板：全部可格挡设为%s", n == 1 and "开" or "关")
+                 end }
+    elseif NET.FLAG_NAME[k] then    -- §105.3 红蓝光反击 / §106.5 武器平衡 / §108 血瓶 / §128.2 严格跟随 / §144 标准数值
+        if NET.FLAG_LOCKED[k] then return nil end      -- §144.1 锁住的不显示
+        local nm = NET.FLAG_NAME[k]
+        return { lbl = function(on) return T(nm[1] .. "：", nm[2] .. ": ") .. onOff(on) end,
+                 cli = function() return NET.flag(k) end, cfg = function() return NET.flagCfg[k] == 1 end, rk = function(r) return r[k] == 1 end,
+                 who = T(nm[1] .. "由主机设置", "THE HOST DECIDES THIS RULE"),
+                 click = function()
+                     local n = 1 - NET.flagCfg[k]
+                     NET.flagSet(k, n)
+                     out("联机面板：%s设为%s", nm[1], n == 1 and "开" or "关")
+                 end }
+    elseif NET.RES_NAME[k] then     -- §113 开局精纯杀气 / 暗源、§113.2 每场 / 每局、§113.4 获取倍率、§170.1 饰品：点一下下一档
+        local nm = NET.RES_NAME[k]
+        return { lbl = function(n) local tx = NET.resText(k, n); return T(nm[1] .. "：", nm[2] .. ": ") .. T(tx[1], tx[2]) end,
+                 cli = function() return NET.resOf(k) end, cfg = function() return NET.resCfg[k] end,
+                 rk = function(r) if r[k] ~= nil then return r[k] end return NET.RES_DEF[k] end,
+                 who = T(nm[1] .. "由主机设置", "THE HOST DECIDES THIS RULE"),
+                 click = function()
+                     local n = NET.resNext(k, NET.resCfg[k])
+                     NET.resSet(k, n)
+                     out("联机面板：%s设为 %s", nm[1], NET.resText(k, n)[1])
+                 end }
+    end
+end
+-- 一行：武林盟主 = 服务器定的（点了只提示）；客机只看主机定的；主机 / 没联机点一下换下一档。没有这项 / 排位规则还没到 = nil
+function NETUI.roomItem(k, lb)
+    local s = roomSpec(k)
+    if not s then return nil end
+    if lb.rk == "1" and not s.noRk then     -- §110
+        local rk = NET.rkRules()
+        if not rk then return nil end
+        return { label = s.lbl(s.rk(rk)),
+                 act = function() netuiFlash(T("武林盟主的规则由服务器固定，不能改", "RANKED RULES ARE FIXED BY THE SERVER"), COL_ORANGE) end }
+    end
+    if lb.role == "client" then
+        return { label = s.lbl(s.cli()) .. T("（主机设置）", " (HOST'S SETTING)"), act = function() netuiFlash(s.who) end }
+    end
+    return { label = s.lbl(s.cfg()) .. (s.tail or T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)")), act = s.click }
+end
+-- §171 房间设置页：这三项放最上，其余按类折叠（一次只展开一类，展开最多的一类也不超出面板行数）。
+-- npos（严格跟随）在系统设置页；没归类的新键自动进"其他"
+NETUI.ROOM_TOP = { "std", "bal", "acc" }
+NETUI.ROOM_CATS = {
+    { id = "match", zh = "对局", en = "MATCH", keys = { "bo", "dm", "bar" } },
+    { id = "combat", zh = "战斗规则", en = "COMBAT", keys = { "ab", "ctr", "med" } },
+    { id = "res", zh = "开局资源", en = "STARTING RESOURCES", keys = { "ult0", "ultx", "sp0", "resm" } },
+    { id = "spec", zh = "观战 / 排队", en = "SPECTATORS / QUEUE", spec = true },
+}
+NETUI.ROOM_ELSEWHERE = { npos = true }
+local function roomPageItems(lb, items)
+    local ranked = lb.rk == "1"
+    if ranked then
+        if NET.rkRules() then
+            items[#items + 1] = { label = T("武林盟主固定规则（服务器定）：", "RANKED RULES (SET BY THE SERVER):"), col = COL_LABEL }
+        else
+            items[#items + 1] = { label = T("（正在从服务器获取排位规则…拿到前不能开局）", "(GETTING THE RANKED RULES FROM THE SERVER...)"), col = COL_ORANGE }
+        end
+    end
+    local used = {}
+    for k in pairs(NETUI.ROOM_ELSEWHERE) do used[k] = true end
+    for _, k in ipairs(NETUI.ROOM_TOP) do
+        used[k] = true
+        local it = NETUI.roomItem(k, lb)
+        if it then items[#items + 1] = it end
+    end
+    local cats = {}
+    for _, c in ipairs(NETUI.ROOM_CATS) do
+        cats[#cats + 1] = c
+        for _, k in ipairs(c.keys or {}) do used[k] = true end
+    end
+    local rest = {}
+    for _, k in ipairs(NET.FLAG_KEYS) do if not used[k] then rest[#rest + 1] = k end end
+    for _, k in ipairs(NET.RES_KEYS) do if not used[k] then rest[#rest + 1] = k end end
+    if #rest > 0 then cats[#cats + 1] = { id = "other", zh = "其他", en = "OTHER", keys = rest } end
+    for _, c in ipairs(cats) do
+        local sub = {}
+        if c.spec then      -- §141.7 排队规矩（排位房间不显示，同以前）
+            if ST.spec and not ranked then ST.spec.Q.items(sub, T, lb.role == "client" or lb.role == "spec", netuiFlash, lb, netuiCmd) end
+        else
+            for _, k in ipairs(c.keys) do
+                local it = NETUI.roomItem(k, lb)
+                if it then sub[#sub + 1] = it end
+            end
+        end
+        if #sub > 0 then
+            local open = NETUI.roomOpen == c.id
+            items[#items + 1] = { label = (open and "[-] " or "[+] ") .. T(c.zh, c.en) .. string.format(T("（%d 项）", " (%d)"), #sub),
+                                  act = function() NETUI.roomOpen = (NETUI.roomOpen ~= c.id) and c.id or nil; NETUI.roomFocus = c.id end }
+            -- 展开 / 收起后光标跟着这一类的标题（上面一类收起时标题会往上挪）
+            if NETUI.roomFocus == c.id then NETUI.sel, NETUI.roomFocus = #items, nil end
+            if open then
+                for _, it in ipairs(sub) do
+                    it.label = "      " .. it.label
+                    items[#items + 1] = it
+                end
+            end
+        end
+    end
+end
+
+-- 面板里可选的行：{ label, act = function() } ；没有 act 的是说明行。NETUI.page = main / rooms / settings（系统设置）/ room（房间设置）/ thanks
 local function netuiItems(lb, tn)
     local items = {}
     if not lobbyAlive(lb) then
@@ -9169,6 +10613,11 @@ local function netuiItems(lb, tn)
     end
     local mode = netuiMode(lb, tn)
     local function page(p) return function() NETUI.page = p; NETUI.sel = 1 end end
+    -- §171 每页底下：房间设置… 在 系统设置… 上面（用户 11-09；"设置"改名"系统设置"）
+    local function settingsBtns()
+        items[#items + 1] = { label = T("房间设置…", "ROOM RULES..."), act = page("room") }
+        items[#items + 1] = { label = T("系统设置…", "SYSTEM SETTINGS..."), act = page("settings") }
+    end
     -- v0.27.21 感谢名单（设置里的一页）：参与测试并反馈了 bug 的玩家
     if NETUI.page == "thanks" then
         items[#items + 1] = { label = T("参与测试并反馈了 bug 的玩家（B 站）：", "PLAYERS WHO TESTED AND REPORTED BUGS (BILIBILI):") }
@@ -9185,123 +10634,11 @@ local function netuiItems(lb, tn)
     if NETUI.page == "aiload" then NETUI.aiLoadItems(lb, items, page); return items end     -- §114 AI 装备
     if NETUI.page == "aipick" then NETUI.aiPickItems(lb, items, page); return items end
     if NETUI.page == "phrases" and CHAT.phraseItems(lb, items, page) then return items end    -- §150 快捷短语
-    -- 房间设置页（用户 2026-11-06"单独出个页面放房间设置"）：主机 / 没联机时点了换值，客机只看主机定的；都是下一局生效
+    -- 房间设置页（用户 2026-11-06"单独出个页面放房间设置"）：主机 / 没联机时点了换值，客机只看主机定的；都是下一局生效。
+    -- §110 武林盟主：规则是服务器定的固定值，只显示、点了不改。§171 入口挪到各页"系统设置…"上面，返回回主页
     if NETUI.page == "room" then
-        -- v0.25.0 对手血条档位（房间设置，HANDOVER §73）：主机 / 没联机时点一下换下一档；客机只看主机定的
-        local BARN = { [2] = T("血量 + 杀气", "HEALTH + SHACHI"), [1] = T("只显示血量", "HEALTH ONLY"), [0] = T("不显示", "HIDDEN") }
-        if lb.role == "client" then
-            items[#items + 1] = { label = T("对手血条：", "OPPONENT BAR: ") .. BARN[NET.barMode()] .. T("（主机设置）", " (HOST'S SETTING)"),
-                                  act = function() netuiFlash(T("对手血条由主机设置", "THE HOST DECIDES THE OPPONENT BAR")) end }
-        else
-            items[#items + 1] = { label = T("对手血条：", "OPPONENT BAR: ") .. BARN[NET.barCfg] .. T("（主机设置，客机照此显示）", " (HOST SETS IT FOR BOTH)"),
-                                  act = function()
-                                      local m = (NET.barCfg + 2) % 3     -- 2 → 1 → 0 → 2
-                                      NET.barSet(m)
-                                      out("联机面板：对手血条设为 %d（%s）", m, BARN[m])
-                                  end }
-        end
-        -- v0.26.3 局数（房间设置）：主机 / 没联机时点一下 3 → 5 → 7 → 9 → 3；客机只看主机定的
-        local function boLabel(n) return string.format(T("局数：%d 局 %d 胜", "MATCH: BEST OF %d"), n, NET.toWin(n)) end
-        -- §110 武林盟主：局数 / 伤害倍率 / 全部可格挡 / 红蓝光反击 / 武器平衡 / 血瓶 都是服务器定的固定规则（主机客机一样），只显示、点了不改
-        if lb.rk == "1" then
-            local rk = NET.rkRules()
-            local fixed = function() netuiFlash(T("武林盟主的规则由服务器固定，不能改", "RANKED RULES ARE FIXED BY THE SERVER"), COL_ORANGE) end
-            if not rk then
-                items[#items + 1] = { label = T("（正在从服务器获取排位规则…拿到前不能开局）", "(GETTING THE RANKED RULES FROM THE SERVER...)"), col = COL_ORANGE }
-            else
-                items[#items + 1] = { label = T("武林盟主固定规则（服务器定）：", "RANKED RULES (SET BY THE SERVER):"), col = COL_LABEL }
-                local function onOff(on) return on and T("开", "ON") or T("关", "OFF") end
-                items[#items + 1] = { label = boLabel(rk.bo), act = fixed }
-                items[#items + 1] = { label = string.format(T("伤害倍率：%d%%", "DAMAGE: %d%%"), rk.dm), act = fixed }
-                items[#items + 1] = { label = T("全部可格挡：", "ALL MOVES BLOCKABLE: ") .. onOff(rk.ab == 1), act = fixed }
-                for _, k in ipairs(NET.FLAG_KEYS) do
-                    local nm = NET.FLAG_NAME[k]
-                    if not NET.FLAG_LOCKED[k] then
-                        items[#items + 1] = { label = T(nm[1] .. "：", nm[2] .. ": ") .. onOff(rk[k] == 1), act = fixed }
-                    end
-                end
-                for _, k in ipairs(NET.RES_KEYS) do     -- §113
-                    local nm = NET.RES_NAME[k]
-                    local tx = NET.resText(k, rk[k])
-                    items[#items + 1] = { label = T(nm[1] .. "：", nm[2] .. ": ") .. T(tx[1], tx[2]), act = fixed }
-                end
-            end
-            items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
-            return items
-        end
-        if lb.role == "client" then
-            items[#items + 1] = { label = boLabel(NET.bestOf()) .. T("（主机设置）", " (HOST'S SETTING)"),
-                                  act = function() netuiFlash(T("局数由主机设置", "THE HOST DECIDES THE MATCH LENGTH")) end }
-        else
-            items[#items + 1] = { label = boLabel(NET.boCfg) .. T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)"),
-                                  act = function()
-                                      local n = NET.boNext(NET.boCfg)
-                                      NET.boSet(n)
-                                      out("联机面板：局数设为 %d 局（先赢 %d 回合）", n, NET.toWin(n))
-                                  end }
-        end
-        -- §86 伤害倍率（房间设置）：主机 / 没联机时点一下 50 → 75 → 100 → 150 → 200 → 300 → 50；客机只看主机定的
-        local function dmLabel(n) return string.format(T("伤害倍率：%d%%", "DAMAGE: %d%%"), n) end
-        if lb.role == "client" then
-            items[#items + 1] = { label = dmLabel(NET.dmgPct()) .. T("（主机设置）", " (HOST'S SETTING)"),
-                                  act = function() netuiFlash(T("伤害倍率由主机设置", "THE HOST DECIDES THE DAMAGE")) end }
-        else
-            items[#items + 1] = { label = dmLabel(NET.dmCfg) .. T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)"),
-                                  act = function()
-                                      local n = NET.dmNext(NET.dmCfg)
-                                      NET.dmSet(n)
-                                      out("联机面板：伤害倍率设为 %d%%", n)
-                                  end }
-        end
-        -- §87 全部可格挡（房间设置）：主机 / 没联机时点一下开 / 关；客机只看主机定的
-        local function abLabel(on) return T("全部可格挡：", "ALL MOVES BLOCKABLE: ") .. (on and T("开", "ON") or T("关", "OFF")) end
-        if lb.role == "client" then
-            items[#items + 1] = { label = abLabel(NET.allBlock()) .. T("（主机设置）", " (HOST'S SETTING)"),
-                                  act = function() netuiFlash(T("全部可格挡由主机设置", "THE HOST DECIDES THIS RULE")) end }
-        else
-            items[#items + 1] = { label = abLabel(NET.abCfg == 1) .. T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)"),
-                                  act = function()
-                                      local n = 1 - NET.abCfg
-                                      NET.abSet(n)
-                                      out("联机面板：全部可格挡设为%s", n == 1 and "开" or "关")
-                                  end }
-        end
-        -- §105.3 红蓝光反击 / §106.5 武器平衡（房间设置）：主机 / 没联机时点一下开 / 关；客机只看主机定的
-        for _, k in ipairs(NET.FLAG_KEYS) do
-            local nm = NET.FLAG_NAME[k]
-            local function lbl(on) return T(nm[1] .. "：", nm[2] .. ": ") .. (on and T("开", "ON") or T("关", "OFF")) end
-            if NET.FLAG_LOCKED[k] then
-                -- §144.1 锁住的不显示
-            elseif lb.role == "client" then
-                items[#items + 1] = { label = lbl(NET.flag(k)) .. T("（主机设置）", " (HOST'S SETTING)"),
-                                      act = function() netuiFlash(T(nm[1] .. "由主机设置", "THE HOST DECIDES THIS RULE")) end }
-            else
-                items[#items + 1] = { label = lbl(NET.flagCfg[k] == 1) .. T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)"),
-                                      act = function()
-                                          local n = 1 - NET.flagCfg[k]
-                                          NET.flagSet(k, n)
-                                          out("联机面板：%s设为%s", nm[1], n == 1 and "开" or "关")
-                                      end }
-            end
-        end
-        -- §113 开局精纯杀气 0 → 1 → 2 → 3 → 0、§113.4 精纯杀气获取 0% → 25% → … → 300% → 0%、开局暗源 0 → … → 6 → 0、开局资源 每场 ↔ 每局（房间设置）：主机 / 没联机时点一下加一；客机只看主机定的
-        for _, k in ipairs(NET.RES_KEYS) do
-            local nm = NET.RES_NAME[k]
-            local function lbl(n) local tx = NET.resText(k, n); return T(nm[1] .. "：", nm[2] .. ": ") .. T(tx[1], tx[2]) end
-            if lb.role == "client" then
-                items[#items + 1] = { label = lbl(NET.resOf(k)) .. T("（主机设置）", " (HOST'S SETTING)"),
-                                      act = function() netuiFlash(T(nm[1] .. "由主机设置", "THE HOST DECIDES THIS RULE")) end }
-            else
-                items[#items + 1] = { label = lbl(NET.resCfg[k]) .. T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)"),
-                                      act = function()
-                                          local n = NET.resNext(k, NET.resCfg[k])
-                                          NET.resSet(k, n)
-                                          out("联机面板：%s设为 %s", nm[1], NET.resText(k, n)[1])
-                                      end }
-            end
-        end
-        if ST.spec then ST.spec.Q.items(items, T, lb.role == "client" or lb.role == "spec", netuiFlash, lb, netuiCmd) end   -- §141.7 排队规矩
-        items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
+        roomPageItems(lb, items)
+        items[#items + 1] = { label = T("返回", "BACK"), act = page("main") }
         return items
     end
     if NETUI.page == "settings" then
@@ -9325,8 +10662,9 @@ local function netuiItems(lb, tn)
         items[#items + 1] = { label = T("联机密码：", "PASSWORD: ") .. (lb.secret == "1" and T("已设置", "SET") or T("未设置（不签名）", "NONE (UNSIGNED)")),
                               act = function() editStart("secret", T("输入联机密码，两边要一样（空着回车 = 不改，输入 - = 清除）", "PASSWORD, SAME ON BOTH SIDES (EMPTY = KEEP, - = CLEAR)"), "",
                                                          T("对方也要填同一个", "BOTH SIDES USE THE SAME ONE")) end }
-        -- 房间设置（对手血条 / 局数 / 伤害倍率 / 全部可格挡 / 红蓝光反击 / 武器平衡）单独一页（用户 2026-11-06，设置页太长）
-        items[#items + 1] = { label = T("房间设置…", "ROOM RULES..."), act = page("room") }
+        -- §171 对手位置严格跟随（房间规则 npos，主机定）放在系统设置（用户 11-09）；房间设置…入口挪到各页"系统设置…"上面
+        local npos = NETUI.roomItem("npos", lb)
+        if npos then items[#items + 1] = npos end
         items[#items + 1] = { label = T("语言：中文", "LANGUAGE: ENGLISH"),
                               act = function() netuiCmd("lang", "lang=" .. (LANG.zh and "en" or "zh") .. "\n") end }
         -- §122 游戏里的 pbz_lobby.dll 没有窗口（lobby.txt win=0），只有退回 exe 时才有这个按钮；旧版联机程序不写 win，照旧显示
@@ -9372,7 +10710,7 @@ local function netuiItems(lb, tn)
         aiRoomItems()
         items[#items + 1] = { label = roomOn and T("（开打后同时开着房间，有人进来就结束 AI 对战、改成和他打）", "(A PLAYER WHO JOINS REPLACES THE AI)")
                                          or T("（AI 照抄你的攻击属性，武器等在\"AI 装备\"里选；开始后按 F1 开打）", "(COPIES YOUR STATS; PICK ITS GEAR IN AI LOADOUT; PRESS F1 TO FIGHT)") }
-        items[#items + 1] = { label = T("设置…", "SETTINGS..."), act = page("settings") }
+        settingsBtns()
         return items
     end
     if lb.mode == "ai" and (lb.role or "none") ~= "none" then
@@ -9384,7 +10722,7 @@ local function netuiItems(lb, tn)
             items[#items + 1] = { label = roomMode == "server" and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制房间地址（发给朋友）", "COPY MY ADDRESS"),
                                   act = function() netuiCmd("copy"); netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end }
         end
-        items[#items + 1] = { label = T("设置…", "SETTINGS..."), act = page("settings") }
+        settingsBtns()
         return items
     end
     local copy = { label = NETUI.viaServer(mode) and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制我的地址（发给朋友）", "COPY MY ADDRESS"),
@@ -9472,7 +10810,7 @@ local function netuiItems(lb, tn)
             NETUI.rankInfo(lb, items)
         end
     end
-    items[#items + 1] = { label = T("设置…", "SETTINGS..."), act = page("settings") }
+    settingsBtns()
     return items
 end
 
@@ -9552,7 +10890,7 @@ local function netuiRows(tn)
     end
     local st, col = netuiStatus(lb, tn)
     local title = T("联机   [Home] 关闭", "ONLINE   [HOME] CLOSE")
-    local name = NETUI.page == "settings" and T("联机 · 设置", "ONLINE · SETTINGS")
+    local name = NETUI.page == "settings" and T("联机 · 系统设置", "ONLINE · SYSTEM SETTINGS")
               or NETUI.page == "room" and T("联机 · 房间设置", "ONLINE · ROOM RULES")
               or NETUI.page == "thanks" and T("联机 · 感谢名单", "ONLINE · THANKS")
               or NETUI.page == "aiload" and T("联机 · AI 装备", "ONLINE · AI LOADOUT")
@@ -9625,7 +10963,7 @@ end
 
 -- ---- v0.20.0 鼠标面板（说明见 GUI 的定义处）
 local GUI_Z = 460            -- 比屏幕文字（450）高
-local GUI_ROWS = 16           -- 房间设置单独一页后最多 11 项，回到 16；§105.3 / §106.5 曾 16 项 / 18；v0.27.6 设置页已有 12 项，留两行余量；v0.27.21 13 项（感谢名单），14 → 15；§102 14 项（服务器中转），15 → 16
+local GUI_ROWS = 17           -- §171 各页底下多了"房间设置…"一行，16 → 17；房间设置单独一页后最多 11 项，回到 16；§105.3 / §106.5 曾 16 项 / 18；v0.27.6 设置页已有 12 项，留两行余量；v0.27.21 13 项（感谢名单），14 → 15；§102 14 项（服务器中转），15 → 16
 local GUI_W = 640            -- 面板最小宽度（Slate 单位）
 local BG_ROW = { R = 0.10, G = 0.10, B = 0.12, A = 0.92 }
 local BG_HOVER = { R = 0.24, G = 0.24, B = 0.28, A = 0.95 }
@@ -10221,6 +11559,8 @@ local function netuiKey(what)
     local tn = now()
     if what == "autostart" then netuiEnsure("模组加载", tn); return end
     if what == "toggle" then netuiSetOpen(not NETUI.open, "Home"); return end
+    -- 用户 2026-11-08：P 也开 / 关面板；输入框里 P 是要打的字母，跳过
+    if what == "ptoggle" then if not NETUI.edit then netuiSetOpen(not NETUI.open, "P") end; return end
     -- 回车 / Esc 只给输入框用（不在输入时什么都不做：回车、Esc 是游戏自己的键）
     if NETUI.edit then
         if what == "enter" then editCommit() elseif what == "esc" then editEnd("Esc") end
@@ -10409,6 +11749,18 @@ local function matchStep(p1, tn)
         if MATCH.state == "cd" and ST.ticks % 3 == 0 then refill(p1) end
         if MATCH.state == "fight" then
             local hp = hpOf(p1)
+            -- §165 测试用：net 目录里有 nodeath.on 就不让自己倒下（血低于一半回满），采招式数据时一回合打到底
+            if NET.noDeath == nil then local f = io.open(NET_DIR .. "/nodeath.on", "r"); NET.noDeath = f ~= nil; if f then f:close() end end
+            if NET.noDeath and hp then
+                local mx = attrOf(p1, "Health_Max")
+                if mx and hp < mx * 0.5 then
+                    setAttr(p1, "Health", mx)
+                    -- 判定按"回过血"截断多段累加（§155）；测试补的血不算，不然多段招后几段都记不进回报（§165.5）
+                    if NET.judgeHp then NET.judgeHp = mx end
+                    out("测试不死：血量 %.0f → %.0f（nodeath.on）", hp, mx)
+                    hp, MATCH.fightHp = mx, mx
+                end
+            end
             local regen = hp and hp > DEAD_HP and MATCH.fightHp and hp ~= MATCH.fightHp and savedByBreakRegen(p1, hp, tn)
             if hp and (hp <= DEAD_HP or regen) and MATCH.dead ~= MATCH.round then
                 MATCH.dead = MATCH.round
@@ -11226,8 +12578,45 @@ end
 -- §154 测试用"自动出招"：真人对真人测伤害时，由外部工具让本机角色贴近对手、面向它、放指定招 N 次（双开时两份各自执行，
 -- 不用电脑控制走位）。只在模组目录有 autohit.on 时才开（加载时看一次）；开着时每秒读一次 <net>/autohit.txt：
 --   id=任意（换了才算新任务）  move=技能名（如 GA_Hun_WoodenSword_A_C）  n=次数  gap=间隔秒  close=1 先瞬移到对手面前 dist 远
-local AUTOHIT = { on = false, id = nil, job = nil, readAt = -100 }
+local AUTOHIT = { on = false, id = nil, job = nil, readAt = -100, hold = nil, holdAt = -100 }
+function AUTOHIT.xyz(v)
+    local x, y, z = tostring(v or ""):match("^%s*(-?[%d.]+)%s*,%s*(-?[%d.]+)%s*,%s*(-?[%d.]+)")
+    return x and { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) } or nil
+end
 do local f = io.open(ROOT .. "/autohit.on", "r"); if f then f:close(); AUTOHIT.on = true end end
+-- §165.6 读动画：长度（GetPlayLength / SequenceLength）、段落（CompositeSections）、通知（Notifies：类名、时刻、时长）。每帧 8 个
+function AUTOHIT.animStep()
+    local A = AUTOHIT.anim
+    for _ = 1, 8 do
+        A.i = A.i + 1
+        local path = A.list[A.i]
+        if not path then
+            local fh = io.open(NET_DIR .. "/anim_dump.txt", "w")
+            if fh then fh:write(table.concat(A.lines, "\n"), "\n"); fh:close() end
+            out("== 自动出招：动画数据写完 %d 行 ==", #A.lines); AUTOHIT.anim = nil; return
+        end
+        local mt = LO.loadObject(path)
+        if not valid(mt) then A.lines[#A.lines + 1] = path .. "\t?"
+        else
+            local len
+            pcall(function() len = mt:GetPlayLength() end)
+            if type(len) ~= "number" then len = tonumber(G.rawProp(mt, "SequenceLength")) end
+            local secs, nts = {}, {}
+            local cs = G.rawProp(mt, "CompositeSections")
+            if cs then pcall(G.eachArr, cs, function(_, e)
+                secs[#secs + 1] = string.format("%s@%.3f", G.fnameStr(G.rawProp(e, "SectionName")) or "?", tonumber(G.rawProp(e, "LinkValue")) or -1)
+            end) end
+            local ns = G.rawProp(mt, "Notifies")
+            if ns then pcall(G.eachArr, ns, function(_, e)
+                local st, nf, cls = G.rawProp(e, "NotifyStateClass"), G.rawProp(e, "Notify"), "?"
+                if valid(st) then cls = G.shortName(G.full(st)) elseif valid(nf) then cls = G.shortName(G.full(nf)) end
+                nts[#nts + 1] = string.format("%s@%.3f+%.3f", cls, tonumber(G.rawProp(e, "LinkValue")) or -1, tonumber(G.rawProp(e, "Duration")) or 0)
+            end) end
+            A.lines[#A.lines + 1] = string.format("%s\t%s\t%s\t%s", path, len and string.format("%.3f", len) or "?", table.concat(secs, " "), table.concat(nts, " "))
+        end
+    end
+end
+
 local function autoHitStep()
     if not AUTOHIT.on then return end
     local tn = now()
@@ -11237,16 +12626,55 @@ local function autoHitStep()
         if kv and kv.id and kv.id ~= AUTOHIT.id then
             AUTOHIT.id = kv.id
             AUTOHIT.job = { move = kv.move or "", n = tonumber(kv.n) or 3, gap = tonumber(kv.gap) or 2.0,
-                            close = kv.close == "1", dist = tonumber(kv.dist) or 180.0, i = 0, at = tn }
+                            close = kv.close == "1", dist = tonumber(kv.dist) or 180.0, i = 0, at = tn,
+                            all = kv.all, list = nil, home = AUTOHIT.xyz(kv.home) }
+            -- §165.6 animdump=1：读 <net>/anim_list.txt（一行一个动画路径），逐个 LoadAsset，记长度 / 段落 / 通知到 <net>/anim_dump.txt
+            if kv.animdump == "1" then
+                local list, fh = {}, io.open(NET_DIR .. "/anim_list.txt", "r")
+                if fh then for l in fh:lines() do l = l:gsub("%s+$", ""); if l ~= "" then list[#list + 1] = l end end; fh:close() end
+                AUTOHIT.anim = { list = list, i = 0, lines = {} }
+                out("== 自动出招：读动画数据 %d 个 ==", #list)
+            end
+            -- §165.1 采数据防跑偏：hold=x,y,z 挨打方离这点太远 / 掉下去就拉回；hold=0 关掉
+            if kv.hold then AUTOHIT.hold = AUTOHIT.xyz(kv.hold); out("== 自动出招：定点 %s ==", kv.hold) end
+            -- §165 采数据：equip=主武器 ID / sequip=影武 ID 先用游戏的临时整套配装换上（Push，不碰存档；pop=1 换回原来的）
+            if kv.pop == "1" and AUTOHIT.pushed then
+                local okP, errP = G.loadoutPop()
+                out("== 自动出招：换回原配装 %s ==", okP and "成功" or tostring(errP))
+                AUTOHIT.pushed = false
+            end
+            if (kv.equip or "") ~= "" or (kv.sequip or "") ~= "" then
+                local mains, shaqis = G.loadoutLists()
+                mains, shaqis = mains or {}, shaqis or {}
+                if AUTOHIT.pushed then G.loadoutPop() end
+                local m = { mains[1] }                  -- §165.4 equip=A,B 两把（测切刀斩要能真切刀）
+                if (kv.equip or "") ~= "" then m = {}; for w in kv.equip:gmatch("[^,%s]+") do m[#m + 1] = w end end
+                local sq = (kv.sequip or "") ~= "" and { kv.sequip } or { shaqis[1] }
+                local okP, errP = G.loadoutPush(m, sq, 0, 0)
+                AUTOHIT.pushed = okP or AUTOHIT.pushed
+                out("== 自动出招：配装换成 主 %s / 影 %s：%s ==", tostring(m[1]), tostring(sq[1]), okP and "成功" or tostring(errP))
+                AUTOHIT.job.at = tn + (tonumber(kv.settle) or 2.5)
+            end
             out("== 自动出招 %s：%s × %d，间隔 %.1f 秒%s ==", kv.id, AUTOHIT.job.move, AUTOHIT.job.n, AUTOHIT.job.gap,
                 AUTOHIT.job.close and "，先贴到对手面前" or "")
+        end
+    end
+    if AUTOHIT.anim then AUTOHIT.animStep() end
+    if AUTOHIT.hold and tn - AUTOHIT.holdAt >= 0.5 then
+        AUTOHIT.holdAt = tn
+        local p0, h = getP1(), AUTOHIT.hold
+        local c = valid(p0) and try("ah hold", function() return p0:K2_GetActorLocation() end)
+        if c and (math.sqrt((c.X - h.X) ^ 2 + (c.Y - h.Y) ^ 2) > 250 or c.Z < h.Z - 300) then
+            pcall(function() p0:K2_SetActorLocation(h, false, {}, true) end)
+            out("== 自动出招：离定点太远，拉回 (%.0f, %.0f, %.0f) ==", c.X, c.Y, c.Z)
         end
     end
     local j = AUTOHIT.job
     if not j or tn < j.at then return end
     local p1, pup = getP1(), puppet()
     if not valid(p1) or not valid(pup) then out("!! 自动出招：没有玩家或对手，停"); AUTOHIT.job = nil; return end
-    local a = try("ah loc", function() return p1:K2_GetActorLocation() end)
+    if j.home then pcall(function() p1:K2_SetActorLocation(j.home, false, {}, true) end) end
+    local a = j.home or try("ah loc", function() return p1:K2_GetActorLocation() end)
     local b = try("ah pup", function() return pup:K2_GetActorLocation() end)
     if not a or not b then return end
     local dx, dy = a.X - b.X, a.Y - b.Y
@@ -11258,13 +12686,32 @@ local function autoHitStep()
         a, d = to, j.dist
     end
     setYaw(p1, math.deg(math.atan(b.Y - a.Y, b.X - a.X)))
+    -- §165 all=main / edge：列出手上武器（或影武）的全部攻击招，每招放 n 次
+    if j.all and not j.list then
+        j.list = {}
+        for _, x in ipairs(abilitiesOf(p1) or {}) do
+            if isAttackAbility(x.name) and (LO.isEdgeAttack(x.name) == (j.all == "edge")) then j.list[#j.list + 1] = x.name end
+        end
+        table.sort(j.list)
+        out("== 自动出招：%s 共 %d 招：%s ==", j.all, #j.list, table.concat(j.list, ","))
+        if #j.list == 0 then AUTOHIT.job = nil; out("== 自动出招 %s 完成 ==", AUTOHIT.id); return end
+        j.total = #j.list * j.n
+    end
+    if j.list then j.move = j.list[math.floor(j.i / j.n) + 1] end
+    -- §165 采数据：每招前把杀气 / 暗源 / 精纯杀气补满（重招、影武、大招要资源，不然放不出）
+    do     -- 单招（move=）补测也补，以前只在 all= 时补，大招没精纯杀气放不出
+        for _, k in ipairs({ "Shachi", "SpiritShadow", "UltimateChargeCount" }) do
+            local mx = attrOf(p1, k .. "_Max")
+            if mx and (attrOf(p1, k) or mx) < mx then setAttr(p1, k, mx) end
+        end
+    end
     local cls
     for _, x in ipairs(abilitiesOf(p1) or {}) do if x.name == j.move then cls = x.cls end end
     local ok, r = false, "玩家身上没有这个技能"
     if cls then ok, r = pcall(function() return ascOf(p1):TryActivateAbilityByClass(cls, true) end) end
     j.i = j.i + 1
-    out("== 自动出招 %d/%d：%s -> %s（离对手 %.0f）==", j.i, j.n, j.move, tostring(r), d)
-    if j.i >= j.n then out("== 自动出招 %s 完成 ==", AUTOHIT.id); AUTOHIT.job = nil else j.at = tn + j.gap end
+    out("== 自动出招 %d/%d：%s -> %s（离对手 %.0f）==", j.i, j.total or j.n, j.move, tostring(r), d)
+    if j.i >= (j.total or j.n) then out("== 自动出招 %s 完成 ==", AUTOHIT.id); AUTOHIT.job = nil else j.at = tn + j.gap end
 end
 
 return { step = matchStep, start = matchStart, saveArena = saveArena, place = placeTextFrame, medProbe = medProbe,
@@ -11281,6 +12728,8 @@ return { step = matchStep, start = matchStart, saveArena = saveArena, place = pl
          cmd = netuiCmd, flash = netuiFlash, panelOpen = function() return NETUI.open end,
          -- §149.1 读档换世界时清掉落地保护记着的旧角色（SAFE 是这里的局部表，M4.forgetWorld 在外面看不到）
          forgetSafe = function() SAFE.guard = nil end,
+         -- §141.14 退出观战时把玩家安全放到主机站过的地面旁边（safePlace 是这里的局部函数）
+         safePlace = safePlace,
          peerName = function() local lb = netuiRead(now()) or {}; return (lb.peername or "") ~= "" and lb.peername or nil end }
 end)()
 
@@ -11646,6 +13095,10 @@ local function onTick()
         return
     end
     ST.stableTicks = ST.stableTicks + 1
+    local okD, errD = pcall(ACC.diag, p1, now())    -- §170.3 饰品份数诊断
+    if not okD and errD ~= ACC.dgErr then ACC.dgErr = errD; out("!! 饰品诊断出错：%s", tostring(errD)) end
+    local okU, errU = pcall(ACC.dedupe, p1, now())  -- §170.4 替身出来后我身上的饰品多一份 → 去掉
+    if not okU and errU ~= ACC.duErr then ACC.duErr = errU; out("!! 饰品去重出错：%s", tostring(errU)) end
     if ST.stableTicks < 90 then return end
     if ST.secondPC ~= nil and not valid(ST.secondPC) then
         out("替身控制器失效（切图？），清掉")
@@ -11717,13 +13170,13 @@ end
 -- 之后所有循环（驱动、每帧输入、去暗杀、看门狗重启）什么都不做，直到新地图加载完（UE4SS 的 LoadMap 钩子，没有就等 25 秒）
 -- 再过 3 秒、找到新的玩家1 且地图变了并稳定 1 秒，才恢复
 M4.mapgo.LOADED_WAIT, M4.mapgo.NOHOOK_WAIT, M4.mapgo.OK_TICKS = 3, 25, 30
-function M4.mapgo.freeze(target, from)
+function M4.mapgo.freeze(target, from, pos)
     if valid(puppet()) and MATCH.autoRemove then MATCH.autoRemove() end
     MATCH.autoPup = nil
     ST.feed, ST.feedLeft = nil, 0
     ST.npcStore, ST.npcCtl, ST.p1pc, ST.testMonster = nil, nil, nil, nil   -- 旧世界的，新地图用不上
     OPPBAR.actor, OPPBAR.bar, OPPBAR.last, OPPBAR.nameAt = nil, nil, {}, nil
-    ST.travel = { at = os.time(), target = target, from = from, loadedAt = nil, ok = 0 }
+    ST.travel = { at = os.time(), target = target, from = from, loadedAt = nil, ok = 0, same = target == from, pos = pos }
     out("== 切图冻结：替身已藏起，加载完之前模组不碰游戏对象 ==")
 end
 
@@ -11753,6 +13206,7 @@ function M4.mapgo.frozen()
         out("!! 切图冻结 %d 秒还没加载完，解除", tc - tr.at)
         return false
     end
+    if tr.same then return M4.mapgo.frozenSame(tr, tc) end      -- §168.1 同地图走游戏传送
     local since = tr.loadedAt or (tc - tr.at >= M4.mapgo.NOHOOK_WAIT and tr.at + M4.mapgo.NOHOOK_WAIT - M4.mapgo.LOADED_WAIT) or nil
     if not since or tc - since < M4.mapgo.LOADED_WAIT then return true end
     if ST.ticks % 15 ~= 0 then ST.ticks = ST.ticks + 1; return true end     -- 加载后每 0.5 秒看一次
@@ -11765,6 +13219,30 @@ function M4.mapgo.frozen()
     ST.travel = nil
     ST.stableTicks = 0
     out("== 切图冻结解除：新地图 %s（用时 %d 秒）==", tostring(m), tc - tr.at)
+    return false
+end
+
+-- §168.1 同地图走游戏传送的解冻：地图名不会变，没法按"换了地图"判断。游戏不一定重新加载整个世界——
+-- 加载钩子来了：照切图等 LOADED_WAIT 秒；没来：至少等 SAME_MIN 秒（别在可能的世界切换中途碰对象）。
+-- 然后玩家1 在落点 SAME_NEAR 以内、而且不在往下掉，连着 OK_TICKS → 解冻（之后 MAPGO.step 当作到达，放到主机身边 + 防掉落）
+M4.mapgo.SAME_MIN, M4.mapgo.SAME_NEAR = 3, 5000.0
+function M4.mapgo.frozenSame(tr, tc)
+    local since = tr.loadedAt and tr.loadedAt + M4.mapgo.LOADED_WAIT or tr.at + M4.mapgo.SAME_MIN
+    if tc < since then return true end
+    if ST.ticks % 15 ~= 0 then ST.ticks = ST.ticks + 1; return true end
+    ST.ticks = ST.ticks + 1
+    ST.p1pc = nil
+    local p1 = getP1()
+    local loc = valid(p1) and try("same tp loc", function() return p1:K2_GetActorLocation() end) or nil
+    local near = loc and tr.pos and math.sqrt((loc.X - tr.pos.X) ^ 2 + (loc.Y - tr.pos.Y) ^ 2) <= M4.mapgo.SAME_NEAR
+    local st = near and G.airOf(p1) or nil
+    tr.ok = (near and st and not st.falling) and tr.ok + 1 or 0
+    if tr.ok < M4.mapgo.OK_TICKS / 15 then return true end
+    ST.travel = nil
+    ST.stableTicks = 0
+    local pd = M4.mapgo.pending
+    if pd and pd.same then pd.done = true end      -- §168.2 现在才算到达（MAPGO.step）
+    out("== 同地图传送冻结解除（用时 %d 秒，%s）==", tc - tr.at, tr.loadedAt and "游戏重新加载了世界" or "没重新加载世界")
     return false
 end
 
@@ -12090,6 +13568,7 @@ end, "移除替身")
 -- v0.18.4：去掉方向键和回车——17:09 实测面板开着按 ↑↓ 角色会转身（yaw 159.7 → −20.3），方向键是游戏的移动键；
 -- 回车没测过，同样可能被游戏用。PgUp / PgDn / End 实测不影响角色（HANDOVER §42）
 bind(Key.HOME, function() M4.netui("toggle") end, "联机面板")
+bind(Key.P, function() M4.netui("ptoggle") end, "联机面板 P")
 -- §112 聊天：Delete（输入框里按 Delete 是删字，CHAT.open 自己跳过）
 bind(Key.DEL, function() CHAT.open(false) end, "聊天")
 -- §141 观战：小键盘 * 换镜头（侧面中点 / 跟 A / 跟 B / 自由视角）。代码在 pbz_spec.lua；
@@ -12101,8 +13580,22 @@ ST.spec = (function()
     return mk({ out = out, ST = ST, MATCH = MATCH, G = G, activate = activateOnPuppet, isAttack = isAttackAbility,
                 loadRecording = loadRecording, recDir = REC_DIR, LO = LO,
                 replayable = replayable, playNamed = playNamed, netCmd = M4.cmd, readKV = fileReadKV, writeFile = fileWrite,
-                rulesFile = NET.RULES_FILE, flash = M4.flash, NET = NET,
-                mapGo = function() local p1 = getP1(); if M4.mapgo.check(p1) == "ok" then M4.mapgo.go(p1, true) end end })
+                rulesFile = NET.RULES_FILE, flash = M4.flash, NET = NET, safePlace = M4.safePlace,
+                mapGo = function() local p1 = getP1(); if M4.mapgo.check(p1) == "ok" then M4.mapgo.go(p1, true) end end,
+                -- §168.5 观战也走游戏传送：离主机多远（米）、同图传到主机身边、是不是在传送中
+                hostDist = function() return M4.mapgo.dist(getP1()) end,
+                toHost = function() return M4.mapgo.toHost(getP1(), true) end,
+                -- 观战者收的包不走 NET.recvOne，lobbyStep 不调 MAPGO.step（11-09 实测：传到了，观战一直不开）：这里替它确认到达
+                -- §168.6 屏幕中间的提示（观战者连着时联机面板的状态行不显示，用对局外提示那一块）
+                notice = function(title, sub, sec)
+                    MATCH.toast = { rows = { { c = title, col = COL_ORANGE, size = 1.3 }, sub and { c = sub, col = COL_LABEL } or nil }, till = now() + (sec or 2.0) }
+                end,
+                travelling = function()
+                    if ST.travel then return true end
+                    local p1, pd = getP1(), M4.mapgo.pending
+                    if pd and valid(p1) and (pd.done or (not pd.same and mapName(p1) == pd.map)) then M4.mapgo.step(p1, mapName(p1)) end
+                    return M4.mapgo.pending ~= nil
+                end })
 end)()
 if ST.spec then
     pcall(ST.spec.Q.load)       -- §141.7 排队规矩（net/rules.txt 的 rot= / rotw=）
