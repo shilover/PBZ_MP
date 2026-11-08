@@ -14,7 +14,7 @@ using System.Web.Script.Serialization;
 
 namespace PbzLobby
 {
-    // 连接方式。steam / steamlobby 走 Steam P2P；lan 是 UDP；
+    // 连接方式。lan 是 UDP；
     // v0.20.3：广域网（wan）并进服务器大厅（用户："广域网没有房间列表，只能一对一输入 IP，作为服务器大厅下的一个子选项就可以"）——
     // 服务器大厅里"输入 IP 直连"走原来广域网的 UDP 直连；主机监听设置里的端口，没人经大厅加入时也接受直接连进来的客机。
     // v0.20.2：虚拟局域网（vlan）并进局域网（用户："虚拟局域网的软件装好连通后，走局域网联机就行"）——局域网顺带单播给
