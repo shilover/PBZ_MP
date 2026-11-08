@@ -9172,7 +9172,7 @@ local function netuiItems(lb, tn)
     -- v0.27.21 感谢名单（设置里的一页）：参与测试并反馈了 bug 的玩家
     if NETUI.page == "thanks" then
         items[#items + 1] = { label = T("参与测试并反馈了 bug 的玩家（B 站）：", "PLAYERS WHO TESTED AND REPORTED BUGS (BILIBILI):") }
-        for _, n in ipairs({ "成步堂芦苇", "谦逊的刘恒宇", "亦如黎明中的花朵_", "絡訸", "化境", "一一清风以及他的小伙伴们" }) do items[#items + 1] = { label = "  " .. n } end
+        for _, n in ipairs({ "成步堂芦苇", "谦逊的刘恒宇", "亦如黎明中的花朵_", "絡訸", "化境", "一一清梦以及他的小伙伴们" }) do items[#items + 1] = { label = "  " .. n } end
         items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
         return items
     end
