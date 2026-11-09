@@ -2243,7 +2243,8 @@ function NET.ultxApply(p1, pct)
     local a = NET.ULTX_ATTR
     if MATCH.ultxSaved == nil then
         if pct == 100 then return end
-        MATCH.ultxSaved = attrOf(p1, a) or false
+        local cur, base = attrOf(p1, a)
+        MATCH.ultxSaved, MATCH.ultxBase = cur or false, base
         if not MATCH.ultxSaved then out("!! 精纯杀气获取倍率：读不到 %s，这一场不改", a); return end
     end
     if not MATCH.ultxSaved then return end
@@ -2254,11 +2255,13 @@ function NET.ultxApply(p1, pct)
     end
 end
 function NET.ultxRestore(p1)
-    local v = MATCH.ultxSaved
-    MATCH.ultxSaved = nil
+    local v, vb = MATCH.ultxSaved, MATCH.ultxBase
+    MATCH.ultxSaved, MATCH.ultxBase = nil, nil
     if not (v and valid(p1)) then return end
     local c = attrOf(p1, NET.ULTX_ATTR)
     if c and math.abs(c - v) > 0.001 then NET.resWrite(p1, NET.ULTX_ATTR, v) end
+    local _, cb = attrOf(p1, NET.ULTX_ATTR)            -- §170.7 改属性函数连基础值一起改，基础值单独写回
+    if vb and cb and math.abs(cb - vb) > 0.0001 then G.setAttrBase(p1, NET.ULTX_ATTR, vb) end
     out("精纯杀气获取倍率：还原成对局前的 %.3f", v)
 end
 function NET.resRestore(p1)
@@ -2507,8 +2510,24 @@ end
 -- §170.5 对局前的属性要在饰品换级（ACC.apply）之前记：倒计时里先调这个，writeAttrs 记 saved 时优先用它
 function STD.capture(p1)
     if not (STD.active() and valid(p1)) or STD.pre then return end
-    STD.pre = {}
-    for _, a in ipairs(STD.ORDER) do STD.pre[a] = attrOf(p1, a) end
+    STD.pre, STD.preBase = {}, {}
+    for _, a in ipairs(STD.ORDER) do STD.pre[a], STD.preBase[a] = attrOf(p1, a) end
+    local ok, add, mul = pcall(STD.accBonus, p1)
+    STD.preAdd, STD.preMul = ok and add or {}, ok and mul or {}
+end
+-- §170.9 写锁定属性：基础值 = base、当前值 = cur。血 / 攻 / 杀气上限这些直接写——游戏的改属性函数（GE_MA_*_Override）对
+-- 带饰品乘法加成的属性会算歪（11-09 08:19 实测 Health_Max 要 3857.5 写成 7616.25），还把加成写进基础值；
+-- 两个格数上限照旧走改属性函数（HUD 要通知，§113），写完再把基础值单独摆正
+STD.VIA_MOD = { UltimateChargeCount_Max = true, SpiritShadow_Max = true }
+-- 11-09 08:28 实测：BaseValue 是"没吃永久道具"的底子（Health_Max 850、Attack 100），记忆之花 / 杀气核心 / 饰品都是效果叠上去的。
+-- 所以只改当前值、基础值永远不动（改属性函数顺手改了的就摆回对局前的），游戏重算时自然回到玩家自己的值
+function STD.put(p1, a, cur)
+    local _, b0 = attrOf(p1, a)
+    local keep = STD.savedBase and STD.savedBase[a] or b0
+    if STD.VIA_MOD[a] then NET.resWrite(p1, a, cur) end
+    local c, cb = attrOf(p1, a)
+    if c and math.abs(c - cur) > 0.01 then G.setAttrCur(p1, a, cur) end
+    if keep and cb and math.abs(cb - keep) > 0.001 then G.setAttrBase(p1, a, keep) end
 end
 function STD.writeAttrs(p1, health)
     local parts = {}
@@ -2517,9 +2536,15 @@ function STD.writeAttrs(p1, health)
     for _, a in ipairs(STD.ORDER) do
         local want, c = (STD.ATTR[a] + (add[a] or 0)) * (mul[a] or 1), attrOf(p1, a)
         if c then
-            if STD.saved and STD.saved[a] == nil then STD.saved[a] = (STD.pre and STD.pre[a]) or c end
+            if STD.saved and STD.saved[a] == nil then
+                STD.saved[a] = (STD.pre and STD.pre[a]) or c
+                STD.savedBase = STD.savedBase or {}
+                local _, cb = attrOf(p1, a)
+                STD.savedBase[a] = (STD.preBase and STD.preBase[a]) or cb
+                if not STD.preAdd then STD.preAdd, STD.preMul = add, mul end
+            end
             if math.abs(c - want) > 0.01 then
-                NET.resWrite(p1, a, want)
+                STD.put(p1, a, want)
                 parts[#parts + 1] = string.format("%s %.0f→%.0f（读回 %s）", a, c, want, tostring(attrOf(p1, a)))
             end
         end
@@ -2799,23 +2824,23 @@ function ACC.apply(p1)
     if first then mine = { ga = {}, gaGiven = {}, ge = {}, geAdded = {}, mode = mode }; ACC.mine = mine end
     -- ① 技能（先换技能：它自己挂的效果跟着换，下面 ② 再看剩下的）
     local swapped = {}
+    -- 11-09 修：先给目标级、给上了再清原来那格（以前先清后给，给不上时这一局身上就少了这件饰品的技能）；
+    -- "只试一次"的记录在 pbz_game 的 LO 里，这边清不到 → 用 again 参数
     for _, s in ipairs(ACC.specs(asc, function(n) return not mine.gaGiven[n] and ACC.target(n, mode) ~= nil end)) do   -- 遍历完再清
-        if LO.clearAbility(asc, s.h) then
+        local t = ACC.target(s.n, mode)
+        local tag = s.n .. "→"
+        local cls1 = t and LO.give(p1, t, {}, true)
+        if t and not cls1 then
+            tag = tag .. "（给不了，原样保留）"
+        elseif LO.clearAbility(asc, s.h) then
             mine.ga[#mine.ga + 1] = { n = s.n, cls = s.cls }
-            local t = ACC.target(s.n, mode)
-            local tag = s.n .. "→"
-            if t then
-                LO.gaveTried = LO.gaveTried or {}
-                LO.gaveTried[pathOf(p1) .. "|" .. t] = nil          -- 自己身上每场可能要再给一次
-                local cls1 = LO.give(p1, t, {})
-                if cls1 then
-                    pcall(function() asc:TryActivateAbilityByClass(cls1, true) end)
-                    mine.gaGiven[t] = true
-                    tag = tag .. t:match("_Lv%d_C$")
-                else tag = tag .. "（给不了）" end
+            if cls1 then
+                pcall(function() asc:TryActivateAbilityByClass(cls1, true) end)
+                mine.gaGiven[t] = true
+                tag = tag .. t:match("_Lv%d_C$")
             else tag = tag .. "（摘掉）" end
-            swapped[#swapped + 1] = tag
-        end
+        else tag = tag .. "（清不掉）" end
+        swapped[#swapped + 1] = tag
     end
     -- ② 效果：按份数换（§170.2 同一个效果可能生效两份，二周目饰品增伤实测 0.3 × 2；换成目标级也挂同样份数）
     local cnt = G.geCounts(p1)
@@ -2917,19 +2942,14 @@ function ACC.snap(p1)
     end
     return ge, ga
 end
+-- 11-09 修：观战一次生成两个替身（A / B，不是 ST.secondPawn），玩家身上的饰品叠到 ×3 还被当成基准记下。
+-- 同一件饰品只能装一次，没替身时实测永远 ×1 → 基准一律按 1，不再记录；有没有替身都查（每 1 秒）
 function ACC.dedupe(p1, tn)
-    local pup = ST.secondPawn
-    if not valid(pup) then
-        if tn - ACC.baseAt >= 5 then
-            ACC.baseAt = tn
-            local ge, ga = ACC.snap(p1)
-            ACC.base = { pp = pathOf(p1), ge = ge, ga = ga }
-        end
-        return
-    end
+    if not (ACC.base and ACC.base.pp == pathOf(p1)) then ACC.base = { pp = pathOf(p1), ge = {}, ga = {} } end
     local b = ACC.base
-    if ACC.mine or not b or b.pp ~= pathOf(p1) or tn - ACC.dedupAt < 1 then return end
+    if ACC.mine or tn - ACC.dedupAt < 1 then return end
     ACC.dedupAt = tn
+    ACC.orphans(p1)
     local ge, ga = ACC.snap(p1)
     local asc = ascOf(p1)
     local fixed = {}
@@ -2959,6 +2979,49 @@ function ACC.dedupe(p1, tn)
         ACC.dedupN = ACC.dedupN + 1
         if ACC.dedupN <= 20 then out("饰品去重（替身出来后我身上多了一份，第 %d 次）：%s", ACC.dedupN, table.concat(fixed, "，")) end
     end
+end
+-- 11-09 修：去重是"整个摘、按数挂回"，挂回的那份不归装备管——之后卸下这件饰品，游戏摘不掉它（用户：加血饰品卸了血条还是长）。
+-- 所以每秒对一遍：身上有某件饰品的效果 / 技能，但 IsEquipAccessory 说没装 → 摘掉。名字对应 GE_Accessory_X_LvN / *Accessory_X_* ↔ AC_X
+function ACC.orphans(p1)
+    local ge, ga = ACC.snap(p1)
+    local by = {}
+    for n in pairs(ge) do local x = n:match("^GE_Accessory_(%a+)_Lv%d$"); if x then by["AC_" .. x] = true end end
+    for n in pairs(ga) do local x = n:match("Accessory_(%a+)_"); if x then by["AC_" .. x] = true end end
+    -- 只管认识的饰品（STD.ACCESSORIES 里有 AC_X）；同名变体 AC_X_1..4 装着任意一件都算装着，宁可漏摘不误摘
+    ACC.known = ACC.known or {}
+    if not next(ACC.known) then for _, id in ipairs(STD.ACCESSORIES or {}) do ACC.known[id] = true end end
+    local ids = {}
+    for id in pairs(by) do
+        if ACC.known[id] then
+            ids[#ids + 1] = id
+            for k = 1, 4 do ids[#ids + 1] = id .. "_" .. k end
+        else by[id] = nil end
+    end
+    if #ids == 0 then return end
+    local on = G.accEquipped(ids)
+    if not on then return end
+    local eq = {}
+    for _, id in ipairs(on) do eq[(id:gsub("_%d$", ""))] = true end
+    for id in pairs(eq) do by[id] = nil end           -- by 里剩下的 = 认识、且确实没装
+    local asc = ascOf(p1)
+    local gone = {}
+    for n in pairs(ge) do
+        local x, lv = n:match("^GE_Accessory_(%a+)_Lv(%d)$")
+        if x and by["AC_" .. x] then
+            LO.removeGE(p1, ACC.gePath(x, lv), nil)
+            gone[#gone + 1] = n
+        end
+    end
+    if valid(asc) then
+        for n in pairs(ga) do
+            local x = n:match("Accessory_(%a+)_")
+            if x and by["AC_" .. x] then
+                for _, sp in ipairs(ACC.specs(asc, function(y) return y == n end)) do LO.clearAbility(asc, sp.h) end
+                gone[#gone + 1] = n
+            end
+        end
+    end
+    if #gone > 0 then out("饰品：没装着的饰品效果还挂在身上，摘掉：%s", table.concat(gone, "，")) end
 end
 -- 对局中每 2 秒（跟着 STD.tick 的调用点）：触发出来的饰品增益也按设置换
 ACC.at = -100
@@ -3047,13 +3110,25 @@ function STD.restore(p1)
     STD.unforce("对局结束")
     STD.gearOff(p1)
     STD.disabled, STD.forceTimes, STD.seen, STD.settleUntil, STD.verify = false, {}, nil, -100, nil
-    local s = STD.saved
-    STD.saved, STD.pre = nil, nil
+    local s, sb = STD.saved, STD.savedBase or {}
+    STD.saved, STD.pre, STD.savedBase, STD.preBase = nil, nil, nil, nil
     if s and valid(p1) then
+        -- 11-09 修：基础值写回对局前的基础值；当前值按"对局前基础值 + 现在身上的饰品加成"算——
+        -- 对局中卸 / 换了饰品，不能再写回对局前的当前值（用户：结束战斗反而比摘掉饰品更长）
+        -- 当前值 = 对局前的当前值，换掉对局前的饰品加成、换成现在的（对局中卸 / 换了饰品）；基础值摆回对局前的
+        local okB, add, mul = pcall(STD.accBonus, p1)
+        if not okB then add, mul = {}, {} end
+        local a0, m0 = STD.preAdd or {}, STD.preMul or {}
+        STD.savedBase = sb
         for _, a in ipairs(STD.ORDER) do
-            local v, c = s[a], attrOf(p1, a)
-            if v and c and math.abs(c - v) > 0.01 then NET.resWrite(p1, a, v) end
+            local v0 = s[a]
+            if v0 then
+                local v = (v0 / (m0[a] or 1) - (a0[a] or 0) + (add[a] or 0)) * (mul[a] or 1)
+                STD.put(p1, a, v)
+            end
         end
+        STD.savedBase, STD.preAdd, STD.preMul = nil, nil, nil
+        s.Health_Max = attrOf(p1, "Health_Max")
         for _, path in ipairs(STD.added or {}) do LO.removeGE(p1, path, "标准数值：摘掉自己的临时天赋 " .. path:match("([%w_]+)_C$")) end
         out("标准数值：属性还原成对局前（血上限 %s、攻击 %s），摘掉临时天赋 %d 个", tostring(s.Health_Max), tostring(s.Attack), #(STD.added or {}))
     end

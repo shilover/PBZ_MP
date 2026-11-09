@@ -283,6 +283,22 @@ local function setAttr(actor, name, v)
     return ok1 and ok2
 end
 
+-- 【适配】只写属性的 BaseValue（当前值不动，游戏下次重算时 = 基础值 × 身上效果）
+-- 【适配】只写属性的 CurrentValue（基础值不动）
+local function setAttrCur(actor, name, v)
+    local set = attrSetOf(actor)
+    local a = set and rawProp(set, name)
+    if a == nil then return false end
+    return (pcall(function() a.CurrentValue = v end))
+end
+-- 【适配】只写属性的 BaseValue（当前值不动）
+local function setAttrBase(actor, name, v)
+    local set = attrSetOf(actor)
+    local a = set and rawProp(set, name)
+    if a == nil then return false end
+    return (pcall(function() a.BaseValue = v end))
+end
+
 -- 【适配】角色的 AbilitySystemComponent 属性，没有就 FindAllOf("AbilitySystemComponent") 按 GetOwner 找
 local function ascOf(actor)
     if not valid(actor) then return nil end
@@ -1033,10 +1049,10 @@ end
 
 -- 替身没有某个技能：按 pbz_abilities.lua 的路径加载并 K2_GiveAbility（Phantom Pact game.playMove 的兜底）。每个"替身×技能"只试一次
 -- 【适配】按 pbz_abilities 的路径 StaticFindObject / LoadAsset 技能类，ASC:K2_GiveAbility(cls, 1, -1)（v0.17.0，§30）
-function LO.give(pup, name, map)
+function LO.give(pup, name, map, again)       -- again = 这次不管"只试一次"（§170 玩家自己的饰品技能每场要再给）
     local key = pathOf(pup) .. "|" .. name
     LO.gaveTried = LO.gaveTried or {}
-    if LO.gaveTried[key] then return nil end
+    if LO.gaveTried[key] and not again then return nil end
     LO.gaveTried[key] = true
     LO.index()
     local cls = map[name]
@@ -3577,7 +3593,7 @@ return {
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
     puppet = puppet, gstat = gstat, now = now, attrSetOf = attrSetOf, attrOf = attrOf, hpOf = hpOf,
     rootMotionScale = rootMotionScale,
-    setAttr = setAttr, ascOf = ascOf, factionComp = factionComp, factionActors = factionActors, factionValue = factionValue, factionName = factionName, anyToStr = anyToStr,
+    setAttr = setAttr, setAttrBase = setAttrBase, setAttrCur = setAttrCur, ascOf = ascOf, factionComp = factionComp, factionActors = factionActors, factionValue = factionValue, factionName = factionName, anyToStr = anyToStr,
     montageOf = montageOf, montageByName = montageByName, playOn = playOn, tagNames = tagNames, tagsOf = tagsOf, activeAbilities = activeAbilities, cancelMoves = cancelMoves, cancelAbilities = cancelAbilities,
     yawTo = yawTo, setYaw = setYaw, facePlayer = facePlayer, placeInFront = placeInFront, setBraking = setBraking, equipWeapon = equipWeapon,
     mapName = mapName, retract = retract, cutMontage = cutMontage, lockingTarget = lockingTarget, setLockTarget = setLockTarget, yawOf = yawOf, stateComp = stateComp, abilitiesOf = abilitiesOf, tagReport = tagReport, geLockHealthClass = geLockHealthClass,
