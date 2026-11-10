@@ -26,7 +26,28 @@
 
 ### 安装和使用
 发布包里的 `安装说明.txt` 有完整说明（安装、按键、联机、反馈问题）。简单说：
-1. 把 `PBZ_MP` 文件夹放到 `<游戏目录>\platform\steam\ue4ss\Mods\`
+1. 把 `PBZ_MP` 文件夹放到 `<游戏目录>\platform\steam\ue4ss\Mods\`，装好后应该是这样：
+   ```text
+   <游戏目录>\platform\steam\
+   ├─ PBZ.exe
+   ├─ dwmapi.dll              ← UE4SS 带的
+   └─ ue4ss\
+      └─ Mods\
+         └─ PBZ_MP\
+            ├─ Scripts\
+            │  ├─ main.lua
+            │  ├─ pbz_game.lua
+            │  ├─ pbz_abilities.lua
+            │  ├─ pbz_places.lua
+            │  ├─ pbz_balance.lua
+            │  ├─ pbz_spec.lua
+            │  └─ pbz_stdgear.lua
+            ├─ enabled.txt
+            ├─ pbz_lobby.dll
+            ├─ net\               （空文件夹）
+            └─ rec\               （空文件夹）
+   ```
+   注意是 `Mods\PBZ_MP\Scripts\main.lua`，不要解压成 `Mods\PBZ_MP\PBZ_MP\...` 多套一层。
 2. 进游戏按 **Home** 打开联机面板，选连接方式，一边建房、一边加入
 3. 双方按 **F1** 准备，先赢 2 回合获胜
 
@@ -100,11 +121,28 @@ Each PC shows the real you plus a puppet of your opponent. When the opponent att
 To find `<game folder>`: in your Steam library, right-click Phantom Blade Zero → Manage → Browse local files.
 
 ### Install
-1. Put the `PBZ_MP` folder into `<game folder>\platform\steam\ue4ss\Mods\`. You should have:
-   - `Mods\PBZ_MP\Scripts\` (four `.lua` files)
-   - `Mods\PBZ_MP\enabled.txt`
-   - `Mods\PBZ_MP\pbz_lobby.dll` (the online helper, loaded inside the game)
-   - empty folders `Mods\PBZ_MP\net\` and `Mods\PBZ_MP\rec\`
+1. Put the `PBZ_MP` folder into `<game folder>\platform\steam\ue4ss\Mods\`. When you're done, it should look like this:
+   ```text
+   <game folder>\platform\steam\
+   ├─ PBZ.exe
+   ├─ dwmapi.dll              <- from UE4SS
+   └─ ue4ss\
+      └─ Mods\
+         └─ PBZ_MP\
+            ├─ Scripts\
+            │  ├─ main.lua
+            │  ├─ pbz_game.lua
+            │  ├─ pbz_abilities.lua
+            │  ├─ pbz_places.lua
+            │  ├─ pbz_balance.lua
+            │  ├─ pbz_spec.lua
+            │  └─ pbz_stdgear.lua
+            ├─ enabled.txt
+            ├─ pbz_lobby.dll      (the online helper, loaded inside the game)
+            ├─ net\               (empty folder)
+            └─ rec\               (empty folder)
+   ```
+   Make sure it's `Mods\PBZ_MP\Scripts\main.lua`, not `Mods\PBZ_MP\PBZ_MP\...` (an extra folder from unzipping is the most common mistake).
 2. UE4SS loads the mod because of `enabled.txt`. To be safe you can also add the line `PBZ_MP : 1` to `Mods\mods.txt`.
 3. Updating: just overwrite. `net\` and `rec\` hold your settings and recordings; keep them.
 
