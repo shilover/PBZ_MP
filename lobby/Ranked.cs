@@ -147,6 +147,10 @@ namespace PbzLobby
     {
         const double HelloEvery = 20, HelloFast = 3, AfterMatchFast = 240;   // 秒：平时 / 还没拿到分数时 / 打完后几分钟内（等结算）
         const double RetryEvery = 3, GiveUpAfter = 600, AliveEvery = 2, LostAfter = 6;
+        // §179.2 结果先发 RRES2（带比分）；旧服务端不认、不回 RACK，发了这么久还没 RACK 就退回旧的 RRES。
+        // 正常网络下 RACK 几十毫秒就回（重发间隔 3 秒，15 秒 = 5 次都没回才退），不会两种都发；万一 RRES2 其实收下了、只是 RACK 丢了，
+        // 服务端同一局同一个人只认第一份，补发的 RRES 不会再记一次（tests/test_ranked_server.mjs ⑬）
+        const double Res2Fallback = 15;
 
         readonly string keyPath;
         string key;
@@ -169,6 +173,9 @@ namespace PbzLobby
 
         // 给游戏内面板看的（WriteLobby 写进 lobby.txt）
         public string Me = "", Rules = "", Error = "", Note = "", TopHead = "";
+        public string Voids = "";       // §179.2 本赛季作废次数（RME 第 10 段；旧服务端没有 = 空）
+        public string MinVer = "";      // §188 服务器要求的最低版本（RVER / RERR|old|<版本>；没配 = 空）
+        public bool Old;                // §188 本机版本低于最低版本：服务器不发规则，打不了武林盟主
         // 上一局的结算：<序号>|<胜 1 / 负 0 / 作废 ->|<分数变化>|<现在的分数>|<名次>|<ok / cap / void>；序号每次 +1，游戏看到变了就在屏幕上提示
         public string Result = "";
         int resultSeq;
@@ -178,15 +185,16 @@ namespace PbzLobby
         public List<string[]> StatRows = new List<string[]>();
         public Action<string> Log = delegate { };
         int rating = -1, ratingBefore = -1;
+        readonly HashSet<string> seenVerdicts = new HashSet<string>();     // §202 RVERDICT 去重（服务器当场推一次、下次 RHELLO 再补发一次）
         string nick = "";
 
         readonly Dictionary<string, string[]> who = new Dictionary<string, string[]>();     // pid → {昵称, 分数, 名次, 称号}
         readonly Dictionary<string, DateTime> whoAsked = new Dictionary<string, DateTime>();
 
-        class Match { public string Sid, Mid, Opp; public Session Ses; public bool Ended; public DateTime LostSince = DateTime.MinValue; }
+        class Match { public string Sid, Mid, Opp; public Session Ses; public bool Ended; public DateTime LostSince = DateTime.MinValue; public int Me, Op; public bool FpSent; }     // FpSent：§210 规则指纹报过了；Me / Op：我看到的比分（§179.2 掉线时报给服务器）
         public readonly MatchStats Stats = new MatchStats();     // §110.11 Session（本机包）/ ServerLink（对方包）往里记
         Match cur;
-        class Pending { public string Kind, Sid, Mid; public string[] Fields; public DateTime Next, Until; }
+        class Pending { public string Kind, Sid, Mid; public string[] Fields; public DateTime Next, Until, Since; }
         readonly List<Pending> pend = new List<Pending>();
 
         public RankClient(string dir)
@@ -325,16 +333,23 @@ namespace PbzLobby
             if (active && (now - lastHello).TotalSeconds > every)
             {
                 lastHello = askedAt = now;
-                Raw(Signed("RHELLO", Pid, Ts(), nick));
+                Raw(Signed("RHELLO", Pid, Ts(), nick) + "|" + Proto.App);      // §188 版本放在签名后面（不签），旧服务端照样认
             }
             if (active && askedAt > lastFromServer && (now - askedAt).TotalSeconds > 6)
                 Error = NoAnswer();
             Track(s, now);
             foreach (var p in pend.ToArray())
             {
+                if (now > p.Until && p.Kind == "fp") { pend.Remove(p); continue; }     // §210 旧服务端不认 RFP：不吵
                 if (now > p.Until) { pend.Remove(p); Log(L.T("排位上报一直没收到回音，放弃：", "Ranked report never acknowledged, gave up: ") + p.Kind + " " + p.Mid); continue; }
                 if (now < p.Next) continue;
                 p.Next = now.AddSeconds(RetryEvery);
+                if (p.Fields[0] == "RRES2" && (now - p.Since).TotalSeconds > Res2Fallback)
+                {
+                    Array.Resize(ref p.Fields, 8);      // 去掉比分
+                    p.Fields[0] = "RRES";
+                    Log(L.T("排位服务器没回 RRES2（旧版？），改用 RRES 上报", "Ranked server didn't ack RRES2 (old version?), falling back to RRES"));
+                }
                 var f = (string[])p.Fields.Clone();
                 f[2] = Ts();       // 每次重发换时间戳（服务器按签名去重，同一局的结果只认第一次）
                 Raw(Signed(f));
@@ -372,14 +387,27 @@ namespace PbzLobby
                             rating = r;
                         }
                         Me = f[3] + "|" + f[4] + "|" + f[5] + "|" + f[6] + "|" + f[7] + "|" + f[8];
+                        Voids = f.Length > 9 ? f[9] : "";
                         if (Error.Length > 0 && !Error.StartsWith(L.T("存不了", "Can't save"))) Error = "";
                         break;
                     case "RRULES":
                         if (f.Length > 2) Rules = f[2];
+                        Old = false;
+                        break;
+                    case "RVER":      // §188 RVER|<最低版本>：跟着 RME / RRULES 发
+                        MinVer = f.Length > 2 ? f[2] : "";
                         break;
                     case "RERR":
                         var why = f.Length > 2 ? f[2] : "";
                         if (why == "unknown") { Raw("PBZS|RREG|" + Pid + "|" + sec + "|" + nick); break; }
+                        if (why == "old")     // §188 RERR|old|<最低版本>：清掉规则，主机开不了局
+                        {
+                            Old = true;
+                            if (f.Length > 3) MinVer = f[3];
+                            Rules = ""; Me = "";
+                            Error = string.Format(L.T("为保护平衡性，请最少使用 v{0} 版本（你现在是 v{1}）", "For balance, ranked needs v{0} or newer (you have v{1})"), MinVer, Proto.App);
+                            break;
+                        }
                         Error = why == "taken" ? L.T("排位账号冲突（密钥对不上），换一个密钥", "Ranked account conflict: use another key")
                               : why == "stale" ? L.T("电脑时间和服务器差太多，校准一下系统时间", "Your clock is off: sync the system time")
                               : why == "badsig" ? L.T("排位签名不对（密钥坏了？）", "Bad ranked signature (broken key?)")
@@ -397,6 +425,24 @@ namespace PbzLobby
                         rating = nr;
                         SetResult(f[4], dr, nr, f[7], f[8]);
                         lastHello = DateTime.MinValue;     // 马上再问一次我的信息（名次 / 胜负场跟着更新）
+                        break;
+                    case "RVERDICT":  // §202 RVERDICT|判定号|sid|mid|v 作废 / u 撤销|t 被判的人 / r 举报人|分数变化|现在的分数|名次
+                        {
+                            if (f.Length < 11 || !seenVerdicts.Add(f[2] + "|" + f[5])) break;
+                            int vd, vr;
+                            if (!int.TryParse(f[8], out vd) || !int.TryParse(f[9], out vr)) break;
+                            rating = vr;
+                            var vds = (vd > 0 ? "+" : "") + vd;
+                            bool undo = f[5] == "u", target = f[6] == "t";
+                            Note = undo ? L.T("对局 #" + f[4] + " 的作弊判定已撤销" + (vd != 0 ? "，分数恢复 " + vds : "") + "，现在 " + vr,
+                                              "Cheat verdict on match #" + f[4] + " was withdrawn" + (vd != 0 ? ", rating restored " + vds : "") + ", now " + vr)
+                                 : target ? L.T("对局 #" + f[4] + " 经举报核实判定使用修改器，已作废" + (vd != 0 ? "，分数 " + vds : "") + "，现在 " + vr,
+                                                "Match #" + f[4] + ": reports confirmed cheating, match voided" + (vd != 0 ? ", rating " + vds : "") + ", now " + vr)
+                                 : L.T("对局 #" + f[4] + " 经核实对方使用修改器，已作废" + (vd != 0 ? "，分数退回 " + vds : "（本场分数不变）") + "，现在 " + vr,
+                                       "Match #" + f[4] + ": opponent confirmed cheating, match voided" + (vd != 0 ? ", rating refunded " + vds : " (rating unchanged)") + ", now " + vr);
+                            Log(Note);
+                            lastHello = DateTime.MinValue;     // 马上再问一次我的信息（名次 / 胜负场跟着更新）
+                        }
                         break;
                     case "RSTATSR":   // §110.11 RSTATSR|种类|赛季|页|总页数|人次 \n 一行一个（\t 分隔）
                         if (f.Length < 7) break;
@@ -430,7 +476,11 @@ namespace PbzLobby
             ratingBefore = -1;
             var ds = (d > 0 ? "+" : "") + d;
             Note = code == "void" ? L.T("上一局两边报的结果对不上，作废", "Last match: reports disagreed, not rated")
+                 : code == "rules" ? L.T("上一局双方实际用的规则不一致，不计分（不是封号），现在 " + r, "Last match: the two players ran different rules - not rated (not a ban), now " + r)   // §210
+                 : code == "oldmod" ? L.T("上一局有一方的模组版本太旧、没报规则，不计分（不是封号），请双方更新到最新版，现在 " + r, "Last match: one player's mod is outdated - not rated (not a ban). Both please update. Now " + r)   // §210 rfp=require
                  : code == "cap" ? L.T("上一局不计分（今天和这位对手已经记了 3 场），现在 " + r, "Last match not rated (3 rated matches with this opponent today), now " + r)
+                 : code == "dispute" ? L.T("上一局 " + ds + "，现在 " + r + "（有一方对判定有异议，已记录，积分照常）", "Last match " + ds + ", now " + r + " (a result dispute was logged; rating unaffected)")
+                 : code != "ok" && code != "" && d == 0 ? L.T("上一局不计分（" + code + "），现在 " + r, "Last match not rated (" + code + "), now " + r)   // §179 以后服务端加的 code
                  : L.T("上一局 " + ds + "，现在 " + r, "Last match " + ds + ", now " + r);
             Result = (++resultSeq) + "|" + win + "|" + ds + "|" + r + "|" + rank + "|" + code;
             Log(Note);
@@ -468,14 +518,22 @@ namespace PbzLobby
 
         void Queue(string kind, string sid, string mid, params string[] fields)
         {
-            pend.Add(new Pending { Kind = kind, Sid = sid, Mid = mid, Fields = fields, Next = DateTime.MinValue, Until = DateTime.UtcNow.AddSeconds(GiveUpAfter) });
+            pend.Add(new Pending { Kind = kind, Sid = sid, Mid = mid, Fields = fields, Next = DateTime.MinValue, Until = DateTime.UtcNow.AddSeconds(GiveUpAfter), Since = DateTime.UtcNow });
+        }
+
+        // §179.3 客机复核：模组记的这一局对不上的次数（rkd=<局号>:<次数>）→ why = dsp:<次数>（服务器只记争议、积分照常）；没有 = end
+        static string DisputeWhy(Session s, string mid)
+        {
+            var p = (s.LocalRkd ?? "").Split(':');
+            int n;
+            return p.Length == 2 && p[0] == mid && int.TryParse(p[1], out n) && n > 0 ? "dsp:" + Math.Min(n, 99) : "end";
         }
 
         void Report(bool win, string why)
         {
             cur.Ended = true;
             fastUntil = DateTime.UtcNow.AddSeconds(AfterMatchFast);
-            Queue("res", cur.Sid, cur.Mid, "RRES", Pid, "", cur.Sid, cur.Mid, cur.Opp, win ? "1" : "0", why);
+            Queue("res", cur.Sid, cur.Mid, "RRES2", Pid, "", cur.Sid, cur.Mid, cur.Opp, win ? "1" : "0", why, cur.Me + ":" + cur.Op);
             Stats.Stop();
             Queue("stat", cur.Sid, cur.Mid, "RSTAT", Pid, "", cur.Sid, cur.Mid, Stats.Payload());     // §110.11 只有记了分的局服务器才算
             Log(L.T("排位对局 #" + cur.Mid + " 上报：" + (win ? "胜" : "负") + "（" + why + "）",
@@ -519,10 +577,21 @@ namespace PbzLobby
                 Log(L.T("排位对局 #" + id + " 开始", "Ranked match #" + id + " started"));
             }
             if (cur == null || cur.Ended) return;
+            // §210 规则指纹：模组在第 1 回合倒计时定下规则后写 rfp=<局号>:<指纹>，报给服务器（服务器自己比两边的，对不上不计分）。
+            // 开局那一刻就报，打完再改没用。旧服务端不认 RFP、不回 RACK，重发到 GiveUpAfter 就算了（不写日志）
+            if (!cur.FpSent)
+            {
+                var q = (s.LocalRfp ?? "").Split(':');
+                if (q.Length == 2 && q[0] == cur.Mid && q[1].Length > 0)
+                {
+                    cur.FpSent = true;
+                    Queue("fp", cur.Sid, cur.Mid, "RFP", Pid, "", cur.Sid, cur.Mid, Clean(q[1]));
+                }
+            }
             if ((now - lastAlive).TotalSeconds > AliveEvery)
             {
                 lastAlive = now;
-                Raw("PBZS|RALIVE|" + Pid + "|" + cur.Sid + "|" + cur.Mid);
+                Raw(Signed("RALIVE", Pid, cur.Sid, cur.Mid, Ts()));      // §179.2 带签名（旧服务端只看前 4 段，照旧认）
             }
             if (!s.Connected)
             {
@@ -533,8 +602,13 @@ namespace PbzLobby
             cur.LostSince = DateTime.MinValue;
             if (id != cur.Mid && !fighting && state != "idle") return;
             int me, op;
+            if (id == cur.Mid && int.TryParse(p[2], out me) && int.TryParse(p[3], out op))
+            {
+                cur.Me = host ? me : op;      // mt= 是主机视角（主机分:客机分）
+                cur.Op = host ? op : me;
+            }
             if (state == "end" && id == cur.Mid && int.TryParse(p[2], out me) && int.TryParse(p[3], out op))
-                Report(host ? me > op : op > me, "end");
+                Report(host ? me > op : op > me, host ? "end" : DisputeWhy(s, cur.Mid));
             else if (state == "idle" || (id != cur.Mid && state.Length > 0))
             {
                 // 没经过 end 就回到自由活动 = 有人弃权。客机弃权会在自己的状态包里带 quit=<局号>；主机弃权没有这个标记
@@ -552,6 +626,9 @@ namespace PbzLobby
             raw("rkpid", Pid);
             raw("rkrules", Rules);
             raw("rkme", Me);
+            raw("rkvoid", Voids);
+            raw("rkminver", MinVer);         // §188
+            raw("rkold", Old ? "1" : "0");
             raw("rkerr", Error);
             raw("rknote", Note);
             raw("rkres", Result);

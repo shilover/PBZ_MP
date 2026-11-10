@@ -440,6 +440,8 @@ namespace PbzLobby
                 var to = from;
                 var s = wire.Verify(data, 0, data.Length, b => { try { Udp.Send(b, b.Length, to); } catch (Exception) { } });
                 if (s == null) continue;
+                // §174 主机：黑名单里只有 IP 的那几条（对方当时没报 uid）按地址拒
+                if (lockFirst && Blacklist.DeniesIp(from.Address)) { wire.Deny(b => { try { Udp.Send(b, b.Length, to); } catch (Exception) { } }); continue; }
                 // §141.8 第二位选手的包：状态包交给 Session 转发；握手 / 可靠事件不进主机的可靠通道（它只认第一位）
                 var p2 = Peer2;
                 if (lockFirst && p2 != null && from.Equals(p2))
@@ -559,6 +561,8 @@ namespace PbzLobby
         // §110 武林盟主：自己的排位 pid（发包时加 rk=，对方据此上报"和谁打的"）；null = 不是排位房间。
         // LocalMt / LocalQuit = 本机游戏状态包里的 mt= / quit=（主机看自己的 mt= 判开局 / 打完，客机看自己的 quit= 判弃权）
         public volatile string RankPid, LocalMt, LocalQuit;
+        public volatile string LocalRfp;       // §210 规则指纹：本机状态包的 rfp=<局号>:<指纹>（"-" = 没有），排位时报给服务器
+        public volatile string LocalRkd;       // §179.3 武林盟主客机复核：本机状态包的 rkd=<局号>:<对不上的次数>（"-" = 没有）
         public MatchStats Stats;     // §110.11 排位房间：本机每个状态包的武器 / 影之武装 / 放招记进去
         public Action<string> Log = delegate { };
         readonly HashSet<string> backedUp = new HashSet<string>();
@@ -600,6 +604,7 @@ namespace PbzLobby
             Rel = new RelChannel(dir, SendText);
             Wire.Rel = Rel;
             T.Wire = Wire;
+            if (role == "host") Wire.Gate = Blacklist.DeniesBody;     // §174
             diag = mode != "ai" && !Modes.IsSteam(mode);
             var lk = T as Link;
             if (lk != null) lk.Diag = diag;
@@ -946,14 +951,14 @@ namespace PbzLobby
                 {
                     lastHello = now;
                     SendText("PBZHELLO\npv=" + Proto.Version + "\nav=" + Proto.App + "\nnm=" + Name.Replace("\r", " ").Replace("\n", " ") + "\nspec=1\n"
-                             + (SpecCfg.NoQueue ? "noq=1\n" : "") + (SpecCfg.Up ? "up=1\n" : ""));
+                             + (SpecCfg.NoQueue ? "noq=1\n" : "") + (SpecCfg.Up ? "up=1\n" : "") + Ident.Lines());
                 }
                 // 客机没连上之前每 0.5 秒发一次握手：主机就算游戏还没读档，也能先知道往哪回
                 if (Role == "client" && !Connected && (now - lastHello).TotalSeconds > 0.5)
                 {
                     lastHello = now;
                     // §85.5 带上昵称：AI 对战时等人的房间可能只靠握手就转正（还没收到状态包里的 nm=）
-                    SendText("PBZHELLO\npv=" + Proto.Version + "\nav=" + Proto.App + "\nnm=" + Name.Replace("\r", " ").Replace("\n", " ") + "\n");
+                    SendText("PBZHELLO\npv=" + Proto.Version + "\nav=" + Proto.App + "\nnm=" + Name.Replace("\r", " ").Replace("\n", " ") + "\n" + Ident.Lines());     // §174 uid= / sh=
                 }
                 int got = T.Pump();
                 if (got > 0)
@@ -961,13 +966,15 @@ namespace PbzLobby
                     lastRx = now;
                     RxSeen += got;
                 }
+                var kl = T as ServerLink;          // §174.9 刚按拉黑放掉了对手：马上算断开（收包线程里做，不和上面抢 lastRx）
+                if (kl != null && kl.Kicked) { kl.Kicked = false; lastRx = DateTime.MinValue; }
                 QueueTick(now);
                 Rel.Tick(now);
                 lock (sendLock) sim.Flush(T.Send);
                 if (bsock != null && (now - lastBcast).TotalSeconds > 1.0)
                 {
                     lastBcast = now;
-                    var msg = "PBZROOM|" + Name.Replace("|", " ") + "|" + T.LocalPort + "|" + LocalMap + "|" + (Connected ? "1" : "0") + (SpecCfg.Max > 0 ? "|1" : "|0") + (AiWaiting ? "|1" : "|0");
+                    var msg = "PBZROOM|" + Name.Replace("|", " ") + "|" + T.LocalPort + "|" + LocalMap + "|" + (Connected ? "1" : "0") + (SpecCfg.Max > 0 ? "|1" : "|0") + (AiWaiting ? "|1" : "|0") + "|" + Ident.MyRoomHash;
                     var b = Kv.Utf8.GetBytes(msg);
                     // Windows 发 255.255.255.255 只走一张网卡（实测走了 VMware 虚拟网卡，WLAN 上的朋友收不到），
                     // 所以再往每张网卡自己的子网广播地址各发一份
@@ -1071,6 +1078,8 @@ namespace PbzLobby
                         if (loc.TryGetValue("map", out m)) LocalMap = m;
                         if (loc.TryGetValue("mt", out m)) LocalMt = m;
                         if (loc.TryGetValue("quit", out m)) LocalQuit = m;
+                        if (loc.TryGetValue("rkd", out m)) LocalRkd = m;
+                        if (loc.TryGetValue("rfp", out m)) LocalRfp = m;
                         var st = Stats;
                         if (st != null)
                         {
@@ -1084,7 +1093,8 @@ namespace PbzLobby
                         {
                             var line = raw.TrimEnd('\r');
                             if (line.Length == 0 || line.StartsWith("st=") || line.StartsWith("nm=")
-                                || line.StartsWith("pv=") || line.StartsWith("av=") || line.StartsWith("rk=")) continue;
+                                || line.StartsWith("pv=") || line.StartsWith("av=") || line.StartsWith("rk=")
+                                || line.StartsWith("uid=") || line.StartsWith("sh=")) continue;
                             sb.Append(line).Append('\n');
                         }
                         // v0.22.0：协议版本 / 程序版本，对方据此提示"版本不一致"（旧版没有 pv=）
@@ -1094,6 +1104,7 @@ namespace PbzLobby
                         sb.Append("nm=").Append(Name.Replace("\r", " ").Replace("\n", " ")).Append('\n');
                         var rk = RankPid;
                         if (rk != null) sb.Append("rk=").Append(rk).Append('\n');
+                        sb.Append(Ident.Lines());     // §174 拉黑用的标识
                         var body = sb.ToString();
                         lock (hostRules)
                             foreach (var k in RuleKeys) { string rv; if (loc.TryGetValue(k, out rv)) hostRules[k] = rv; }
@@ -1220,7 +1231,7 @@ namespace PbzLobby
     // 监听 27016 上的房间广播
     class Discovery
     {
-        class Room { public string Name, Map; public bool Full, Watch, Ai; public DateTime Seen; }
+        class Room { public string Name, Map, Bh; public bool Full, Watch, Ai; public DateTime Seen; }
         readonly Dictionary<string, Room> rooms = new Dictionary<string, Room>();
         readonly UdpClient sock;
         public readonly bool Ok;
@@ -1253,17 +1264,17 @@ namespace PbzLobby
                 var p = Kv.Utf8.GetString(data).Split('|');
                 int port;
                 if (p.Length >= 5 && p[0] == "PBZROOM" && int.TryParse(p[2], out port))
-                    lock (rooms) rooms[from.Address + ":" + port] = new Room { Name = p[1], Map = p[3], Full = p[4] == "1", Watch = p.Length >= 6 && p[5] == "1", Ai = p.Length >= 7 && p[6] == "1", Seen = DateTime.UtcNow };
+                    lock (rooms) rooms[from.Address + ":" + port] = new Room { Name = p[1], Map = p[3], Full = p[4] == "1", Watch = p.Length >= 6 && p[5] == "1", Ai = p.Length >= 7 && p[6] == "1", Bh = p.Length >= 8 ? p[7] : "", Seen = DateTime.UtcNow };
             }
         }
 
-        public List<string[]> Current()   // {地址:端口, 名字, 地图, 已满, 能观战}
+        public List<string[]> Current()   // {地址:端口, 名字, 地图, 已满, 能观战, 和 AI 对打, 主机标记（§174）}
         {
             var list = new List<string[]>();
             lock (rooms)
                 foreach (var kv in rooms)
                     if ((DateTime.UtcNow - kv.Value.Seen).TotalSeconds < 3.5)
-                        list.Add(new[] { kv.Key, kv.Value.Name, kv.Value.Map, kv.Value.Full ? "1" : "0", kv.Value.Watch ? "1" : "0", kv.Value.Ai ? "1" : "0" });
+                        list.Add(new[] { kv.Key, kv.Value.Name, kv.Value.Map, kv.Value.Full ? "1" : "0", kv.Value.Watch ? "1" : "0", kv.Value.Ai ? "1" : "0", kv.Value.Bh ?? "" });
             list.Sort((a, b) => string.CompareOrdinal(a[0], b[0]));
             return list;
         }
@@ -2152,6 +2163,42 @@ namespace PbzLobby
                         else Warn(Steam.Error);
                     }
                     break;
+                case "block":      // §174 拉黑最近第 who 个对手（1 = 当前 / 最近）
+                    {
+                        var o = OppAt(d);
+                        if (o == null) { lastLog = L.T("没有可拉黑的对手（还没收到对方的包）", "No opponent to block yet"); break; }
+                        if (!Blacklist.Add(o)) { lastLog = L.T("对方没有可用的标识，拉黑不了", "Nothing identifies this opponent; cannot block"); break; }
+                        lastLog = DateTime.Now.ToString("HH:mm:ss ") + L.T("已拉黑：", "Blocked: ") + (o.Nick.Length > 0 ? o.Nick : o.Uid);
+                        NetLog.W("拉黑：" + (o.Uid.Length > 0 ? "uid " : "") + (o.Sid.Length > 0 ? "SteamID " : "") + (o.Sh.Length > 0 ? "sh " : "") + (o.Ip.Length > 0 && o.Uid.Length == 0 ? "仅 IP" : ""));
+                        // 拉黑的是自己正连着的主机：断开（自己是主机时收包那一层会把他拒掉，不用断）
+                        var cs = session;
+                        if (cs != null && cs.Role != "host" && recentOpp.Count > 0 && recentOpp[0] == o) StopSession();
+                        // §174.9 自己是服务器大厅的主机、拉黑的是正连着的对手：马上放掉这条连接（房间立刻报空，被拉黑的人再加入时直接被拒）
+                        if (cs != null && cs.Role == "host" && recentOpp.Count > 0 && recentOpp[0] == o)
+                        {
+                            var sl = cs.T as ServerLink;
+                            if (sl != null) sl.KickReq = true;
+                        }
+                    }
+                    break;
+                case "unblock":    // §174 解除黑名单第 i 个（1 起）
+                    {
+                        int bi;
+                        if (d.TryGetValue("i", out v) && int.TryParse(v, out bi) && Blacklist.Remove(bi - 1)) lastLog = L.T("已从黑名单移除", "Removed from the blacklist");
+                    }
+                    break;
+                case "report":     // §174 举报最近第 who 个对手：why=原因（逗号分开），note=附言；§181 ev=作弊数据采样的摘要（一行 JSON，可没有）
+                    {
+                        var o = OppAt(d);
+                        if (o == null) { Reporter.Status = L.T("没有可举报的对手", "No opponent to report"); break; }
+                        string why, note, ev;
+                        d.TryGetValue("why", out why);
+                        d.TryGetValue("note", out note);
+                        d.TryGetValue("ev", out ev);
+                        var rp = rank != null ? rank.Pid : null;
+                        Reporter.Send(LobbyServer.Resolve(cfg.Server), o, why ?? "", note ?? "", cfg.Name, rp ?? "", ev ?? "");
+                    }
+                    break;
                 case "refresh":   // §91 游戏内面板打开房间列表页：马上重新问一次房间
                     if (Modes.IsServer(Mode)) lobbyList.Refresh();
                     else if (Mode == "steamlobby") SteamLobby.Refresh();
@@ -2177,6 +2224,7 @@ namespace PbzLobby
                 foreach (var f in Steam.FriendsInGame())
                 {
                     // §123 没开房的好友单独标 nohost：面板不算"可加入"、排在后面，点了直接提示（以前也标 friend，连过去注定超时）
+                    if (Blacklist.DeniesSteam(Addr.SteamId(f[0]))) continue;     // §174 拉黑的人
                     add(f[2] == "1" ? "friend" : "nohost", f[1] + (f[2] == "1" ? L.T("（在开房）", " (hosting)") : L.T("（在玩，没开房）", " (playing, not hosting)")), "steam:" + f[0]);
                     // §141 开房的好友再列一行"观战"（好友状态里看不出满没满：满了就看，没满也能先看着排队）
                     if (f[2] == "1") add("watchf", f[1], "steam:" + f[0]);
@@ -2191,6 +2239,7 @@ namespace PbzLobby
                     // §110 第 6 列 = 排位房间（旧服务器没有这列 = 不是）：服务器大厅只列普通房间，武林盟主只列排位房间；第 7 列 = 称号
                     bool rk = r.Length > 5 && r[5] == "1";
                     if (rk != (Mode == "ranked")) continue;
+                    if (r.Length > 9 && Blacklist.HidesRoom(r[9])) continue;     // §174 第 10 列 = 主机标记：拉黑的人开的房不列
                     var title = rk && r.Length > 6 && r[6].Trim().Length > 0 ? "【" + r[6].Trim() + "】" : "";
                     // 第 5 列 = 所在服务器（空 = 就是我们连的这台；否则是互通过来的别的服务器，§50）
                     var home = r.Length > 4 ? r[4].Trim() : "";
@@ -2209,6 +2258,7 @@ namespace PbzLobby
                 foreach (var r in SteamLobby.Poll())
                 {
                     if (r[0] == SteamLobby.Mine.ToString() || r[4] == Steam.MyId.ToString()) continue;   // 不列自己的大厅
+                    if (Blacklist.DeniesSteam(Addr.SteamId(r[4]))) continue;     // §174 拉黑的人开的大厅
                     // §141 满了、主机认观战（大厅数据 spec=1）的大厅标 watch
                     bool watch = r[3] == "1" && r.Length > 5 && r[5] == "1";
                     add(r[3] != "1" ? "lobby" : watch ? "watch" : "full", r[1] + L.T("  地图 ", "  map ") + r[2] + (r[3] == "1" ? L.T("  已满", "  full") : ""), (watch ? "watch:" : "lobby:") + r[0]);
@@ -2224,6 +2274,8 @@ namespace PbzLobby
                     if (s != null && s.Role == "host" && r[0].EndsWith(":" + s.T.LocalPort) && myIps.Contains(r[0].Substring(0, r[0].LastIndexOf(':'))))
                         continue;
                     var addr = r[0].EndsWith(":" + Session.GamePort) ? r[0].Substring(0, r[0].LastIndexOf(':')) : r[0];
+                    IPAddress rip;     // §174 拉黑的人开的房（主机标记，或只有 IP 的那几条）
+                    if (Blacklist.HidesRoom(r[6]) || (IPAddress.TryParse(r[0].Substring(0, r[0].LastIndexOf(':')), out rip) && Blacklist.DeniesIp(rip))) continue;
                     // §141 满了、主机又认观战的房间标 watch（面板上能点"观战"），旧版主机的满房照旧 full（灰）
                     add(r[3] != "1" ? "room" : r[4] == "1" ? "watch" : "full",
                         r[1] + "  " + addr + L.T("  地图 ", "  map ") + r[2] + (r[3] == "1" ? L.T("  已满", "  full") : ""), addr);
@@ -2387,11 +2439,56 @@ namespace PbzLobby
             }
         }
 
+        // §174 当前 / 最近的对手（最多 5 个，新的在前），面板拉黑 / 举报用。AI 不算；观战时记的是主机
+        readonly List<Opp> recentOpp = new List<Opp>();
+        Opp OppAt(Dictionary<string, string> d)
+        {
+            string v;
+            int i;
+            if (!d.TryGetValue("who", out v) || !int.TryParse(v, out i)) i = 1;
+            return i >= 1 && i <= recentOpp.Count ? recentOpp[i - 1] : null;
+        }
+
+        void NoteOpp(Session s)
+        {
+            if (s == null || s.Mode == "ai" || !s.PeerSeen) return;
+            var t = s.T;
+            var o = new Opp { Uid = s.Wire.PeerUid ?? "", Sh = s.Wire.PeerSh ?? "", Mode = s.Mode, Ver = s.Wire.PeerApp ?? "", Mt = s.LocalMt ?? "" };
+            o.Nick = !string.IsNullOrEmpty(t.PeerNick) ? t.PeerNick : !string.IsNullOrEmpty(s.Wire.HelloNick) ? s.Wire.HelloNick : t.PeerName ?? "";
+            var lk = t as Link;
+            if (lk != null && lk.Peer != null) o.Ip = lk.Peer.Address.ToString();
+            var svl = t as ServerLink;
+            if (svl != null && svl.PeerIp != null) o.Ip = svl.PeerIp.ToString();     // 经服务器中转时没有（看到的是服务器的 IP）
+            var rl = t as IRoomLink;
+            if (rl != null) { o.Room = rl.RoomId ?? ""; o.Rk = rl.PeerRk ?? ""; }
+            if (!o.HasId) return;
+            var now = DateTime.UtcNow;
+            var old = recentOpp.Find(x => x.Same(o));
+            if (old == null) { o.First = now; old = o; }
+            else
+            {
+                recentOpp.Remove(old);
+                old.Merge(o);
+            }
+            old.Last = now;
+            recentOpp.Insert(0, old);
+            if (recentOpp.Count > 5) recentOpp.RemoveAt(5);
+        }
+
         void Tick()
         {
             var s = session;
             QueueSwitch();
             s = session;
+            NoteOpp(s);
+            // §174 主机说我们在它的黑名单里：断开，别一直重连
+            if (s != null && s.Role != "host" && s.Wire.Denied)
+            {
+                NetLog.W("被房主拒绝（在对方的黑名单里），断开");
+                StopSession();
+                Warn(L.T("被房主拒绝（你在对方的黑名单里）", "Refused by the host (you are on their blacklist)"));
+                return;
+            }
             var fLocal = Path.Combine(dir, "state_local.txt");
             var gp = GamePipe.For(dir);      // §83 走管道时 state_local.txt 不再更新
             bool gameOn = (gp != null && gp.Connected) || File.Exists(fLocal) && (DateTime.Now - File.GetLastWriteTime(fLocal)).TotalSeconds < 3;
@@ -2592,6 +2689,20 @@ namespace PbzLobby
             kv("win", "1");
 #endif
             Rank.WriteLobby(sb, Mode == "ranked");     // §110 rk / rkme / rkrules / rktop / rkt1..
+            // §174 最近的对手 opN = <已拉黑 0/1>|<连接方式>|<几秒前>|<昵称>；黑名单 blN = <连接方式>|<拉黑时间 unix>|<昵称或标识>；rpt = 举报结果
+            kv("opn", recentOpp.Count.ToString());
+            for (int i = 0; i < recentOpp.Count; i++)
+            {
+                var o = recentOpp[i];
+                sb.Append("op").Append(i + 1).Append('=').Append(Blacklist.Has(o) ? "1" : "0").Append('|').Append(o.Mode).Append('|')
+                  .Append((long)(DateTime.UtcNow - o.Last).TotalSeconds).Append('|').Append(Clean(o.Nick.Length > 0 ? o.Nick : o.Uid)).Append('\n');
+            }
+            var bl = Blacklist.Snapshot();
+            kv("bln", bl.Count.ToString());
+            for (int i = 0; i < bl.Count && i < 40; i++)
+                sb.Append("bl").Append(i + 1).Append('=').Append(Clean(bl[i].Mode)).Append('|').Append(bl[i].At).Append('|')
+                  .Append(Clean(bl[i].Nick.Length > 0 ? bl[i].Nick : bl[i].Uid.Length > 0 ? bl[i].Uid : bl[i].Sid.Length > 0 ? bl[i].Sid : bl[i].Ip)).Append('\n');
+            kv("rpt", Reporter.Status);
             // v0.19.1：8 → 40（跟大厅服务器一次给的上限一样），游戏内面板的"房间列表"页自己分页
             int n = Math.Min(cands.Count, 40);
             kv("n", n.ToString());
@@ -2753,6 +2864,8 @@ namespace PbzLobby
             Directory.CreateDirectory(dir);
             Steam.LogDir = dir;     // §125 Steam 连接诊断 net\steam_conn.log
             L.Load(dir);
+            Ident.Load(dir);         // §174 net\uid.txt
+            Blacklist.Load(dir);     // §174 net\blacklist.txt（只在启动时读这一次）
             if (selfTest)    // §125
             {
                 var w2 = new StreamWriter(log ?? Path.Combine(dir, "steam_selftest_cli.log"), false, Kv.Utf8) { AutoFlush = true };

@@ -734,8 +734,68 @@ local function liveStep(s, other, tn)
         s.feed = nil
         return
     end
-    if mont ~= "" and cur and d2(cur, target) < 400.0 then s.feed = nil else steer(s, target) end
+    -- §167.9 跟真人一样"严格跟随"：位置由 SP.followFrame 每帧拉过去，这里的 steer 只给跑步动画速度 / 摇杆
+    s.aim = { X = x, Y = y, Z = tonumber(p.z), vx = tonumber(p.vx) or 0, vy = tonumber(p.vy) or 0, at = s.lastAt or tn, air = p.air == "1" }
+    SP.followPrep(s)
+    steer(s, target)
     if mont == "" then turn(s, tonumber(p.yaw) or 0) end
+end
+
+-- §167.9 线上反馈（11-09 视频）：观战里两人隔着十几米各打各的。原因：观战替身只靠 steer 写速度追位置（移动组件按 MaxWalkSpeed
+-- 截断，追不上），出招时动画根运动带着人走、离目标 4 米内也不纠正、15 米外才摆过去 —— 一打快了就越漂越远。
+-- 改成和对战替身的"对手位置严格跟随"（main.lua NPM，§128.1）一样：根运动倍数 0（动作照播、人不被动画带走），
+-- 每帧把替身往"包里位置 + 速度 × 包龄（最多 FOLLOW_AHEAD 秒）"拉，每秒补 FOLLOW_K 倍误差，差 FOLLOW_SNAP 以上直接摆
+SP.FOLLOW_K, SP.FOLLOW_SNAP, SP.FOLLOW_AHEAD, SP.FOLLOW_ZSNAP = 14.0, 600.0, 0.25, 300.0
+
+-- 每个替身第一次跟随时：根运动关掉、跑速 / 加速度上限提上去（同 drivePuppet）
+-- 【适配】G.rootMotionScale（AnimInstance 根运动倍数）、CharacterMovement.MaxWalkSpeed / MaxAcceleration
+function SP.followPrep(s)
+    if s.followReady then return end
+    s.followReady = true
+    local ok, how = G.rootMotionScale(s.pup, 0.0)
+    local cm = rawProp(s.pup, "CharacterMovement")
+    if valid(cm) then
+        pcall(function() cm.MaxWalkSpeed = math.max(tonumber(rawProp(cm, "MaxWalkSpeed")) or 0, 1400.0) end)
+        pcall(function() cm.MaxAcceleration = math.max(tonumber(rawProp(cm, "MaxAcceleration")) or 0, 6000.0) end)
+    end
+    out("观战 %s：严格跟随位置（根运动关 %s：%s）", s.tag, ok and "成功" or "失败", tostring(how))
+end
+
+-- 纯计算（测试用）：这一刻该在的 XY、从 cur 走一步后的 XY、是否直接摆
+-- §167.9.2 总控复测：冲刺（双月 AdvancedDash）时还会落后 5–6 米。只按误差追，匀速时稳态落后 = 速度 ÷ K（80 米/秒 ≈ 5.7 米）。
+-- 加速度前馈：包还新（外推没到头）时先按包里的速度走 dt，再按误差补（离线模拟 80 米/秒冲刺落后 5.7 → 1.2 米）
+function SP.followStep(cur, aim, tn, dt)
+    local age = math.max(tn - aim.at, 0)
+    local a = math.min(age, SP.FOLLOW_AHEAD)
+    local ax, ay = aim.X + aim.vx * a, aim.Y + aim.vy * a
+    local cx, cy = cur.X, cur.Y
+    if age < SP.FOLLOW_AHEAD then cx, cy = cx + aim.vx * math.max(dt, 0), cy + aim.vy * math.max(dt, 0) end
+    local dx, dy = ax - cx, ay - cy
+    local err = math.sqrt((ax - cur.X) ^ 2 + (ay - cur.Y) ^ 2)
+    if err > SP.FOLLOW_SNAP then return ax, ay, true, err end
+    local k = math.min(1.0, SP.FOLLOW_K * math.max(dt, 0))
+    return cx + dx * k, cy + dy * k, false, err
+end
+
+-- 每帧（frame() 里摆镜头之前）。【适配】Actor:K2_GetActorLocation / K2_SetActorLocation
+function SP.followFrame()
+    local tn = now()
+    for _, s in ipairs(SP.side) do
+        local aim = s.aim
+        if s.live and aim and not s.idle and valid(s.pup) and tn - aim.at < 1.0 then
+            local cur = loc(s.pup)
+            if cur then
+                local dt = s.followAt and (tn - s.followAt) or 0.016
+                s.followAt = tn
+                local x, y, snap, err = SP.followStep(cur, aim, tn, dt)
+                local z = cur.Z
+                if not aim.air and aim.Z and math.abs(aim.Z - cur.Z) > SP.FOLLOW_ZSNAP then z, snap = aim.Z + 20.0, true end
+                pcall(function() s.pup:K2_SetActorLocation({ X = x, Y = y, Z = z }, false, {}, snap) end)
+                s.errMax = math.max(s.errMax or 0, err)
+                if snap then s.snaps = (s.snaps or 0) + 1 end
+            end
+        end
+    end
 end
 
 -- 【适配】G.bossBarShow / bossBarOf / bossBarSet / bossBarShachiShow（PBZHUDLayout:RegisterBossHPBar、WB_BossHPBar_C:ForSeq_*）
@@ -829,9 +889,12 @@ local function logic()
     end
     if tn - (SP.statAt or 0) > 10.0 and a.live then
         SP.statAt = tn
-        out("观战（联机）| A 主机 包 %d 招 %d 失败 %d 动作 %d 血 %s/%s | B 对手 包 %d 招 %d 失败 %d 动作 %d 血 %s/%s | 镜头 %s",
-            a.n or 0, a.fired or 0, a.failed or 0, a.acts or 0, tostring(a.hp), tostring(a.hpm),
-            b.n or 0, b.fired or 0, b.failed or 0, b.acts or 0, tostring(b.hp), tostring(b.hpm), CAM_NAMES[SP.cam])
+        out("观战（联机）| A 主机 包 %d 招 %d 失败 %d 动作 %d 血 %s/%s 偏差最大 %.0f 直接摆 %d | B 对手 包 %d 招 %d 失败 %d 动作 %d 血 %s/%s 偏差最大 %.0f 直接摆 %d | 两人相距 %s | 镜头 %s",
+            a.n or 0, a.fired or 0, a.failed or 0, a.acts or 0, tostring(a.hp), tostring(a.hpm), a.errMax or 0, a.snaps or 0,
+            b.n or 0, b.fired or 0, b.failed or 0, b.acts or 0, tostring(b.hp), tostring(b.hpm), b.errMax or 0, b.snaps or 0,
+            (function() local la, lb = loc(a.pup), loc(b.pup); return (la and lb) and string.format("%.0f", d2(la, lb)) or "?" end)(),
+            CAM_NAMES[SP.cam])
+        a.errMax, b.errMax = 0, 0
     elseif tn - (SP.statAt or 0) > 10.0 and a.pkt then
         SP.statAt = tn
         out("观战包 | A 第 %d/%d 帧 招 %d 失败 %d 动作 %d 血 %s/%s 当前 %s | B 第 %d/%d 帧 招 %d 失败 %d 动作 %d 血 %s/%s 当前 %s | 镜头 %s",
@@ -846,6 +909,40 @@ local function logic()
     end
 end
 
+-- §167.8 用户 11-09："观战时显示一个 UI 面板写名字挂替身头上"：每人一个小 UMG 界面，每帧按头顶位置投到屏幕上。
+-- 联机观战写玩家名字（没收到写"主机" / "对手"），录像 / AI 对打写原来的标签。游戏暂停（菜单）时藏
+SP.TAG_UP = 120.0           -- 替身中心往上这么多 = 名字底边（胶囊半高约 90）
+local function headName(s)
+    if s.live then return (s.nick and s.nick ~= "") and s.nick or (s.tag == "A" and "主机" or "对手") end
+    return s.name or s.tag
+end
+function SP.tagFrame()
+    local pc = getP1PC()
+    if not valid(pc) then return end
+    local paused = false
+    pcall(function()
+        SP.gs = SP.gs or StaticFindObject("/Script/Engine.Default__GameplayStatics")
+        paused = SP.gs:IsGamePaused(pc) == true
+    end)
+    local tn = now()
+    for _, s in ipairs(SP.side) do
+        if not (s.nameTag and valid(s.nameTag.w)) and tn >= (s.nameTagTry or 0) then
+            s.nameTagTry = tn + 5.0                     -- 建不起来别每帧重试
+            s.nameTag = G.nameTagNew(pc)
+            if s.nameTag then out("观战头顶名字 %s：界面已建好", s.tag) end
+        end
+        if s.nameTag then
+            G.nameTagSet(s.nameTag, headName(s))
+            local pos = nil
+            if not paused and not s.idle and valid(s.pup) then
+                local l = loc(s.pup)
+                if l then pos = { X = l.X, Y = l.Y, Z = l.Z + SP.TAG_UP } end
+            end
+            G.nameTagPlace(s.nameTag, pc, pos)
+        end
+    end
+end
+
 local function frame()
     for _, s in ipairs(SP.side) do
         local f = s.feed
@@ -854,7 +951,9 @@ local function frame()
             pcall(function() s.pup:AddMovementInput(f.dir, f.scale, true) end)
         end
     end
+    pcall(SP.followFrame)
     pcall(placeCam)
+    pcall(SP.tagFrame)
     local c = os.clock()
     if c - SP.lastLogic >= SP.TICK then
         SP.lastLogic = c
@@ -968,6 +1067,8 @@ function SP.stop(why)
     SP.on = false
     for _, s in ipairs(SP.side) do
         if s.barReg then G.bossBarHide(s.pup) end
+        G.nameTagRemove(s.nameTag)
+        if s.followReady then G.rootMotionScale(s.pup, 1.0) end     -- §167.9 替身留着复用（AI 对打要根运动）
         hideOne(s.pup)
     end
     SP.side = {}
@@ -1096,7 +1197,7 @@ function SP.feed(t, tn)
         end
     end
     for _, x in ipairs(SP.side) do
-        local nm = string.format("%s（%s）", x.tag, x.nick or (x.tag == "A" and "主机" or "对手"))
+        local nm = (x.nick and x.nick ~= "") and x.nick or (x.tag == "A" and "主机" or "对手")      -- 头顶只显示玩家名字，不带 A / B
         local sc = SP.score
         if sc and sc.st ~= "idle" then
             nm = string.format("%s  %d 分", nm, x.tag == "A" and sc.h or sc.c)

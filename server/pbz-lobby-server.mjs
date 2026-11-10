@@ -56,10 +56,29 @@
 //   任何 → PBZS|CFGQ|<我有的哈希或 ->   ← PBZS|CFG|<哈希>|<第几块>|<共几块>|<内容>（每块 ≤ 900 字节，内容里本来就有 |，客户端只按前 5 个 | 切）
 //                                       ← 已经是最新：PBZS|CFG|<哈希>|0|0|     没给 --cfg：PBZS|CFG|-|0|0|
 // pbz-ranked.mjs 只在给了 --ranked 时才加载：没有这个文件、不加 --ranked，服务器照常跑（排位不公开源码，不随发布包分发）。
+//
+// §174 举报 / 封禁（HANDOVER §174）：
+//   REG 第 15 段 = 主机标记（主机安装号的哈希），列表第 10 列原样给出：客户端据此不列自己拉黑的人开的房。
+//   --reports <文件>：收举报，一行一条 JSON 追加到这个文件（不给就不收，回 RPTERR …|off）。
+//     任何 → PBZS|REPORT|<随机号>|<键=值，Tab 分开>   ← PBZS|RPTOK|<随机号> / PBZS|RPTERR|<随机号>|off / rate / bad
+//     键：ru / rsh / rnm / rpid / rv = 举报人的安装号 / Steam 哈希 / 昵称 / 排位 pid / 版本；tu / tsh / tsid / tnm / tpid / tv = 被举报人的；
+//     mode / room / mt（对局状态）/ dur（连着几秒）/ ago（几秒前断的）/ why（原因，逗号分开）/ note（附言）。只记，不自动封。
+//     同一个来源 IP 10 分钟最多 6 条；同一个随机号只记一次（客户端没收到回执会重发）。
+//   node pbz-lobby-server.mjs --dump-reports <文件> [--all]：按被举报人汇总打印后退出（--all 把每一条都列出来）；
+//     §181 后面再打一段"可疑排名"（同目录 evidence/ 里的对局数据，每人一行 + 最可疑 3 条明细，只出报告不自动封）。
+//   §181 举报附带的对局数据（客户端房间设置"作弊数据采样"开着才有）：举报收下后
+//     任何 → PBZS|EVID|<举报随机号>|<片号>/<总片数>|<gzip 后 Base64>（最多 8 片，每片 ≤ 1000 字节）  ← 拼齐写好 PBZS|EVOK|<随机号>
+//     写 <举报文件同目录>/evidence/<日期>.jsonl，一行一份；丢片不写；90 天前的每天清掉（--bans 里的人的留着）。
+//   §202 --cheat-rules <配置文件>（要同时给 --reports）：收齐举报附带的对局数据后按配置判定，武林盟主的对局判定作弊可以作废、退分。
+//     判定模块 pbz-verdict.mjs 和排位一样不随发布包分发；没有这个文件就别加这个参数。
+//   --bans <文件>：武林盟主封禁名单（手动维护，改了自动重读）。一行一个排位 pid 或 SteamID（# 后面是注释）；
+//     名单里的人登记排位房间 / 加入排位房间都回 ERR …|banned。普通房间不管。
 import dgram from 'node:dgram';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
 import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
 
 const arg = (name, def) => {
     const i = process.argv.indexOf(name);
@@ -71,6 +90,9 @@ const QUIET = process.argv.includes('--quiet');
 const RELAY = process.argv.includes('--relay') || process.env.RELAY === '1';
 const RANKED_FILE = arg('--ranked', process.env.RANKED || '');
 const CFG_FILE = arg('--cfg', process.env.PBZ_CFG || '');
+const REPORTS_FILE = arg('--reports', process.env.PBZ_REPORTS || '');
+const BANS_FILE = arg('--bans', process.env.PBZ_BANS || '');
+const CHEAT_RULES = arg('--cheat-rules', process.env.PBZ_CHEAT_RULES || '');      // §202
 const UPSTREAMS =process.argv.flatMap((a, i) => (a === '--upstream' && process.argv[i + 1] ? [process.argv[i + 1]] : []));
 
 const ROOM_TTL = 10_000;          // 主机 10 秒没心跳就删房间
@@ -78,6 +100,9 @@ const SESSION_TTL = 30_000;       // 会话 30 秒没包就删
 const MAX_ROOMS = 1000;
 const MAX_LIST = 40;
 const MAX_PACKET = 1400;
+const REPORT_RATE = 6;            // §174 每个来源 IP 每 10 分钟最多几条举报
+const REPORT_WINDOW = 600_000;
+const REPORT_KEYS = ['ru', 'rsh', 'rnm', 'rpid', 'rv', 'tu', 'tsh', 'tsid', 'tnm', 'tpid', 'tv', 'mode', 'room', 'mt', 'dur', 'ago', 'why', 'note'];
 const PUSH_CHUNK = 6;             // 每个 PUSH 包几个房间（中文名字 32 字 ≈ 96 字节，6 个也在 1400 以内）
 const MAX_REMOTE_PER_SOURCE = 200;
 const RELAY_RATE = 120;           // 每个会话每个方向每秒最多转发多少包（游戏 30 包/秒，留余量）
@@ -120,12 +145,231 @@ const newId = (len) => {
     return s;
 };
 
+// ---- §181 BEGIN 作弊数据：举报附带的对局数据摘要（HANDOVER §181；这一段只用传进来的 fs / zlib / path，tests/test_evidence.mjs 单独拿出来测）
+// 客户端举报收下（RPTOK）后另发 PBZS|EVID|<举报随机号>|<片号>/<总片数>|<Base64>（gzip 过的一行 JSON，最多 8 片，每片整包 ≤ 1000 字节）。
+// 只认这台服务器最近 10 分钟收下的举报的随机号；拼齐、解压、过滤后写 <举报文件同目录>/evidence/<日期>.jsonl 一行一份（带随机号和被举报人标识），
+// 回 PBZS|EVOK|<随机号>；60 秒没拼齐就丢（丢片不写）。每天清 90 天前的文件，--bans 名单里的人（排位 pid / SteamID）那几行留着。
+// --dump-reports 多一段"可疑排名"：每份摘要按指标计数，延迟高的整份不进排名；只出报告，不自动封。
+const EV_MAX_PIECES = 8, EV_PIECE_MAX = 1000, EV_TTL = 60_000, EV_KEEP_DAYS = 90, EV_MAX_RAW = 65_536, EV_LAT_BAD = 300;
+// §181.4 五项 + 两项参考：big ① 单次伤害 > 招表 × 3、cd ② 冷却过短、heal / sh ③ 凭空回血 / 回杀气、tp ④ 瞬移（客户端已扣掉延迟 > 300 ms 的）、
+// attr ⑤ 属性超过标准数值的项数；lo 受伤偏少 = 我判定打中、对方回报 hit 但伤害 < 招表 ÷ 3（无敌 / 减伤类修改器，§193 起进排名）。
+// 合计 ≥ EV_FLAG 任一项 = 有证据支持。lo 只认 v ≥ 2 的摘要（客户端 §193 起才扣掉延迟高 / 回合结束截断的样本）、标准数值开着或武林盟主
+const EV_CATS = ['big', 'cd', 'heal', 'sh', 'tp', 'attr', 'lo'];
+const EV_FLAG = { big: 2, cd: 3, heal: 2, sh: 3, tp: 2, attr: 1, lo: 3 };
+const EV_LO_X = 1 / 3, EV_LO_CAP = 10, EV_LO_MINV = 2;
+const EV_NAME = { big: '伤害超标', cd: '冷却过短', heal: '凭空回血', sh: '凭空回杀气', tp: '瞬移', attr: '属性超标', lo: '受伤偏少' };
+const evDirOf = (pathMod, reportsFile) => pathMod.join(pathMod.dirname(pathMod.resolve(reportsFile)), 'evidence');
+const evDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+const evNum = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const evStr = (v, n = 64) => String(v ?? '').replace(/[^\w,\-.]/g, '').slice(0, n);
+// 摘要过一遍：只留认识的键；数字就是数字，字串只留 [\w,-.]；明细每类最多 10 条、每条最多 8 项
+function evClean(o) {
+    if (!o || typeof o !== 'object') return null;
+    const env = {}, c = {}, d = {};
+    for (const [k, v] of Object.entries(o.env || {})) if (/^\w{1,12}$/.test(k)) env[k] = typeof v === 'string' ? evStr(v, 200) : evNum(v);
+    for (const k of ['hits', 'std', 'res', 'pk', 'ux', 'healAmt', ...EV_CATS]) c[k] = Math.max(0, evNum(o.c?.[k]) ?? 0);
+    for (const k of EV_CATS) {
+        const rows = Array.isArray(o.d?.[k]) ? o.d[k].slice(0, 10) : [];
+        d[k] = rows.filter(Array.isArray).map((r) => r.slice(0, 8).map((x) => (typeof x === 'string' ? evStr(x) : evNum(x))));
+    }
+    return { v: evNum(o.v), mv: evStr(o.mv, 16), mid: evNum(o.mid), r: evNum(o.r), dur: evNum(o.dur), sc: evStr(o.sc, 12), env, c, d };
+}
+function createEvidence({ dir, fs: fsm, zlib: zl, path: pathMod, onWritten = null }) {
+    const reports = new Map();    // 随机号 → { row, at }（收下的举报）
+    const pend = new Map();       // 随机号 → { n, parts, got, at }
+    const done = new Map();       // 随机号 → 时间（写过了，重发的片直接回 EVOK）
+    const st = { written: 0, bad: 0, dropped: 0 };
+    function noteReport(nonce, row, now) { reports.set(nonce, { row, at: now }); }
+    // 一个分片；返回要回的包（字符串）或 null。ctx 原样交给 onWritten（§202：发摘要的地址，只在内存里用）
+    function onPiece(f, now, ctx) {
+        const nonce = String(f[2] ?? '').slice(0, 16);
+        if (!reports.has(nonce)) return null;
+        if (done.has(nonce)) return `PBZS|EVOK|${nonce}`;
+        const m = /^(\d)\/(\d)$/.exec(String(f[3] ?? ''));
+        const data = String(f.slice(4).join('|'));
+        if (!m || !/^[A-Za-z0-9+/=]{1,1000}$/.test(data)) return null;
+        const i = Number(m[1]), n = Number(m[2]);
+        if (n < 1 || n > EV_MAX_PIECES || i < 1 || i > n) return null;
+        let p = pend.get(nonce);
+        if (!p || p.n !== n) { p = { n, parts: new Array(n).fill(null), got: 0, at: now }; pend.set(nonce, p); }
+        if (p.parts[i - 1] === null) { p.parts[i - 1] = data; p.got++; }
+        if (p.got < n) return null;
+        pend.delete(nonce);
+        let ev;
+        try {
+            const raw = zl.gunzipSync(Buffer.from(p.parts.join(''), 'base64'), { maxOutputLength: EV_MAX_RAW });
+            ev = evClean(JSON.parse(raw.toString('utf8')));
+        } catch { ev = null; }
+        if (!ev) { st.bad++; return null; }
+        const row = reports.get(nonce).row || {};
+        const line = { t: new Date(now).toISOString(), n: nonce };
+        for (const k of ['tu', 'tsh', 'tsid', 'tpid', 'tnm', 'ru', 'rsh']) if (row[k]) line[k] = row[k];
+        line.ev = ev;
+        try {
+            fsm.mkdirSync(dir, { recursive: true });
+            fsm.appendFileSync(pathMod.join(dir, `${evDay(now)}.jsonl`), JSON.stringify(line) + '\n');
+        } catch (e) { console.error(`[evidence] 写不进 ${dir}：${e.message}`); return null; }
+        done.set(nonce, now);
+        st.written++;
+        if (onWritten) { try { onWritten(line, row, ctx); } catch (e) { console.error(`[evidence] 判定出错：${e.message}`); } }
+        return `PBZS|EVOK|${nonce}`;
+    }
+    function sweep(now) {
+        for (const [k, p] of pend) if (now - p.at > EV_TTL) { pend.delete(k); st.dropped++; }
+        for (const [k, r] of reports) if (now - r.at > 600_000) reports.delete(k);
+        for (const [k, t] of done) if (now - t > 600_000) done.delete(k);
+    }
+    // 删 90 天前的；被封的人（bansHas(排位 pid / SteamID)）那几行留着
+    function cleanOld(now, bansHas) {
+        let files = [];
+        try { files = fsm.readdirSync(dir); } catch { return 0; }
+        const cut = evDay(now - EV_KEEP_DAYS * 86_400_000);
+        let removed = 0;
+        for (const fn of files) {
+            const m = /^(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(fn);
+            if (!m || m[1] >= cut) continue;
+            const full = pathMod.join(dir, fn);
+            let keep = [];
+            try {
+                keep = fsm.readFileSync(full, 'utf8').split('\n').filter((l) => {
+                    try { const o = JSON.parse(l); return bansHas(o.tpid) || bansHas(o.tsid); } catch { return false; }
+                });
+                if (keep.length) fsm.writeFileSync(full, keep.join('\n') + '\n');
+                else fsm.unlinkSync(full);
+                removed++;
+            } catch (e) { console.error(`[evidence] 清理 ${fn} 失败：${e.message}`); }
+        }
+        return removed;
+    }
+    return { noteReport, onPiece, sweep, cleanOld, st, pend };
+}
+// 一份摘要的指标：延迟高（平均往返 > 300 ms）或没测出往返（lat 为 null）的整份不可信；标准数值没开、也不是武林盟主的不算 ① ⑤ 和 lo；
+// v < 2 的旧摘要不算 lo（那时客户端 lo 不扣延迟 / 截断）
+function evScore(ev) {
+    const e = ev?.env || {}, c = ev?.c || {};
+    const lat = evNum(e.lat);
+    const s = { trusted: lat !== null && lat <= EV_LAT_BAD, stdOk: e.std === 1 || e.rk === 1, healAmt: c.healAmt || 0 };
+    for (const k of EV_CATS) s[k] = c[k] || 0;
+    s.loOk = s.stdOk && (evNum(ev?.v) ?? 0) >= EV_LO_MINV;
+    if (!s.stdOk) s.big = s.attr = 0;
+    if (!s.loOk) s.lo = 0;
+    return s;
+}
+// 一份摘要里最可疑的明细（按"超出阈值几倍"排：伤害 ÷ 3 倍招表、半个技能时长 ÷ 间隔、回血占上限 ÷ 3%、杀气 ÷ 一半、速度 ÷ 30 米/秒、属性 ÷ 1.6 倍基准、
+// lo 招表 ÷ 3 ÷ max(回报, 1) 封顶 10——和客户端 CS.score 同一算法）
+function evDetails(ev) {
+    const out = [], d = ev?.d || {}, sc = evScore(ev);
+    const f1 = (x) => (typeof x === 'number' ? Math.round(x * 10) / 10 : x);
+    if (sc.stdOk) for (const r of d.big || []) if (r[3] > 0) out.push({ w: r[2] / r[3] / 3, s: `${EV_NAME.big} ${r[1]} ${f1(r[2])}（招表 ${f1(r[3])}，×${f1(r[2] / r[3])}）@${f1(r[0])}s` });
+    for (const r of d.cd || []) if (r[2] >= 0 && r[3] > 0) out.push({ w: r[3] / 2 / Math.max(r[2], 50), s: `${EV_NAME.cd} ${r[1]} 间隔 ${f1(r[2])} ms（技能时长 ${f1(r[3])} ms）@${f1(r[0])}s` });
+    for (const r of d.heal || []) if (r[3] > 0) out.push({ w: (r[2] - r[1]) / r[3] / 0.03, s: `${EV_NAME.heal} ${f1(r[1])} → ${f1(r[2])}（上限 ${f1(r[3])}）@${f1(r[0])}s` });
+    for (const r of d.sh || []) if (r[3] > 0) out.push({ w: (r[2] - r[1]) / r[3] / 0.5, s: `${EV_NAME.sh} ${f1(r[1])} → ${f1(r[2])}（上限 ${f1(r[3])}）@${f1(r[0])}s` });
+    for (const r of d.tp || []) if (evNum(r[4]) !== null && r[4] >= 0 && r[4] <= EV_LAT_BAD) out.push({ w: r[3] / 3000, s: `${EV_NAME.tp} ${f1(r[1] / 100)} 米 / ${f1(r[2])} ms（${f1(r[3] / 100)} 米/秒，出招 ${r[5]}，往返 ${r[4] ?? '?'} ms）@${f1(r[0])}s` });
+    if (sc.stdOk) for (const r of d.attr || []) if (r[2] > 0) out.push({ w: r[1] / r[2] / 1.6, s: `${EV_NAME.attr} ${r[0]} ${f1(r[1])}（基准 ${f1(r[2])}）` });
+    if (sc.loOk) for (const r of d.lo || []) if (evNum(r[2]) !== null && r[2] >= 0 && r[3] > 0 && evNum(r[4]) !== null && r[4] >= 0 && r[4] <= EV_LAT_BAD)
+        out.push({ w: Math.min(EV_LO_CAP, r[3] * EV_LO_X / Math.max(r[2], 1)), s: `${EV_NAME.lo} ${r[1]} 对方回报 ${f1(r[2])}（招表 ${f1(r[3])}，×${f1(r[2] / r[3])}，往返 ${r[4]} ms）@${f1(r[0])}s` });
+    return out.sort((a, b) => b.w - a.w);
+}
+// 读 evidence 目录 → 按被举报人汇总（key 和 dumpReports 一样）。同一个举报人对同一个人同一场（mid）举报了几次，
+// 摘要只算最后一份（同一场打完后再举报一次，后一份更全）；举报人或 mid 不知道的不去重
+function evRank(rows, evLines, key) {
+    const people = new Map();
+    const get = (k) => {
+        if (!people.has(k)) people.set(k, { k, reports: 0, reporters: new Set(), names: new Set(), ev: 0, evBad: 0, dup: 0, sum: Object.fromEntries([...EV_CATS, 'healAmt'].map((x) => [x, 0])), det: [] });
+        return people.get(k);
+    };
+    for (const r of rows) { const p = get(key(r)); p.reports++; p.reporters.add(r.ru || r.rsh || r.ip); if (r.tnm) p.names.add(r.tnm); }
+    const uniq = new Map();
+    for (const l of evLines) {
+        const who = l.ru || l.rsh, mid = evNum(l.ev?.mid);
+        const dk = who && mid !== null ? `${key(l)}|${who}|${mid}` : Symbol('ev');
+        if (uniq.has(dk)) get(key(l)).dup++;
+        uniq.delete(dk);                 // 后来的放到最后（保持读到的先后）
+        uniq.set(dk, l);
+    }
+    for (const l of uniq.values()) {
+        const p = get(key(l)), sc = evScore(l.ev);
+        if (l.tnm) p.names.add(l.tnm);
+        if (!sc.trusted) { p.evBad++; continue; }
+        p.ev++;
+        for (const x of [...EV_CATS, 'healAmt']) p.sum[x] += sc[x];
+        p.det.push(...evDetails(l.ev).slice(0, 3));
+    }
+    const list = [...people.values()].filter((p) => p.ev + p.evBad > 0);
+    for (const p of list) {
+        p.flags = Object.entries(EV_FLAG).filter(([x, n]) => p.sum[x] >= n).map(([x]) => x);
+        p.det.sort((a, b) => b.w - a.w);
+    }
+    // 先看举报人数（一个人反复举报刷不上去），再看有没有证据支持、几项、举报条数
+    return list.sort((a, b) => b.reporters.size - a.reporters.size || (b.flags.length > 0) - (a.flags.length > 0)
+        || b.flags.length - a.flags.length || b.reports - a.reports);
+}
+function evReadDir(fsm, pathMod, dir) {
+    const lines = [];
+    let files = [];
+    try { files = fsm.readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).sort(); } catch { return lines; }
+    for (const f of files) {
+        for (const l of fsm.readFileSync(pathMod.join(dir, f), 'utf8').split('\n')) {
+            if (!l.trim()) continue;
+            try { const o = JSON.parse(l); if (o && o.ev) lines.push(o); } catch { /* 坏行跳过 */ }
+        }
+    }
+    return lines;
+}
+function evPrintRank(list) {
+    console.log(`\n==== 可疑排名（举报附带的对局数据；只出报告，不自动封；按举报人数排；延迟高的整份不算）====`);
+    if (!list.length) { console.log('（没有对局数据）'); return; }
+    for (const p of list) {
+        const s = p.sum;
+        console.log(`${p.flags.length ? '★' : ' '} ${p.k}  举报 ${p.reports} 条 / ${p.reporters.size} 人  数据 ${p.ev} 份${p.evBad ? `（另 ${p.evBad} 份延迟高 / 没测出往返没算）` : ''}${p.dup ? `（另 ${p.dup} 份是同一人同一场重复举报）` : ''}`
+            + `  ①伤害超标 ${s.big}  ②冷却过短 ${s.cd}  ③回血 ${s.heal}（共 ${Math.round(s.healAmt)}）/ 回杀气 ${s.sh}  ④瞬移 ${s.tp}  ⑤属性超标 ${s.attr}  受伤偏少 ${s.lo}`
+            + `  昵称：${[...p.names].slice(0, 3).join(' / ') || '?'}`);
+        for (const d of p.det.slice(0, 3)) console.log(`     - ${d.s}`);
+    }
+}
+// ---- §181 END
+
+// §174 看举报：按被举报人汇总
+function dumpReports(file, all) {
+    let lines = [];
+    try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { console.error(`读不了 ${file}：${e.message}`); process.exit(1); }
+    const rows = [];
+    for (const l of lines) { try { rows.push(JSON.parse(l)); } catch { /* 坏行跳过 */ } }
+    const key = (r) => (r.tsid ? `steam ${r.tsid}` : r.tpid ? `pid ${r.tpid}` : r.tu ? `uid ${r.tu}` : r.tsh ? `sh ${r.tsh}` : `nm ${r.tnm || '?'}`);
+    const groups = new Map();
+    for (const r of rows) {
+        const k = key(r);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(r);
+    }
+    console.log(`共 ${rows.length} 条举报，${groups.size} 个被举报人（${file}）`);
+    const sorted = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+    for (const [k, list] of sorted) {
+        const reporters = new Set(list.map((r) => r.ru || r.rsh || r.ip));
+        const why = {};
+        for (const r of list) for (const w of String(r.why || '').split(',').filter(Boolean)) why[w] = (why[w] || 0) + 1;
+        const names = [...new Set(list.map((r) => r.tnm).filter(Boolean))].slice(0, 5).join(' / ');
+        const ids = [...new Set(list.flatMap((r) => [r.tu && `uid ${r.tu}`, r.tsh && `sh ${r.tsh}`, r.tsid && `steam ${r.tsid}`, r.tpid && `pid ${r.tpid}`].filter(Boolean)))].join('  ');
+        console.log(`\n== ${k}  ${list.length} 条，${reporters.size} 个举报人  昵称：${names || '?'}`);
+        console.log(`   标识：${ids}`);
+        console.log(`   原因：${Object.entries(why).map(([w, n]) => `${w}×${n}`).join('  ') || '（没选）'}`);
+        console.log(`   最近：${list[list.length - 1].t}`);
+        for (const r of (all ? list : list.filter((x) => x.note).slice(-3)))
+            console.log(`   - ${r.t} ${r.rnm || r.ru || '?'}（${r.mode || '?'}${r.room ? ' 房间 ' + r.room : ''}${r.mt ? ' 对局 ' + r.mt : ''}${r.dur ? ' 连了 ' + r.dur + ' 秒' : ''}）${r.why ? ' [' + r.why + ']' : ''}${r.note ? '：' + r.note : ''}`);
+    }
+    evPrintRank(evRank(rows, evReadDir(fs, path, evDirOf(path, file)), key));     // §181 可疑排名（举报文件旁边的 evidence/）
+}
+if (process.argv.includes('--dump-reports')) {
+    dumpReports(arg('--dump-reports', REPORTS_FILE || 'pbz-reports.jsonl'), process.argv.includes('--all'));
+    process.exit(0);
+}
+
 const sock = dgram.createSocket('udp4');
 let ranked = null;
 if (RANKED_FILE) {
     try {
         const { createRanked } = await import('./pbz-ranked.mjs');
-        ranked = createRanked({ file: RANKED_FILE, log, send, webDir: arg('--web', process.env.RANKED_WEB || '') });
+        ranked = createRanked({ file: RANKED_FILE, log, send, webDir: arg('--web', process.env.RANKED_WEB || ''), cfgFile: arg('--ranked-cfg', process.env.RANKED_CFG || '') });
     } catch (e) {
         console.error(`[server] 给了 --ranked 但加载不了 pbz-ranked.mjs（要和本文件放在同一个目录）：${e.message}`);
         process.exit(1);
@@ -159,6 +403,69 @@ function loadCfg() {
 if (CFG_FILE) {
     loadCfg();
     fs.watchFile(CFG_FILE, { interval: 5000 }, loadCfg);
+}
+
+// §174 武林盟主封禁名单：一行一个 pid 或 SteamID
+let bans = new Set();
+function loadBans() {
+    let t = '';
+    try { t = fs.readFileSync(BANS_FILE, 'utf8'); } catch (e) { console.error(`[bans] 读不了 ${BANS_FILE}：${e.message}`); return; }
+    bans = new Set(t.split('\n').map((l) => l.replace(/#.*/, '').trim()).filter(Boolean));
+    console.log(`[bans] 封禁名单 ${bans.size} 条`);
+}
+if (BANS_FILE) {
+    loadBans();
+    fs.watchFile(BANS_FILE, { interval: 5000 }, loadBans);
+}
+const banned = (...ids) => ids.some((x) => x && bans.has(x));
+
+// §202 举报判定（pbz-verdict.mjs，不公开）：只在给了 --cheat-rules 时加载
+let verdict = null;
+if (CHEAT_RULES) {
+    if (!REPORTS_FILE) { console.error('[server] --cheat-rules 要和 --reports 一起用'); process.exit(1); }
+    try {
+        const { createVerdictServer } = await import('./pbz-verdict.mjs');
+        verdict = createVerdictServer({ rulesFile: CHEAT_RULES, reportsFile: REPORTS_FILE, rankedFile: RANKED_FILE, ranked, log: note });
+    } catch (e) {
+        console.error(`[server] 给了 --cheat-rules 但加载不了 pbz-verdict.mjs（要和本文件放在同一个目录）：${e.message}`);
+        process.exit(1);
+    }
+}
+// §181 举报附带的对局数据：和举报文件同目录的 evidence/；启动时和每天清一次 90 天前的（被封的人的留着）
+const evid = REPORTS_FILE ? createEvidence({ dir: evDirOf(path, REPORTS_FILE), fs, zlib, path,
+    onWritten: verdict ? (line, row, ctx) => verdict.onEvidence(line, row, ctx?.ip || '') : null }) : null;
+if (evid) {
+    const clean90 = () => { const n = evid.cleanOld(Date.now(), (x) => !!x && bans.has(x)); if (n) console.log(`[evidence] 清理了 ${n} 个 90 天前的文件`); };
+    clean90();
+    setInterval(clean90, 86_400_000).unref();
+}
+// §174 举报：每个来源 IP 的计数、收过的随机号
+const reportRate = new Map();     // ip → [时间…]
+const reportSeen = new Map();     // 随机号 → 时间
+function onReport(f, from) {
+    const nonce = clean(f[2], 16);
+    if (!nonce) return;
+    if (!REPORTS_FILE) { send(`PBZS|RPTERR|${nonce}|off`, from); return; }
+    const now = Date.now();
+    if (reportSeen.has(nonce)) { send(`PBZS|RPTOK|${nonce}`, from); return; }
+    const ip = ipOf(from);
+    const times = (reportRate.get(ip) || []).filter((t) => now - t < REPORT_WINDOW);
+    if (times.length >= REPORT_RATE) { reportRate.set(ip, times); send(`PBZS|RPTERR|${nonce}|rate`, from); return; }
+    const r = { t: new Date(now).toISOString(), ip: ip16(from), n: nonce };      // §181 n = 随机号（evidence 里同一个号对得上）
+    for (const part of String(f.slice(3).join(' ')).split('\t')) {
+        const eq = part.indexOf('=');
+        if (eq <= 0) continue;
+        const k = part.slice(0, eq);
+        if (REPORT_KEYS.includes(k)) r[k] = clean(part.slice(eq + 1), k === 'note' ? 160 : 64).trim();
+    }
+    if (!r.tu && !r.tsh && !r.tsid && !r.tnm) { send(`PBZS|RPTERR|${nonce}|bad`, from); return; }
+    try { fs.appendFileSync(REPORTS_FILE, JSON.stringify(r) + '\n'); } catch (e) { console.error(`[report] 写不进 ${REPORTS_FILE}：${e.message}`); send(`PBZS|RPTERR|${nonce}|io`, from); return; }
+    times.push(now);
+    reportRate.set(ip, times);
+    reportSeen.set(nonce, now);
+    if (evid) evid.noteReport(nonce, r, now);      // §181 这个随机号的对局数据分片之后才收
+    send(`PBZS|RPTOK|${nonce}`, from);
+    note(`[report] 收到举报：被举报人 ${r.tsid || r.tpid || r.tu || r.tsh || '?'}（${r.mode || '?'}）原因 ${r.why || '-'}`);
 }
 
 function send(text, to) {
@@ -207,6 +514,7 @@ function onControl(f, from) {
             const rk = f[8] === '1', pid = clean(f[9], 16);
             if (rk && !ranked) { send('PBZS|ERR|-|noranked', from); return; }
             if (rk && !ranked.known(pid)) { send('PBZS|ERR|-|unknown', from); return; }
+            if (rk && banned(pid, steamIdOf(f[10]))) { send('PBZS|ERR|-|banned', from); return; }     // §174
             let id = byKey.get(key);
             let room = id && rooms.get(id);
             if (!room) {
@@ -230,6 +538,7 @@ function onControl(f, from) {
             room.steam = rk ? steamIdOf(f[10]) : '';   // §135 排位对局走 Steam：主机的 SteamID（旧版联机程序不发 = 空）
             room.watch = f[11] === '1' && !rk;         // §141 主机认观战（排位房间不给看）
             room.aiFight = f[13] === '1';           // §141 第 14 段 = 主机在和本地 AI 对打（列表第 9 列）
+            room.bh = clean(f[14], 16);             // §174 第 15 段 = 主机标记（列表第 10 列）
             room.maxWatch = Math.min(MAX_WATCH, Number.isFinite(Number(f[12])) && f[12] !== undefined && f[12] !== '' ? Number(f[12]) : MAX_WATCH);   // 第 13 段 = 主机设的上限
             room.seen = now;
             send(`PBZS|REGOK|${id}|${from}|${watchCount(room, now)}|${room.second && room.watchers?.has(room.second) ? 1 : 0}`, from);
@@ -248,7 +557,7 @@ function onControl(f, from) {
             const own = [...rooms.values()].map((r) => ({ ...r, home: '', title: title(r) })).sort(order);
             const list = own.concat([...remote.values()].sort(order)).slice(0, MAX_LIST);
             // §141 第 8 列 = 能观战（主机认观战、这台开了中转、是这台自己的房间）
-            send('PBZS|ROOMS\n' + list.map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}\t${r.home}\t${r.ranked ? 1 : 0}\t${r.title || ''}\t${r.watch && RELAY && !r.home ? 1 : 0}\t${r.aiFight ? 1 : 0}`).join('\n'), from);
+            send('PBZS|ROOMS\n' + list.map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}\t${r.home}\t${r.ranked ? 1 : 0}\t${r.title || ''}\t${r.watch && RELAY && !r.home ? 1 : 0}\t${r.aiFight ? 1 : 0}\t${r.bh || ''}`).join('\n'), from);
             return;
         }
         case 'WATCH': {
@@ -318,6 +627,7 @@ function onControl(f, from) {
                 room.full = false;
             }
             if (room.ranked && !(ranked && ranked.known(cpid) && cpid !== room.pid)) { send(`PBZS|ERR|${id}|ranked`, from); return; }
+            if (room.ranked && banned(cpid, csteam)) { send(`PBZS|ERR|${id}|banned`, from); return; }     // §174
             // §135 排位对局只走 Steam：两边都要有 SteamID（一边是旧版就说清楚，别让客机一直连不上）
             if (room.ranked && !room.steam !== !csteam) { send(`PBZS|ERR|${id}|${room.steam ? 'needsteam' : 'oldhost'}`, from); return; }
             // 同一个客机端点重发 JOIN（每次直连重试都会发）沿用原会话号
@@ -336,6 +646,14 @@ function onControl(f, from) {
             // §135 第 7 段 = 对方的 SteamID（排位房间才有；旧版联机程序只看前 6 段）
             send(`PBZS|PEER|${id}|${s.sid}|${room.host}|${room.hostLocal}${room.steam ? '|' + room.steam : ''}`, from);
             send(`PBZS|PEER|${id}|${s.sid}|${from}|${s.bLocal}${csteam ? '|' + csteam : ''}`, room.host);
+            return;
+        }
+        case 'REPORT':      // §174
+            onReport(f, from);
+            return;
+        case 'EVID': {      // §181 举报附带的对局数据分片（没开 --reports / 不是刚收下的举报 → 不理）
+            const rep = evid && evid.onPiece(f, now, { ip: ipOf(from) });
+            if (rep) send(rep, from);
             return;
         }
         case 'RELAY': {
@@ -534,7 +852,11 @@ setInterval(() => {
         } else if (s.relay) relaySummary(s, '定时');   // §133 中转中每 2 秒看一次，有变化才写
     }
     for (const [k, r] of remote) if (now - r.seen > ROOM_TTL) remote.delete(k);
+    for (const [k, t] of reportSeen) if (now - t > REPORT_WINDOW) reportSeen.delete(k);     // §174
+    for (const [k, ts] of reportRate) if (!ts.some((t) => now - t < REPORT_WINDOW)) reportRate.delete(k);
+    if (evid) evid.sweep(now);      // §181 60 秒没拼齐的分片丢掉
     if (ranked) ranked.tick();
+    if (verdict) verdict.tick();        // §202 配置热加载、没结算的对局再找、人工撤销
 }, 2000).unref();
 
 if (upstreams.size > 0) {
@@ -550,6 +872,9 @@ sock.bind(PORT, HOST, () => {
     console.log(`[server] PBZ_MP 大厅服务器已启动：UDP ${HOST}:${sock.address().port}`
         + (RELAY ? '；中转开' : '；中转关（--relay 打开）')
         + (ranked ? `；武林盟主排位开（${RANKED_FILE}）` : '')
+        + (REPORTS_FILE ? `；收举报（${REPORTS_FILE}）` : '')
+        + (BANS_FILE ? `；排位封禁名单（${BANS_FILE}）` : '')
+        + (verdict ? `；举报判定（${CHEAT_RULES}，${verdict.rules().mode}）` : '')
         + (upstreams.size ? `；互通上游 ${[...upstreams.keys()].join(', ')}` : ''));
 });
 

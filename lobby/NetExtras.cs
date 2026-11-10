@@ -561,4 +561,362 @@ namespace PbzLobby
         }
 #endif
     }
+
+    // ---- §174 拉黑 / 举报（HANDOVER §174）
+    // 标识：uid = 本机第一次运行时随机生成的安装号（net\uid.txt，12 位十六进制）；sh = 自己 SteamID 的哈希（有 Steam 才有，
+    // 不直接把 SteamID 发给陌生人）。握手和每个状态包都带 uid= / sh=，主机按它拒绝拉黑的人。都是对方自己报的，删文件 / 改包能换掉；
+    // Steam 连接上主机看到的对方 SteamID 是 Steam 验过的，最可靠
+    static class Ident
+    {
+        public static string Uid = "";
+        static ulong shFor;
+        static string shText = "";
+
+        public static void Load(string dir)
+        {
+            var f = Path.Combine(dir, "uid.txt");
+            Uid = Clean(Kv.ReadText(f));
+            if (Uid.Length >= 8) return;
+            var b = new byte[6];
+            using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create()) rng.GetBytes(b);
+            try { Kv.WriteAtomic(f, BitConverter.ToString(b).Replace("-", "").ToLowerInvariant() + "\n"); } catch (Exception) { }
+            Uid = Clean(Kv.ReadText(f));
+        }
+
+        static string Clean(string s)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var c in (s ?? "").Trim().ToLowerInvariant()) if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) sb.Append(c);
+            return sb.Length > 16 ? sb.ToString(0, 16) : sb.ToString();
+        }
+
+        public static string Sh
+        {
+            get
+            {
+                if (!Steam.Ready || Steam.MyId == 0) return "";
+                if (shFor != Steam.MyId) { shText = SteamHash(Steam.MyId); shFor = Steam.MyId; }
+                return shText;
+            }
+        }
+
+        static string H(string s)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(Kv.Utf8.GetBytes(s))).Replace("-", "").Substring(0, 12).ToLowerInvariant();
+        }
+        public static string SteamHash(ulong id) { return id == 0 ? "" : H("pbzmp-sid|" + id); }
+        public static string SteamHash(string id) { ulong v; return ulong.TryParse(id, out v) ? SteamHash(v) : ""; }
+        // 房间列表里的主机标记：uid 的哈希（列表谁都能看，不直接放 uid）
+        public static string RoomHash(string uid) { return string.IsNullOrEmpty(uid) ? "" : H("pbzmp-room|" + uid); }
+        public static string MyRoomHash { get { return RoomHash(Uid); } }
+
+        // 握手 / 状态包里加的两行
+        public static string Lines()
+        {
+            var sh = Sh;
+            return (Uid.Length > 0 ? "uid=" + Uid + "\n" : "") + (sh.Length > 0 ? "sh=" + sh + "\n" : "");
+        }
+
+        // 包里某个字段（"\n键=值"；包的第一行不会是这两个键）
+        public static string Field(string body, string key)
+        {
+            int i = body.IndexOf("\n" + key + "=", StringComparison.Ordinal);
+            if (i < 0) return null;
+            i += key.Length + 2;
+            int e = body.IndexOf('\n', i);
+            return (e < 0 ? body.Substring(i) : body.Substring(i, e - i)).Trim();
+        }
+    }
+
+    // 一个对手（当前 / 最近）：主程序每轮看连着的会话记下来，面板的拉黑 / 举报用
+    class Opp
+    {
+        public string Uid = "", Sh = "", Sid = "", Ip = "", Nick = "", Mode = "", Room = "", Mt = "", Ver = "", Rk = "";
+        public DateTime First, Last;
+        public bool Same(Opp o)
+        {
+            if (Uid.Length > 0 && o.Uid.Length > 0) return Uid == o.Uid;
+            if (Sid.Length > 0 && o.Sid.Length > 0) return Sid == o.Sid;
+            if (Sh.Length > 0 && o.Sh.Length > 0) return Sh == o.Sh;
+            return Ip.Length > 0 && Ip == o.Ip && Nick == o.Nick;
+        }
+        public bool HasId { get { return Uid.Length > 0 || Sh.Length > 0 || Sid.Length > 0 || Ip.Length > 0; } }
+        // 同一个人又看到一次：新看到的非空字段盖上去
+        public void Merge(Opp o)
+        {
+            Func<string, string, string> m = (old, nw) => nw.Length > 0 ? nw : old;
+            Uid = m(Uid, o.Uid); Sh = m(Sh, o.Sh); Sid = m(Sid, o.Sid); Ip = m(Ip, o.Ip); Nick = m(Nick, o.Nick);
+            Room = m(Room, o.Room); Mt = m(Mt, o.Mt); Ver = m(Ver, o.Ver); Rk = m(Rk, o.Rk);
+            Mode = o.Mode;
+        }
+    }
+
+    // 黑名单：net\blacklist.txt，一行一个（uid= sh= sid= ip= nm= mode= at=，Tab 分开）。启动读一次，改了写一次；
+    // 收包时查的是内存里的集合（每个包两次哈希表查找）。ip 只在这一条什么别的标识都没有时才拿来比（IP 会变、会多人共用）
+    static class Blacklist
+    {
+        public class Entry { public string Uid = "", Sh = "", Sid = "", Ip = "", Nick = "", Mode = ""; public long At; }
+        public const int Max = 200;
+        static readonly object gate = new object();
+        static List<Entry> list = new List<Entry>();
+        static volatile HashSet<string> uids = new HashSet<string>(), shs = new HashSet<string>(), sids = new HashSet<string>(),
+                                        ips = new HashSet<string>(), rooms = new HashSet<string>();
+        static string file;
+
+        public static void Load(string dir)
+        {
+            file = Path.Combine(dir, "blacklist.txt");
+            var l = new List<Entry>();
+            foreach (var raw in (Kv.ReadText(file) ?? "").Split('\n'))
+            {
+                var line = raw.TrimEnd('\r');
+                if (line.Length == 0 || line[0] == '#') continue;
+                var e = new Entry();
+                foreach (var part in line.Split('\t'))
+                {
+                    int eq = part.IndexOf('=');
+                    if (eq <= 0) continue;
+                    var v = part.Substring(eq + 1).Trim();
+                    switch (part.Substring(0, eq))
+                    {
+                        case "uid": e.Uid = v; break;
+                        case "sh": e.Sh = v; break;
+                        case "sid": e.Sid = v; break;
+                        case "ip": e.Ip = v; break;
+                        case "nm": e.Nick = v; break;
+                        case "mode": e.Mode = v; break;
+                        case "at": long.TryParse(v, out e.At); break;
+                    }
+                }
+                if (e.Uid.Length > 0 || e.Sh.Length > 0 || e.Sid.Length > 0 || e.Ip.Length > 0) l.Add(e);
+            }
+            lock (gate) { list = l; Rebuild(); }
+        }
+
+        // 收包线程只读这几个集合：整个换掉，不在原地改
+        static void Rebuild()
+        {
+            var u = new HashSet<string>(); var h = new HashSet<string>(); var s = new HashSet<string>(); var ip = new HashSet<string>(); var r = new HashSet<string>();
+            foreach (var e in list)
+            {
+                if (e.Uid.Length > 0) { u.Add(e.Uid); r.Add(Ident.RoomHash(e.Uid)); }
+                if (e.Sh.Length > 0) h.Add(e.Sh);
+                if (e.Sid.Length > 0) { s.Add(e.Sid); h.Add(Ident.SteamHash(e.Sid)); }
+                if (e.Uid.Length == 0 && e.Sh.Length == 0 && e.Sid.Length == 0 && e.Ip.Length > 0) ip.Add(e.Ip);
+            }
+            uids = u; shs = h; sids = s; ips = ip; rooms = r;
+        }
+
+        static void Save()
+        {
+            if (file == null) return;
+            var sb = new System.Text.StringBuilder("# PBZ_MP blacklist (HANDOVER 174): edit it in the in-game panel\n");
+            foreach (var e in list)
+                sb.Append("uid=").Append(e.Uid).Append("\tsh=").Append(e.Sh).Append("\tsid=").Append(e.Sid).Append("\tip=").Append(e.Ip)
+                  .Append("\tnm=").Append(e.Nick.Replace("\t", " ").Replace("\r", " ").Replace("\n", " ")).Append("\tmode=").Append(e.Mode)
+                  .Append("\tat=").Append(e.At).Append('\n');
+            try { Kv.WriteAtomic(file, sb.ToString()); } catch (Exception ex) { NetLog.W("黑名单写不进去：" + ex.Message); }
+        }
+
+        public static int Count { get { lock (gate) return list.Count; } }
+        public static List<Entry> Snapshot() { lock (gate) return new List<Entry>(list); }
+
+        // 拉黑一个对手；已经在名单里就补全标识。返回 false = 什么标识都没有（还没收到对方的包）
+        public static bool Add(Opp o)
+        {
+            if (!o.HasId) return false;
+            lock (gate)
+            {
+                Entry e = null;
+                foreach (var x in list)
+                    if ((o.Uid.Length > 0 && x.Uid == o.Uid) || (o.Sid.Length > 0 && x.Sid == o.Sid) || (o.Sh.Length > 0 && x.Sh == o.Sh)) { e = x; break; }
+                if (e == null)
+                {
+                    if (list.Count >= Max) list.RemoveAt(0);
+                    e = new Entry();
+                    list.Add(e);
+                }
+                if (o.Uid.Length > 0) e.Uid = o.Uid;
+                if (o.Sh.Length > 0) e.Sh = o.Sh;
+                if (o.Sid.Length > 0) e.Sid = o.Sid;
+                if (o.Ip.Length > 0) e.Ip = o.Ip;
+                if (o.Nick.Length > 0) e.Nick = o.Nick;
+                e.Mode = o.Mode;
+                e.At = (long)Link.UnixNow();
+                Rebuild();
+                Save();
+            }
+            return true;
+        }
+
+        public static bool Remove(int index)
+        {
+            lock (gate)
+            {
+                if (index < 0 || index >= list.Count) return false;
+                list.RemoveAt(index);
+                Rebuild();
+                Save();
+            }
+            return true;
+        }
+
+        // 收到的包（握手 / 状态包）是不是黑名单里的人发的
+        public static bool DeniesBody(string body)
+        {
+            var u = uids; var h = shs;
+            if (body == null || (u.Count == 0 && h.Count == 0)) return false;
+            var uid = Ident.Field(body, "uid");
+            if (uid != null && u.Contains(uid)) return true;
+            var sh = Ident.Field(body, "sh");
+            return sh != null && h.Contains(sh);
+        }
+        public static bool DeniesSteam(ulong id) { return id != 0 && (sids.Contains(id.ToString()) || shs.Contains(Ident.SteamHash(id))); }
+        public static bool DeniesIp(IPAddress ip) { var s = ips; return ip != null && s.Count > 0 && s.Contains(ip.ToString()); }
+        public static bool HidesRoom(string roomHash) { return !string.IsNullOrEmpty(roomHash) && rooms.Contains(roomHash); }
+        public static bool Has(Opp o)
+        {
+            if (o.Uid.Length > 0 || o.Sh.Length > 0 || o.Sid.Length > 0)
+                return (o.Uid.Length > 0 && uids.Contains(o.Uid)) || (o.Sid.Length > 0 && sids.Contains(o.Sid)) || (o.Sh.Length > 0 && shs.Contains(o.Sh));
+            return o.Ip.Length > 0 && ips.Contains(o.Ip);
+        }
+
+        // 主机回给被拒的人（签名照常，对方面板显示"被房主拒绝"）
+        public const string DenyBody = "PBZDENY\n";
+    }
+
+    // 举报：经大厅服务器记到服务端文件（服务端 --reports）。
+    //   PBZS|REPORT|<随机号>|<键=值，Tab 分开>  ← PBZS|RPTOK|<随机号> / PBZS|RPTERR|<随机号>|<原因 off / rate / bad>
+    // §181 作弊数据采样：举报收下（RPTOK）后，游戏给的摘要（一行 JSON）gzip + Base64 切片另发
+    //   PBZS|EVID|<随机号>|<片号>/<总片数>|<数据>   每片整包 ≤ 1000 字节、最多 8 片；服务端拼齐才落盘，回 PBZS|EVOK|<随机号>。
+    //   没回执整套重发，最多 3 轮；旧服务端不认 EVID、不回，举报本身照样算数。摘要超过 8 片就不发（游戏那边已限 4000 字节，不会超）
+    static class Reporter
+    {
+        public static volatile string Status = "";      // 给面板：空 / 正在发 / 结果
+        static volatile bool busy;
+
+        static string C(string s, int n)
+        {
+            s = (s ?? "").Replace("|", "/").Replace("\t", " ").Replace("\r", " ").Replace("\n", " ").Trim();
+            return s.Length > n ? s.Substring(0, n) : s;
+        }
+
+        internal static string Payload(Opp o, string why, string note, string myName, string myPid)
+        {
+            var kv = new[]
+            {
+                "ru=" + C(Ident.Uid, 16), "rsh=" + C(Ident.Sh, 16), "rnm=" + C(myName, 32), "rpid=" + C(myPid, 16), "rv=" + Proto.App,
+                "tu=" + C(o.Uid, 16), "tsh=" + C(o.Sh, 16), "tsid=" + C(o.Sid, 20), "tnm=" + C(o.Nick, 32), "tpid=" + C(o.Rk, 16), "tv=" + C(o.Ver, 12),
+                "mode=" + C(o.Mode, 12), "room=" + C(o.Room, 16), "mt=" + C(o.Mt, 40),
+                "dur=" + (long)(o.Last - o.First).TotalSeconds, "ago=" + (long)(DateTime.UtcNow - o.Last).TotalSeconds,
+                "why=" + C(why, 64), "note=" + C(note, 120),
+            };
+            return string.Join("\t", kv);
+        }
+
+        public const int EvPiece = 960, EvMax = 8;      // §181 每片 Base64 最多 960 字符（加上头不到 1000 字节）
+
+        // §181 摘要 → 分片包（gzip + Base64）；空 / 太大 → null
+        internal static List<byte[]> EvidencePackets(string nonce, string ev)
+        {
+            if (string.IsNullOrEmpty(ev)) return null;
+            byte[] gz;
+            using (var ms = new MemoryStream())
+            {
+                using (var z = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Compress, true))
+                {
+                    var raw = Kv.Utf8.GetBytes(ev);
+                    z.Write(raw, 0, raw.Length);
+                }
+                gz = ms.ToArray();
+            }
+            var b64 = Convert.ToBase64String(gz);
+            int n = (b64.Length + EvPiece - 1) / EvPiece;
+            if (n < 1 || n > EvMax) return null;
+            var list = new List<byte[]>();
+            for (int i = 0; i < n; i++)
+            {
+                var part = b64.Substring(i * EvPiece, Math.Min(EvPiece, b64.Length - i * EvPiece));
+                list.Add(Kv.Utf8.GetBytes("PBZS|EVID|" + nonce + "|" + (i + 1) + "/" + n + "|" + part));
+            }
+            return list;
+        }
+
+        public static bool Send(IPEndPoint server, Opp o, string why, string note, string myName, string myPid, string ev = "")
+        {
+            if (server == null) { Status = L.T("举报要经大厅服务器：先在系统设置里填大厅服务器", "Reports go through the lobby server: set it in System settings"); return false; }
+            if (busy) return false;
+            busy = true;
+            Status = L.T("正在发送举报…", "Sending the report...");
+            var nonce = Guid.NewGuid().ToString("N").Substring(0, 12);
+            var pkt = Kv.Utf8.GetBytes("PBZS|REPORT|" + nonce + "|" + Payload(o, why, note, myName, myPid));
+            Safe.Pool("report", delegate
+            {
+                string result = null;
+                try
+                {
+                    using (var u = new UdpClient(new IPEndPoint(NetBind.Addr, 0)))
+                    {
+                        bool okRpt = false;
+                        u.Client.ReceiveTimeout = 1500;
+                        for (int i = 0; i < 4 && result == null; i++)
+                        {
+                            try { u.Send(pkt, pkt.Length, server); } catch (Exception) { }
+                            var until = DateTime.UtcNow.AddSeconds(1.5);
+                            while (result == null && DateTime.UtcNow < until)
+                            {
+                                IPEndPoint from = null;
+                                byte[] d;
+                                try { d = u.Receive(ref from); } catch (Exception) { break; }
+                                var f = Kv.Utf8.GetString(d).Split('|');
+                                if (f.Length < 3 || f[0] != "PBZS" || f[2] != nonce) continue;
+                                if (f[1] == "RPTOK") { result = L.T("举报已提交，谢谢", "Report sent, thank you"); okRpt = true; }
+                                else if (f[1] == "RPTERR")
+                                {
+                                    var w = f.Length > 3 ? f[3] : "";
+                                    result = w == "off" ? L.T("这台大厅服务器没开举报", "This lobby server does not take reports")
+                                           : w == "rate" ? L.T("举报太频繁，过一会儿再试", "Too many reports, try again later")
+                                           : L.T("服务器没收下举报（", "The server refused the report (") + w + L.T("）", ")");
+                                }
+                            }
+                        }
+                        if (okRpt) { Status = result; SendEvidence(u, server, nonce, ev); }    // 面板先显示举报结果，摘要后台接着发
+                    }
+                }
+                catch (Exception ex) { result = L.T("举报发不出去：", "Could not send the report: ") + ex.Message; }
+                Status = result ?? L.T("大厅服务器没回应（旧版服务器不收举报）", "The lobby server did not answer (older servers take no reports)");
+                NetLog.W("举报：" + Status);
+                busy = false;
+            });
+            return true;
+        }
+
+        // §181 发摘要分片，等 EVOK；结果只写日志（静默，面板只显示举报本身的结果）
+        static void SendEvidence(UdpClient u, IPEndPoint server, string nonce, string ev)
+        {
+            List<byte[]> pk;
+            try { pk = EvidencePackets(nonce, ev); }
+            catch (Exception ex) { NetLog.W("举报：对局数据打包失败 " + ex.Message); return; }
+            if (pk == null) { if (!string.IsNullOrEmpty(ev)) NetLog.W("举报：对局数据太大，没发"); return; }
+            for (int round = 0; round < 3; round++)
+            {
+                foreach (var p in pk) { try { u.Send(p, p.Length, server); } catch (Exception) { } Thread.Sleep(5); }
+                var until = DateTime.UtcNow.AddSeconds(1.5);
+                while (DateTime.UtcNow < until)
+                {
+                    IPEndPoint from = null;
+                    byte[] d;
+                    try { d = u.Receive(ref from); } catch (Exception) { break; }
+                    var f = Kv.Utf8.GetString(d).Split('|');
+                    if (f.Length >= 3 && f[0] == "PBZS" && f[1] == "EVOK" && f[2] == nonce)
+                    {
+                        NetLog.W("举报：对局数据已送达（" + pk.Count + " 片）");
+                        return;
+                    }
+                }
+            }
+            NetLog.W("举报：对局数据没有回执（旧服务器不收，或丢了）");
+        }
+    }
 }

@@ -28,7 +28,7 @@ namespace PbzLobby
     {
         // 联机程序之间的协议版本：1 = v0.20.x 及以前（状态包里没有 pv=）；2 = v0.22.0 起（可靠事件 + 签名）
         public const int Version = 2;
-        public const string App = "0.30.3";        // 和 main.lua 的 VERSION 一致
+        public const string App = "0.32.0";        // 和 main.lua 的 VERSION 一致
         public const double MaxSkewSec = 120.0;    // 签名时间戳和本机时钟最多差 2 分钟
     }
 
@@ -43,6 +43,12 @@ namespace PbzLobby
         public volatile int PeerProto;              // 0 = 还不知道；1 = 旧版（状态包没有 pv=）
         long lastHelloTicks;                        // §85.5 最近一次收到对方会话握手（PBZHELLO 带 pv=）的时间（UTC Ticks）
         public volatile string HelloNick;           // §85.5 对方握手里的昵称（nm=，旧版没有）
+        // §174 拉黑：主机设 Gate（Blacklist.DeniesBody），黑名单里的人发来的包丢掉、回一个签过名的 PBZDENY；
+        // 被拒的一方收到后记下时间（Denied：面板显示"被房主拒绝"，主程序断开）。PeerUid / PeerSh = 对方握手 / 状态包里的标识
+        public Func<string, bool> Gate;
+        public long DeniedOut;
+        DateTime denyAt, deniedAt;
+        public volatile string PeerUid, PeerSh;
         DateTime atBad, atTime, atUnsigned, atSigned, atNakNosig, atNakSig, atNakBad, atNakTime;
         readonly Dictionary<string, DateTime> nakAt = new Dictionary<string, DateTime>();
 
@@ -104,6 +110,24 @@ namespace PbzLobby
 
         // 收到的包：验签，返回原来的包；拒收 / 拒收通知返回 null。reply 用来回拒收通知（可以为 null）
         public string Verify(byte[] d, int off, int len, Action<byte[]> reply)
+        {
+            var body = VerifyRaw(d, off, len, reply);
+            var g = Gate;
+            if (body == null || g == null || !g(body)) return body;
+            Deny(reply);
+            return null;
+        }
+
+        // §174 拒一个包：回 PBZDENY（每 0.5 秒最多一个）
+        public void Deny(Action<byte[]> reply)
+        {
+            DeniedOut++;
+            if (reply == null || (DateTime.UtcNow - denyAt).TotalSeconds <= 0.5) return;
+            denyAt = DateTime.UtcNow;
+            try { reply(Seal(Blacklist.DenyBody)); } catch (Exception) { }
+        }
+
+        string VerifyRaw(byte[] d, int off, int len, Action<byte[]> reply)
         {
             if (Starts(d, off, len, "PBZNAK|")) { OnNak(Kv.Utf8.GetString(d, off, len)); return null; }
             if (!Starts(d, off, len, "PBZSIG|"))
@@ -169,6 +193,7 @@ namespace PbzLobby
         {
             if (body.StartsWith("PBZEV\n", StringComparison.Ordinal)) { if (Rel != null) Rel.OnEvents(body); return true; }
             if (body.StartsWith("PBZACK\n", StringComparison.Ordinal)) { if (Rel != null) Rel.OnAck(body); return true; }
+            if (body.StartsWith("PBZDENY", StringComparison.Ordinal)) { deniedAt = DateTime.UtcNow; return true; }     // §174
             bool hello = body.StartsWith("PBZHELLO", StringComparison.Ordinal);
             if (hello && body.IndexOf("\npv=", StringComparison.Ordinal) < 0) return true;   // 打洞 / 旧版的握手：看不出版本
             if (!hello && body.IndexOf("\nseq=", StringComparison.Ordinal) < 0) return false;
@@ -177,6 +202,10 @@ namespace PbzLobby
             PeerProto = p != null && int.TryParse(p, out pv) ? pv : 1;
             var av = Field(body, "av");
             if (av != null && av.Length > 0) PeerApp = av;
+            var uid = Field(body, "uid");       // §174
+            if (uid != null && uid.Length > 0) PeerUid = uid;
+            var sh = Field(body, "sh");
+            if (sh != null && sh.Length > 0) PeerSh = sh;
             if (hello)
             {
                 System.Threading.Interlocked.Exchange(ref lastHelloTicks, DateTime.UtcNow.Ticks);
@@ -196,10 +225,14 @@ namespace PbzLobby
             }
         }
 
+        // §174 最近 10 秒收到过主机的 PBZDENY
+        public bool Denied { get { return (DateTime.UtcNow - deniedAt).TotalSeconds < 10; } }
+
         // 给窗口看的一句提示（空 = 一切正常）。只看最近 5 秒发生的问题。brief = 游戏内面板用的短句（一行只放得下 30 来个字）
         public string Hint(bool brief = false)
         {
             var now = DateTime.UtcNow;
+            if (Denied) return brief ? L.T("被房主拒绝", "REFUSED BY THE HOST") : L.T("被房主拒绝（你在对方的黑名单里）", "Refused by the host (you are on their blacklist)");
             Func<DateTime, bool> recent = t => (now - t).TotalSeconds < 5;
             if (recent(atTime) || recent(atNakTime))
                 return brief ? L.T("两边时钟差超过 2 分钟，包被拒收", "CLOCKS DIFFER BY OVER 2 MIN")

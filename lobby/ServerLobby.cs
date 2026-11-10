@@ -266,6 +266,8 @@ namespace PbzLobby
         public string Error { get { return error; } }
         public int LocalPort { get { return ((IPEndPoint)udp.Client.LocalEndPoint).Port; } }
         public string PeerStr { get { return relay ? L.T("经服务器中转", "via server relay") : (peer != null ? peer.ToString() : ""); } }
+        // §174 对方的 IP（直连时；中转时看到的是服务器，不算）
+        public IPAddress PeerIp { get { var p = peer; return relay || p == null ? null : p.Address; } }
         // §130 诊断里写的（地址脱敏）
         public string PeerDiag { get { return relay ? "经服务器中转" : peer != null ? NetLog.Ip(peer) : "（还没有）"; } }
         public string ServerDiag
@@ -328,10 +330,19 @@ namespace PbzLobby
             Raw(b, peer);
         }
 
+        // §174.9 主机拉黑了正连着的对手：放掉这条连接、马上重新登记（不再等 3 秒没包才报"房间空了"）。
+        // 以前被拉黑的人立刻重新加入时，服务器还按"有人"回 full，客机卡在"连接中"、收不到拒绝（test_blacklist ② 偶发失败）。
+        // 命令线程只置标记，收包线程（这里）来做，免得和 Pump 抢字段
+        public volatile bool KickReq, Kicked;
         public int Pump()
         {
             var now = DateTime.UtcNow;
             int got = 0;
+            if (KickReq)
+            {
+                KickReq = false;
+                if (host && (peer != null || relay)) { DropPeer(); lastReg = DateTime.MinValue; Kicked = true; NetLog.W("拉黑：放掉当前对手，马上重新登记房间"); }
+            }
             while (true)
             {
                 int avail;
@@ -361,6 +372,8 @@ namespace PbzLobby
                     text = wire.Verify(data, 0, data.Length, b => Raw(b, to));
                     if (text == null) continue;
                 }
+                // §174 主机：黑名单里只有 IP 的那几条按地址拒（打洞包也不回）
+                if (host && Blacklist.DeniesIp(from.Address)) { var to2 = from; wire.Deny(b => Raw(b, to2)); continue; }
                 if (!known && (text.StartsWith("PBZHELLO") || text.Contains("hello=1") || text.Contains("seq=")))
                 {
                     peer = from;
@@ -369,6 +382,9 @@ namespace PbzLobby
                     NetLog.W("客机用 IP 直连进来：" + NetLog.Ip(from) + "（第一个包 " + Link.Head(text) + "）");
                 }
                 if (!from.Equals(peer) && !cands.Contains(from)) continue;
+                // §174.9 客机还没锁定对端时主机回的 PBZDENY（验过签、来自候选地址）也要认：被拉黑后再加入，
+                // 主机只回拒绝、不回带 ack=1 的打洞包，下面的 ack 判断会把它当没通的打洞包跳过 → 客机一直卡在"连接中"
+                if (!host && peer == null && text.StartsWith("PBZDENY", StringComparison.Ordinal)) { wire.Control(text); continue; }
                 if (peer == null)
                 {
                     // 客机要确认是双向通的：主机的打洞包带 ack=1（= 主机收到过我们的包）或已经是状态包才算直连。
@@ -530,6 +546,7 @@ namespace PbzLobby
                           : why == "noranked" ? L.T("这台大厅服务器没开武林盟主排位", "This lobby server has no ranked mode")
                           : why == "unknown" ? L.T("排位账号还没登记上，稍等几秒", "Ranked account not registered yet, wait a few seconds")
                           : why == "ranked" ? L.T("这是武林盟主排位房间：用\"武林盟主\"方式加入", "This is a ranked room: join it from Ranked")
+                          : why == "banned" ? L.T("你被这台大厅服务器禁止参加武林盟主", "You are banned from ranked play on this lobby server")     // §174
                           : L.T("大厅服务器报错：", "Lobby server error: ") + why;
                     break;
                 case "RELAYOK":
@@ -612,7 +629,8 @@ namespace PbzLobby
                 if (!regLogged) { regLogged = true; NetLog.W("开始登记房间：大厅服务器 " + ServerDiag + "，本机内网 " + NetLog.Ip(LobbyServer.LocalAddr(LocalPort)) + "，允许中转 " + (AllowRelay ? "是" : "否") + "（每 2 秒一次）"); }
                 Raw("PBZS|REG|" + key + "|" + LobbyServer.Clean(name) + "|" + LobbyServer.Clean(MapOf()) + "|" + (full ? "1" : "0")
                     + "|" + LobbyServer.LocalAddr(LocalPort) + "|" + (AllowRelay ? "1" : "0")
-                    + (RankPid != null ? "|1|" + RankPid + "||" : "|0|||") + (SpecCfg.Max > 0 ? "1" : "0") + "|" + SpecCfg.Max + "|" + (AiRoom ? "1" : "0"), server);     // §141 第 12 段 = 认观战（排位房间服务器不给看），第 13 段 = 人数上限
+                    + (RankPid != null ? "|1|" + RankPid + "||" : "|0|||") + (SpecCfg.Max > 0 ? "1" : "0") + "|" + SpecCfg.Max + "|" + (AiRoom ? "1" : "0")
+                    + "|" + Ident.MyRoomHash, server);     // §141 第 12 段 = 认观战（排位房间服务器不给看），第 13 段 = 人数上限；§174 第 15 段 = 主机标记
                 if (lastFromServer == DateTime.MinValue ? (now - attemptAt).TotalSeconds > 5 : ServerQuiet)
                     error = L.T("大厅服务器没回应：", "The lobby server is not answering: ") + LobbyServer.Show(ServerName, server);
             }

@@ -23,7 +23,7 @@ namespace PbzLobby
         const double ResDmg = 400, ResDelay = 0.4;                        // 你砍中它一刀扣 400；回报晚 0.4 秒（刀落下才判定）
         const double TouchWait = 1.5, TouchDelay = 0.1;                   // §107 等你的刀碰到它最多 1.5 秒，没碰到 = 落空；碰到后 0.1 秒回报
         const double DmgWait = 0.5;                                       // §115 中招后等模组 td= 报伤害最多 0.5 秒，还没有就按 400
-        static readonly double[] DmSteps = { 50, 75, 100, 150, 200, 300 };   // §86 伤害倍率档位（同 main.lua NET.DM_STEPS）
+        static readonly double[] DmSteps = { 10, 20, 30, 40, 50, 75, 100, 150, 200, 300 };   // §86 伤害倍率档位（同 main.lua NET.DM_STEPS）
         const double AiAir = 0.15, HopVz = 750, HopG = 1800, HopLead = 0.25;
 
         static readonly string[][] Combos = {

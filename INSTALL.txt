@@ -191,6 +191,8 @@ Players who tested and reported bugs (Bilibili):
   絡訸
   化境
   一一清梦以及他的小伙伴们
+  伊格尼斯
+  、 (yes, that's the name)
 
 
 Uninstall: delete the Mods\PBZ_MP folder (and the line in mods.txt if

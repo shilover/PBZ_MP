@@ -76,6 +76,8 @@ lobby\aot\build_aot.bat
 - 絡訸
 - 化境
 - 一一清梦以及他的小伙伴们
+- 伊格尼斯
+- 、（你没看错）
 
 ### 许可证
 [GPL-3.0](LICENSE)；大厅服务器 `server/` 单独用 [AGPL-3.0](server/LICENSE)（改过的服务端对外提供服务，要向玩家提供源码）。
@@ -187,6 +189,8 @@ Players who tested the mod and reported bugs (on Bilibili):
 - 絡訸
 - 化境
 - 一一清梦以及他的小伙伴们
+- 伊格尼斯
+- 、 (yes, that's the name)
 
 ### License
 [GPL-3.0](LICENSE). The lobby server in `server/` is licensed separately under [AGPL-3.0](server/LICENSE): if you run a modified server for others, you must offer them its source.
