@@ -2645,6 +2645,17 @@ NET.FLAG_KEYS[#NET.FLAG_KEYS + 1] = "cs"
 NET.FLAG_DEF.cs, NET.flagCfg.cs = 1, 1
 NET.FLAG_NAME.cs = { "作弊数据采样", "CHEAT DATA SAMPLING" }
 NET.FLAG_RKFIX = { cs = 1 }
+-- §216 三个原来挂在"武器平衡"下面的限制拆成单独的房间设置（用户 11-10"火枪cd，回避减杀气，瞬影cd 都增加到设置里。普通房间默认关闭"）：
+--   gcd = 紫冥剑火枪冷却（§184，秒数 cooldown.ZiMingJian_HuoQiang）、dgc = 闪避扣杀气（§200.10，cost.Dodge / SnakeDodge）、
+--   sycd = 瞬影冷却（§200 / §200.13，cooldown.ShunYingDodge）。普通房间默认关；武林盟主默认开（NET.RK_DEF，服务器 rkrules 可以写 0 关）。
+--   不再看武器平衡开关（数值还是取平衡表 / 下发的 cd= / co=）；切武器保持杀气（§200.11）和火枪每发点数（§212）仍归武器平衡
+for _, k in ipairs({ "gcd", "dgc", "sycd" }) do
+    NET.FLAG_KEYS[#NET.FLAG_KEYS + 1] = k
+    NET.FLAG_DEF[k], NET.flagCfg[k] = 0, 0
+end
+NET.FLAG_NAME.gcd = { "紫冥剑火枪冷却", "ZIMINGJIAN GUN COOLDOWN" }
+NET.FLAG_NAME.dgc = { "闪避扣杀气", "DODGE COSTS SHACHI" }
+NET.FLAG_NAME.sycd = { "瞬影冷却", "FLASH STEP COOLDOWN" }
 function NET.flagLoad()
     local t = fileReadKV(NET.AB_FILE) or {}
     for _, k in ipairs(NET.FLAG_KEYS) do
@@ -4603,6 +4614,7 @@ CFG.init()
 -- lobby.txt 在 NETUI 段才读得到（netuiRead），这里先放个空的，那边换掉
 NET.RK_DEF = { bo = 3, dm = 100, ab = 0, ctr = 1, bal = 0, med = 1, npos = 1, std = 0, ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 0, accn = 3 }   -- §176 accn 生效饰品数量：服务器 rkrules 的 accn=（moecn 写明 3，§169.5），不发也按 3（武林盟主默认只生效前 3 件）；禁用名单走 rkrules 的 accban=（§179.4，NET.rkAccBan）；§170.1 acc 饰品等级：服务器不发就是原样；§169 std 标准数值：服务器发 std=1 就开，不发就关（以前不在表里，排位写死关）；§113 ult0 / sp0 / resm：服务器不发就是 0 / 3 / 每场（§113.3）；§113.4 ultx 获取倍率 100%；§138 npos 对手位置严格跟随（以前不在表里：排位跟主机自己的设置，固定规则页还误显示"关"）
 NET.RK_DEF.tl = 180      -- §173 武林盟主回合时限：服务器不发 tl= 就是 180 秒
+NET.RK_DEF.gcd, NET.RK_DEF.dgc, NET.RK_DEF.sycd = 1, 1, 1     -- §216 武林盟主：火枪冷却 / 闪避扣杀气 / 瞬影冷却服务器不发就开（和以前跟着 bal=1 一样）
 NET.rkLobby = function() return nil end
 NET.rkCache = {}
 function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }；空 / 一个认识的键都没有 → nil
@@ -9009,8 +9021,8 @@ GCD = { KEY = "ZiMingJian_HuoQiang", CAP = 3.0, SCAN = 0.25, SEEN_FROM = 0.3, SA
 function GCD.log(...)
     if GCD.logs < GCD.LOGS then GCD.logs = GCD.logs + 1; out(...) end
 end
-function GCD.sec()            -- 冷却秒数：不在对局里 / 武器平衡关着 = 0（不管）；平衡表 cooldown 里没写 = 0
-    if MATCH.role == nil or not BAL.active() then return 0 end
+function GCD.sec()            -- 冷却秒数：不在对局里 / 房间设置"紫冥剑火枪冷却"关着（§216）= 0（不管）；平衡表 cooldown 里没写 = 0
+    if MATCH.role == nil or not (BAL.on and NET.flagNow("gcd")) then return 0 end
     return BAL.COOLDOWN[GCD.KEY] or 0
 end
 function GCD.reset(why)
@@ -9298,14 +9310,16 @@ function DCD.keyOf(n)
     return "Dodge"
 end
 function DCD.on() return MATCH.role ~= nil and MATCH.state == "fight" end
-function DCD.secKey(key)    -- 瞬影冷却秒数：不在交手里 / 武器平衡关着 = 0；表里没写 = 默认 10
-    if not DCD.on() or not BAL.active() then return 0 end
+function DCD.syOn() return BAL.on and NET.flagNow("sycd") end     -- §216 房间设置"瞬影冷却"（以前看武器平衡）
+function DCD.dgOn() return BAL.on and NET.flagNow("dgc") end      -- §216 房间设置"闪避扣杀气"（以前看武器平衡）
+function DCD.secKey(key)    -- 瞬影冷却秒数：不在交手里 / 房间设置"瞬影冷却"关着（§216）= 0；表里没写 = 默认 10
+    if not DCD.on() or not DCD.syOn() then return 0 end
     local v = BAL.COOLDOWN[key]
     if v == nil then v = DCD.DEF[key] end
     return v or 0
 end
-function DCD.costOf(n)      -- 普通闪避这一段扣多少杀气：不在交手里 / 武器平衡关着 / 不是普通闪避 = 0
-    if DCD.kind(n) ~= "dg" or not DCD.on() or not BAL.active() then return 0 end
+function DCD.costOf(n)      -- 普通闪避这一段扣多少杀气：不在交手里 / 房间设置"闪避扣杀气"关着（§216）/ 不是普通闪避 = 0
+    if DCD.kind(n) ~= "dg" or not DCD.on() or not DCD.dgOn() then return 0 end
     return BAL.cost(DCD.keyOf(n))
 end
 function DCD.reset(why)
@@ -9389,8 +9403,9 @@ end
 -- netSend 看到我新出现的技能时调：普通闪避扣杀气、照发（返回 false）；瞬影冷却中拦了返回 true（调用方不发这招）
 function DCD.check(p1, n, act, tn)
     local k = DCD.kind(n)
-    if not k or not DCD.on() or not BAL.active() then return false end
-    if k == "dg" then DCD.charge(p1, n, tn); return false end
+    if not k or not DCD.on() then return false end
+    if k == "dg" then if DCD.dgOn() then DCD.charge(p1, n, tn) end; return false end
+    if not DCD.syOn() then return false end
     local s = DCD.me.sy
     s.blocked = s.blocked or {}
     local why
@@ -9460,7 +9475,7 @@ function DCD.hintRows(tn)
 end
 -- ③ 替身：对方发来的瞬影在对方冷却里（按收到的事件算）就不放，返回 true；普通闪避不挡
 function DCD.puppet(e, tn)
-    if DCD.kind(e.name) ~= "sy" or not DCD.on() or not BAL.active() then return false end
+    if DCD.kind(e.name) ~= "sy" or not DCD.on() or not DCD.syOn() then return false end
     local y = DCD.op.sy
     local why
     if y.at and (y.sec or 0) > 0 and tn < y.at + y.sec - DCD.TOL then
@@ -9639,6 +9654,7 @@ local function netSend(p1, tn)
         .. "npos=" .. NET.flagCfg.npos .. "\n"  -- §128.2 我的"对手位置严格跟随"设置（只有主机的算数）
         .. "std=" .. NET.flagCfg.std .. "\n"    -- §144 我的"标准数值"设置（只有主机的算数）
         .. "cs=" .. NET.flagCfg.cs .. "\n"      -- §181 我的"作弊数据采样"设置（只有主机的算数）
+        .. "gcd=" .. NET.flagCfg.gcd .. "\ndgc=" .. NET.flagCfg.dgc .. "\nsycd=" .. NET.flagCfg.sycd .. "\n"   -- §216 我的火枪冷却 / 闪避扣杀气 / 瞬影冷却设置（只有主机的算数）
         .. "cfgh=" .. CFG.wire() .. "\n"       -- §158 我的数值表哈希（只有主机的算数；客机对不上就来要）
         .. "rfp=" .. RFP.wire() .. "\n"       -- §210 这一场的规则指纹（对方比；联机程序排位时报给服务器）
         .. "ult0=" .. NET.resCfg.ult0 .. "\nsp0=" .. NET.resCfg.sp0 .. "\nresm=" .. NET.resCfg.resm .. "\n"   -- §113 我的开局精纯杀气 / 暗源 / 每场每局（只有主机的算数）
@@ -11666,6 +11682,9 @@ local function matchRows(tn)
         if MATCH.flags and MATCH.flags.ctr == false then rules[#rules + 1] = T("无红蓝光反击", "NO RED/BLUE COUNTERS") end   -- §105.3
         if MATCH.flags and MATCH.flags.bal then rules[#rules + 1] = T("武器平衡", "WEAPON BALANCE") end                     -- §106.5
         if MATCH.flags and MATCH.flags.med == false then rules[#rules + 1] = T("禁用血瓶", "NO POTIONS") end                -- §108
+        if MATCH.flags and MATCH.flags.gcd then rules[#rules + 1] = T("火枪冷却", "GUN COOLDOWN") end                     -- §216
+        if MATCH.flags and MATCH.flags.dgc then rules[#rules + 1] = T("闪避扣杀气", "DODGE COSTS SHACHI") end             -- §216
+        if MATCH.flags and MATCH.flags.sycd then rules[#rules + 1] = T("瞬影冷却", "FLASH STEP COOLDOWN") end             -- §216
         if STD.active() then rules[#rules + 1] = T("标准数值", "STANDARD STATS") end
         do local am = ACC.mode(); if am ~= 0 then rules[#rules + 1] = T("饰品" .. ACC.MODE_NAME[am], "ACCESSORIES " .. ({ "UNREFINED", "FULLY REFINED", "DISABLED" })[am]) end end   -- §170.1                                         -- §144
         do local an = ACC.limitNow(); if an < 6 then rules[#rules + 1] = string.format(T("饰品只生效前 %d 件", "FIRST %d ACCESSORIES ONLY"), an)
@@ -12046,6 +12065,7 @@ RFP = { WAIT = 3.0, F = 1, mid = nil, fp = nil, text = nil, at = 0, peer = nil, 
         NAME = { bo = { "局数", "BEST OF" }, dm = { "伤害倍率", "DAMAGE" }, ab = { "全部可格挡", "ALL BLOCKABLE" }, tl = { "回合时限", "TIME LIMIT" },
                  ctr = { "红蓝光反击", "COUNTERS" }, bal = { "武器平衡", "WEAPON BALANCE" }, med = { "血瓶", "POTIONS" },
                  npos = { "对手位置严格跟随", "STRICT FOLLOW" }, std = { "标准数值", "STANDARD STATS" }, cs = { "作弊数据采样", "CHEAT SAMPLING" },
+                 gcd = { "火枪冷却", "GUN COOLDOWN" }, dgc = { "闪避扣杀气", "DODGE COST" }, sycd = { "瞬影冷却", "FLASH STEP CD" },
                  ult0 = { "开局精纯杀气", "START ULT" }, ultx = { "精纯杀气获取", "ULT GAIN" }, sp0 = { "开局暗源", "START EDGE" },
                  resm = { "资源每场 / 每局", "RESOURCE RESET" }, acc = { "饰品等级", "ACCESSORY LEVEL" }, accn = { "生效饰品数量", "ACCESSORY LIMIT" },
                  accban = { "禁用饰品", "BANNED ACCESSORIES" }, wpnban = { "禁用武器", "BANNED WEAPONS" }, edgeban = { "禁用影之武装", "BANNED EDGES" },
@@ -12061,7 +12081,7 @@ function RFP.build()
     local kv = { f = RFP.F, rk = NET.rkRules() and 1 or 0, bo = MATCH.toWin, dm = MATCH.dmPct, ab = MATCH.ab, tl = MATCH.tl or 0 }
     for k, v in pairs(MATCH.flags or {}) do kv[k] = v end
     for k, v in pairs(MATCH.res or {}) do if kv[k] == nil then kv[k] = v end end
-    local tbl = MATCH.flags and (MATCH.flags.bal or MATCH.flags.std)
+    local tbl = MATCH.flags and (MATCH.flags.bal or MATCH.flags.std or MATCH.flags.gcd or MATCH.flags.dgc or MATCH.flags.sycd)   -- §216 三个开关也取表里的秒数 / 杀气
     kv.cfg = tbl and (CFG.usedHash or CFG.localHash) or "-"      -- 武器平衡 / 标准数值都关着时数值表不影响伤害
     local ks = {}
     for k in pairs(kv) do ks[#ks + 1] = k end
@@ -13868,7 +13888,7 @@ end
 NETUI.ROOM_TOP = { "std", "bal", "acc", "accn", "accban", "wpnban", "edgeban" }      -- §176 生效饰品数量 / 禁用饰品跟在饰品后面；§180 禁用武器 / 影之武装再往下
 NETUI.ROOM_CATS = {
     { id = "match", zh = "对局", en = "MATCH", keys = { "bo", "dm", "bar", "tl", "cs" } },     -- §173 tl 回合时限；§181 cs 作弊数据采样
-    { id = "combat", zh = "战斗规则", en = "COMBAT", keys = { "ab", "ctr", "med" } },
+    { id = "combat", zh = "战斗规则", en = "COMBAT", keys = { "ab", "ctr", "med", "gcd", "dgc", "sycd" } },     -- §216
     { id = "res", zh = "开局资源", en = "STARTING RESOURCES", keys = { "ult0", "ultx", "sp0", "resm" } },
     { id = "spec", zh = "观战 / 排队", en = "SPECTATORS / QUEUE", spec = true },
 }
