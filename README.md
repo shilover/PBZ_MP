@@ -48,6 +48,8 @@
             └─ rec\               （空文件夹）
    ```
    注意是 `Mods\PBZ_MP\Scripts\main.lua`，不要解压成 `Mods\PBZ_MP\PBZ_MP\...` 多套一层。
+
+   ![把 PBZ_MP 文件夹放在 platform\steam\ue4ss\Mods](images/install_mods.png)
 2. 进游戏按 **Home** 打开联机面板，选连接方式，一边建房、一边加入
 3. 双方按 **F1** 准备，先赢 2 回合获胜
 
@@ -143,6 +145,8 @@ To find `<game folder>`: in your Steam library, right-click Phantom Blade Zero �
             └─ rec\               (empty folder)
    ```
    Make sure it's `Mods\PBZ_MP\Scripts\main.lua`, not `Mods\PBZ_MP\PBZ_MP\...` (an extra folder from unzipping is the most common mistake).
+
+   ![Put the PBZ_MP folder in platform\steam\ue4ss\Mods](images/install_mods.png)
 2. UE4SS loads the mod because of `enabled.txt`. To be safe you can also add the line `PBZ_MP : 1` to `Mods\mods.txt`.
 3. Updating: just overwrite. `net\` and `rec\` hold your settings and recordings; keep them.
 
