@@ -1,9 +1,9 @@
-# PBZ_MP — 影之刃零联机 mod（4net 官方示例）
+# PBZ_MP — 影之刃零联机 mod（4net 示例）
 
 [English below](#english)
 
 非官方的《影之刃零》（Steam 版，UE4SS）联机对战 mod：1v1、观战、多人（淘汰 / 积分 / 对决）、本地 AI 练习。
-它同时是 **[4net](https://github.com/shilover/fornet) 的官方示例**：一个已经有玩家在用的游戏 mod，是怎么搭在 4net 上的。
+它同时是 **[4net](https://github.com/shilover/fornet) 的示例**：一个已经有玩家在用的游戏 mod，是怎么搭在 4net 上的。
 
 > 本仓库 2026-11-16 起重新开始（旧历史已清掉）。这一版不带 Steam 相关插件、不带排位模式。
 > 本项目与 S-GAME / 《影之刃零》官方无关。
@@ -42,7 +42,7 @@ GPL-3.0（`LICENSE`）；`server/` 是 AGPL-3.0（`server/LICENSE`）。
 ## English
 
 An unofficial online-play mod for Phantom Blade Zero (Steam, UE4SS): 1v1, spectating, multiplayer modes, local AI practice.
-It is also the **official example for [4net](https://github.com/shilover/fornet)**: how a mod that real players already use is built on 4net.
+It is also an **example for [4net](https://github.com/shilover/fornet)**: how a mod that real players already use is built on 4net.
 This repository restarted on 2026-11-16 (old history removed). This edition has no Steam plugin and no ranked mode.
 Not affiliated with S-GAME or Phantom Blade Zero.
 
