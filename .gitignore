@@ -1,9 +1,0 @@
-*.exe
-*.dll
-*.pdb
-game_dir.txt
-mod/PBZ_MP/net/*
-!mod/PBZ_MP/net/.gitkeep
-mod/PBZ_MP/rec/*
-!mod/PBZ_MP/rec/.gitkeep
-mod/PBZ_MP/mp_probe.log
