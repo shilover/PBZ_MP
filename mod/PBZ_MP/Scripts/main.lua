@@ -6085,6 +6085,11 @@ local function enter(p1, s, tn, why)
         FMATCH.roundReset()     -- F4a：清这一回合的记录；第 1 回合把"准备"用掉（§110.12，实现在 fornet_match.lua）
         NET.streak = {}
         standUp(p1); standUp(puppet())
+        -- §364 倒计时开始：两边还在放的招式技能取消（用户 11-16"开打前放偃月刀大招、马上开战，大招第二刀还能放出来，没刷新掉"）
+        for _, who in ipairs({ { p1, "自己" }, { puppet(), "替身" } }) do
+            local okC, gone = pcall(G.cancelMoves, who[1])
+            if okC and gone and #gone > 0 then out("§364 倒计时取消%s还在放的招：%s", who[2], table.concat(gone, ",")) end
+        end
         local pos, yaw = spawnPoint()
         -- v0.26.0 强制归位只对 AI 对手（用户："主要是为了给 AI 在开战前保持一定距离，真人对战不需要"）：
         -- AI 只会跟着你走，不归位就贴着脸开打；真人自己会拉开距离，各自留在原地

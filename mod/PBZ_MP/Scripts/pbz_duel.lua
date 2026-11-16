@@ -468,6 +468,7 @@ local function applyLocalPhase(tn)
     if st == "cd" then
         fireMatchStart(mid)
         standBoth()                       -- §307 D8：下回合 cd 两人都站起来
+        if mp.cancelAllMoves then mp.cancelAllMoves("对决倒计时") end     -- §364 开打前放的招别带进交手
         DUEL.fellA, DUEL.fellB, DUEL.fellKey = nil, nil, nil
         DUEL.dtk, DUEL.dtkMid, DUEL.dtkRound = 0, mid, rd      -- §307 D5：新回合重新累计受伤
         if fighter then

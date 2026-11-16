@@ -2459,10 +2459,23 @@ function MP.buildArena()
     return { cx = l.X, cy = l.Y, cz = l.Z, radius = 600.0, yaw = yaw, auto = true }
 end
 
+-- §364 倒计时开始：自己和每个替身还在放的招式技能取消（开打前放的大招第二段带进交手，用户 11-16 偃月刀大招）
+function MP.cancelAllMoves(why)
+    local list = { { getP1(), "自己" } }
+    for pid, s in pairs(NETP.side) do list[#list + 1] = { s.pup, "替身 " .. tostring(pid) } end
+    for _, w in ipairs(list) do
+        if valid(w[1]) then
+            local okC, gone = pcall(G.cancelMoves, w[1])
+            if okC and gone and #gone > 0 then out("§364 %s：取消%s还在放的招 %s", why, w[2], table.concat(gone, ",")) end
+        end
+    end
+end
+
 enter = function(st, tn, why)
     local was = RULE.st
     RULE.st, RULE.at = st, tn
     if st == "cd" then
+        MP.cancelAllMoves("多人倒计时")       -- §364
         if ctx.onMatchEnd and RULE.matchStarted then
             ctx.onMatchEnd(RULE.activeMid or RULE.mid, "重新开始")
             RULE.matchStarted = false
@@ -4484,6 +4497,7 @@ do
             local p1 = getP1()
             if valid(p1) then G.standUp(p1) end
         end,
+        cancelAllMoves = function(why) MP.cancelAllMoves(why) end,     -- §364 对决倒计时用
         fallPeer = function(pid)
             local s = NETP.side[pid]
             if s and valid(s.pup) and not s.fallen then

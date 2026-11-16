@@ -708,8 +708,11 @@ namespace ForNet
             // 要比 main.lua 的 EV_KEEP（1.5 秒）长，否则还在 ev 里的招式过期后会被当成新招再报一次中招；
             // §115 还在 td= 里的（大招打了好几秒）不过期，不然后几段没处记
             var old = new List<int>();
+            // §363 判完了、招还在 act= 里放（偃月刀大招：第一下拉人判中招 400，被拉开 3–4 秒后才砍下那一刀）别丢：
+            // 以前判完 3 秒就丢，后面那刀的 td= 找不到这条结果、整招只剩 400（用户 11-16"第一下打到，第二下砍刀没伤害"）
             foreach (var kv in answered)
-                if (tnow - Math.Max(kv.Value.Seen, kv.Value.Last) >= (kv.Value.Kind == null ? ActMax + 1.0 : kv.Value.Summon && kv.Value.Kind != "miss" ? SummonKeep : kv.Value.Late ? LateTouch : 3.0)) old.Add(kv.Key);   // §350 / §351 / §352 还没判的（act= 里还在放）别先丢了
+                if (tnow - Math.Max(kv.Value.Seen, kv.Value.Last) >= (kv.Value.Kind == null ? ActMax + 1.0 : kv.Value.Summon && kv.Value.Kind != "miss" ? SummonKeep : kv.Value.Late ? LateTouch : 3.0)
+                    && !(kv.Value.Kind != null && actInfo && acting.Contains(kv.Key) && tnow - kv.Value.Seen < ActMax + 1.0)) old.Add(kv.Key);   // §350 / §351 / §352 还没判的（act= 里还在放）别先丢了
             foreach (var k in old) answered.Remove(k);
             // §86 伤害倍率：游戏是主机，按它包里的 dm= 缩放你砍中 AI 的那 400（旧版 / 坏值 = 100%）
             double dm = Num(me, "dm", 100), dmg = ResDmg * (Array.IndexOf(DmSteps, dm) >= 0 ? dm : 100) / 100;
