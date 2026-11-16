@@ -1,0 +1,9 @@
+name=spec
+version=0.36.0
+title=观战
+titleEn=Spectate
+game=pbz
+needsFornet=0.3.0
+needs=base>=0.36.0
+entry=init.lua
+consent=@spec

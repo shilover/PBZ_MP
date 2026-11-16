@@ -1,0 +1,4 @@
+name=pbz
+entry=adapter.lua
+needsFornet=0.3.0
+title=影之刃零（游戏适配层）

@@ -1,0 +1,10 @@
+name=multi
+version=0.36.0
+title=多人
+titleEn=Multiplayer
+game=pbz
+needsFornet=0.3.0
+needs=base>=0.36.0
+wants=spec
+entry=init.lua
+consent=@mp

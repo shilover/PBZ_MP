@@ -1,0 +1,9 @@
+name=base
+version=0.36.0
+title=基础联机包
+titleEn=Base online package
+game=pbz
+needsFornet=0.3.0
+entry=init.lua
+order=10
+net=1
