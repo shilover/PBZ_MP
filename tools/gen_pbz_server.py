@@ -33,9 +33,9 @@ def build():
         sys.exit("fornet-lobby-server.mjs 里要正好一行 const WIRE_DEFAULTS … // @wire-defaults，找到 %d 行" % len(hits))
     lines[hits[0]] = PBZ_DEFAULTS
     out = {"pbz-lobby-server.mjs": "\n".join(lines)}
-    out["README.md"] = README_HEAD + io.open(os.path.join(SRC, "README.md"), encoding="utf-8").read()
-    if os.path.exists(os.path.join(SRC, "README.en.md")):
-        out["README.en.md"] = README_HEAD_EN + io.open(os.path.join(SRC, "README.en.md"), encoding="utf-8").read()
+    # 4net 的 README.md 是英文、README.zh.md 是中文（11-16 用户：GitHub 上默认英文）
+    out["README.md"] = README_HEAD_EN + io.open(os.path.join(SRC, "README.md"), encoding="utf-8").read()
+    out["README.zh.md"] = README_HEAD + io.open(os.path.join(SRC, "README.zh.md"), encoding="utf-8").read()
     out["LICENSE"] = io.open(os.path.join(SRC, "LICENSE"), encoding="utf-8").read()
     return out
 

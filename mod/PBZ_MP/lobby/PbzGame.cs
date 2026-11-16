@@ -17,6 +17,7 @@ namespace ForNet
             ModName = "PBZ_MP";
             TitleZh = "影之刃零 联机"; TitleEn = "Phantom Blade Zero - LAN Battle";
             GameZh = "影之刃零"; GameEn = "Phantom Blade Zero";
+            AppVersion = "0.34.3";     // §360.12 和 main.lua 的 VERSION 一致（以前写在 4net 的 Reliable.cs 里；make_release 会核对）
             ProcessName = "PBZ";
             BackupSave = PbzBackup.Run;
             RankedZh = "武林盟主"; RankedLongZh = "武林盟主排位"; RankedModeZh = "武林盟主（排位，经大厅服务器）";     // §360.9 提示文字里的排位名（4net 默认"排位"）

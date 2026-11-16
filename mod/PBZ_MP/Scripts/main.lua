@@ -21,7 +21,7 @@
 
 local UEHelpers = require("UEHelpers")
 
-local VERSION = "0.34.1"
+local VERSION = "0.34.3"
 local TAG = "[PBZ_MP] "
 -- v0.14.0：所有文件都放在模组自己的目录（…/Mods/PBZ_MP/），不再写死本机的游戏路径，别人的电脑上也能用。
 -- 从本脚本的路径推出模组目录（脚本在 PBZ_MP/Scripts/main.lua）；拿不到时退回 UE4SS 的工作目录（游戏 exe 所在的 platform/steam）下的相对路径
@@ -1395,7 +1395,7 @@ end
 -- 普通服务器大厅房间未手动改过的规则：默认按当前排位标准，不写盘；切回别的联机方式还原
 NET.SV_DEF = {
     dm   = 35,
-    flag = { med = 0, bal = 1, std = 1, gcd = 1, dgc = 1, sycd = 1, stg = 1, swk = 1 },
+    flag = { med = 0, bal = 1, std = 1, gcd = 1, dgc = 0, sycd = 1, stg = 1, swk = 0 },   -- 11-16 盟主关闪避扣杀气 / 切武器保持杀气
     res  = { ultx = 200, acc = 2, accn = 3, dif = 3 },
 }
 NET.svOn, NET.svMode = false, nil
@@ -2445,7 +2445,7 @@ local function suppressLocalReact()
     local pup = ST.secondPawn
     if not valid(pup) then return end
     if (ST.pupOwnFrames or 0) > 0 then ST.pupOwnFrames = ST.pupOwnFrames - 1 end
-    if not PEER.on then TOUCH.watchHp(pup, now()) end      -- §107（§223 观战替身不回报）
+    if not PEER.on then TOUCH.watchHp(pup, now()); TOUCH.keepShachi(pup) end      -- §107（§223 观战替身不回报）；§357 木桩不在本机破防
     local m = rawProp(pup, "Mesh")
     if not valid(m) then return end
     local okA, an = pcall(function() return m:GetAnimInstance() end)
@@ -2479,6 +2479,9 @@ local function suppressLocalReact()
     end
     for _, k in ipairs(SUPPRESS_PATTERNS) do
         if name:find(k, 1, true) then
+            if k ~= "_Hit_" and not PEER.on then TOUCH.markBreak(name, now()) end       -- §356 破防 / 挣脱也是碰到了
+            -- §353 本地 AI 交手中杀气按替身自己的：杀气打空是这边游戏判的破防，照播（真人那边是对方游戏判、发 brk=）
+            if k ~= "_Hit_" and AISYNC and AISYNC.ownShachi() then AISYNC.noteBreak(name); return end
             -- §104 受击 = 我的刀在本机碰到替身：按对手历史先播格挡 / 留着受击（破防类照旧一律掐掉，只听对方的 brk=）
             if k == "_Hit_" and not PEER.on then TOUCH.mark(now()) end      -- §107 碰到了（AI 对战据此回报）
             -- §299 多人：本机游戏给某个替身播了受击 = 我的招碰到了它（只认我自己最近 3 秒出过攻击招的时候；
@@ -2883,6 +2886,7 @@ local function netJudge(p1, tn)
     local shPrev = NET.prevSh
     NET.prevSh = shNow
     CAP.flush(NET.lastHit and NET.lastHit.r)          -- §199.9 被吃过跳伤的招结束了 → 记合计
+    YQX.fix(p1, tn)                                   -- §361 妖锯妖气爆发只留 5%（在早返回之前：爆发不一定落在招式窗口里）
     if #NET.judges == 0 and not NET.pendDef and not NET.lastHit
         and not (NET.fighting() and ST.summonArmAt and tn - ST.summonArmAt <= SUMD.FIELD_HOLD) then return end
     local hp = hpOf(p1)
@@ -3061,7 +3065,7 @@ local function applyRemoteResult(p1, r)
         end
         LO.zmHeal(p1, r.atk, r.v)
     else
-        out("◆ 你的第 #%d 招落空%s", r.atk, pr.note or "")
+        out("◆ 你的第 #%d 招落空%s%s", r.atk, pr.note or "", NET.rai and TOUCH.missNote(r.atk) or "")     -- §357 本地 AI：落空时离替身多远
     end
     NET.applied[r.kind] = (NET.applied[r.kind] or 0) + 1
 end
@@ -3206,6 +3210,22 @@ function TOUCH.mark(tn, d)
         TOUCH.dmg[id] = (TOUCH.dmg[id] or 0) + TOUCH.calc(id, d, tn)
     end
 end
+-- §356 本机游戏给替身播破防 / 破防挣脱（Break / MoTian_Dodge）= 我的刀碰到了它，只是没播 _Hit_、也不掉血。
+-- 以前只掐掉、不记 tc=，本地 AI 一律回报落空（11-16 内测 0.34.0：偃月刀 A 连 12 刀只算 2 刀，同一段"掐掉替身的本机反应"涨了 11 次）。
+-- 只认我 BRK_WIN 秒内出过攻击招；同一个动作每帧都会看到，隔 BRK_GAP 秒没看到破防动作 / 换了动作才算新的一次
+TOUCH.BRK_WIN, TOUCH.BRK_GAP, TOUCH.brkLogs = 1.5, 0.3, 0
+function TOUCH.markBreak(name, tn)
+    local fresh = name ~= TOUCH.brkName or tn - (TOUCH.brkSeen or -100) > TOUCH.BRK_GAP
+    TOUCH.brkName, TOUCH.brkSeen = name, tn
+    if not fresh then return false end
+    if not (NET.myAtkAt and tn - NET.myAtkAt <= TOUCH.BRK_WIN) then return false end
+    TOUCH.mark(tn)
+    if TOUCH.brkLogs < 30 then
+        TOUCH.brkLogs = TOUCH.brkLogs + 1
+        out("§356 替身在我这边破防 / 挣脱（%s）→ 算我第 #%d 招碰到了（本地 AI 据此回报）", name, TOUCH.srcId(tn))
+    end
+    return true
+end
 function TOUCH.calc(id, d, tn, isAi, prevDmg, inFight, capKey)
     if not d or d <= 0 then return 0 end
     local add = d * TOUCH.scale(id)
@@ -3262,6 +3282,55 @@ function TOUCH.watchHp(pup, tn)
     ST.pupHpSeen = h
     TOUCH.headStep(pup, tn, h)
     if AIF then AIF.step(pup, tn) end                    -- §217 本地 AI：替身身上的持续伤害钉住来源招
+end
+-- §357 驱动那边改替身血量之前先调：上次 watchHp 之后掉的血先记成碰到，再改。
+-- watchHp 在每帧循环里，按对方回报校正（recvOne）/ §301 写满（NET.drive）在驱动里（约 30 次 / 秒）；驱动先跑的那一帧，
+-- 刀落下掉的血被直接写回去、ST.pupHpSeen 也跟着改了，watchHp 永远看不到 → 没播 _Hit_ 的那刀（霸体 / 同名受击还在播）报落空
+function TOUCH.harvest(pup, tn, c)
+    if PEER.on then return end
+    c = c or hpOf(pup)
+    if c and ST.pupHpSeen and c < ST.pupHpSeen - 0.5 then
+        TOUCH.mark(tn, ST.pupHpSeen - c)
+        TOUCH.harvested = (TOUCH.harvested or 0) + 1
+        if TOUCH.harvested <= 20 or TOUCH.harvested % 50 == 0 then
+            out("§357 替身掉血 %.0f 在驱动改血量前补记成碰到（第 %d 次）", ST.pupHpSeen - c, TOUCH.harvested)
+        end
+    end
+    if c then ST.pupHpSeen = c end
+end
+-- §357 木桩 / 交手外的本地 AI：替身杀气每帧补（以前驱动每 10 拍 ≈ 0.33 秒补一次；偃月刀一刀扣 885 / 897，
+-- 两刀之间没补上就在本机破防 → 挣脱带无敌帧，后面几刀穿过去报落空）。真人对战 / §353 交手中按游戏自己的都不管
+TOUCH.SH_KEEP = 0.6
+function TOUCH.keepShachi(pup)
+    if not (NET.rai and ST.pupShMax) or PEER.on then return end
+    if AISYNC and AISYNC.ownShachi() then return end
+    local cur = attrOf(pup, "Shachi")
+    if cur and cur < ST.pupShMax * TOUCH.SH_KEEP then setAttr(pup, "Shachi", ST.pupShMax) end
+end
+-- §357 落空诊断：本地 AI 对手时，每拍记下我最近这招期间和替身的最近距离；AI 报落空时写进日志（找剩下的落空是不是够不着）
+TOUCH.dmin, TOUCH.DIST_WIN = {}, 3.0
+function TOUCH.distStep(p1, pup, tn)
+    if not NET.rai or PEER.on then return end
+    local id, at = NET.myAtkId, NET.myAtkAt
+    if not (id and at and tn - at < TOUCH.DIST_WIN) then return end
+    local okA, a = pcall(function() return pup:K2_GetActorLocation() end)
+    local okB, b = pcall(function() return p1:K2_GetActorLocation() end)
+    if not (okA and okB and a and b) then return end
+    local d = math.sqrt((a.X - b.X) ^ 2 + (a.Y - b.Y) ^ 2) / 100
+    local e = TOUCH.dmin[id]
+    if not e then
+        e = { d = d, at = tn, d0 = d }
+        TOUCH.dmin[id] = e
+        for k, v in pairs(TOUCH.dmin) do if tn - v.at > 30 then TOUCH.dmin[k] = nil end end
+    elseif d < e.d then e.d = d end
+    e.at = tn
+end
+function TOUCH.missNote(id)
+    local e = TOUCH.dmin[id]
+    if not e then return "" end
+    local pup = puppet()
+    local m = pup and montageOf(pup) or nil
+    return string.format("（诊断：出招时离替身 %.1f 米，这招期间最近 %.1f 米，替身动作 %s）", e.d0, e.d, (m and m ~= "") and tostring(m) or "无")
 end
 -- §207 本地 AI：L1+圈（瞬杀 / 裂斩 / 影杀）打 AI 只剩约一半（用户 11-10"跟 ai 打，L1+圈 几乎没伤害了"）。
 -- 原因：td= 按"替身本机掉的血 × 系数"算，替身本机血量 = AI 回报的血量；L1+圈 原版一刀 7000–8000（系数 0.14 / 0.15 就是按这个定的），
@@ -4712,6 +4781,7 @@ function NET.recvOne(p1, tn, t)
     -- 替身血量以对方回报为准（本机砍替身掉的血只是预测，会被这里覆盖）
     local rhp, rhpm = tonumber(t.hp), tonumber(t.hpm)
     if valid(pup) and rhp and rhp >= 0 then
+        TOUCH.harvest(pup, tn)                        -- §357 改血量 / 上限之前先把没看到的掉血记成碰到
         if rhpm and rhpm > 0 and math.abs((attrOf(pup, "Health_Max") or 0) - TOUCH.localHp(rhpm)) > 1 then setAttr(pup, "Health_Max", TOUCH.localHp(rhpm)) end   -- §207 本地 AI 临时加的那份带上
         local c = hpOf(pup)
         local full = TOUCH.fullOn()                   -- §301 本地 AI 交手中：替身本机写满，不写 AI 剩血
@@ -4729,6 +4799,7 @@ function NET.recvOne(p1, tn, t)
     -- §276（移植 0.33 分支 §269.3）杀气改走 sq=：§174 的身份字段也叫 sh=（SteamID 哈希），联机程序发包前把游戏的 sh= 整行删掉、换成身份那行 →
     -- §174 起对方的杀气从来没到过（黄条一直是替身自己的、每 10 帧补满 = 一直满）。不读 t.sh：那是身份哈希，全数字时会被当成杀气
     NET.rsh, NET.rshm = tonumber(t.sq), tonumber(t.shm)
+    NET.rsqp = t.sqp == "1"         -- §353 本地 AI：交手中替身杀气按游戏自己的（不补满），AI 跟着 psq= 走
     -- §223.6 观战替身：判定结果在 applyRemoteResult / LO.zmHeal 里自己不做；下面的房间设置照记（记进这个替身自己那份，
     -- NET.flag / resOf / accBanOf 观战时按主机那一路记下的，两个替身都按主机的规则，同真实对局）；会对外要东西 / 改共用状态的跳过
     NET.recvRules(t)
@@ -4944,7 +5015,8 @@ function NET.drive(p1, pup, tn)
     -- 替身的架势在本机保持满值：破防应由对方判定，不能被我本机的刀打出来（v0.9.5 日志里有本机 BreakEscape）
     if ST.ticks % 10 == 0 then
         local mx, cur = attrOf(pup, "Shachi_Max"), attrOf(pup, "Shachi")
-        if mx and cur and cur < mx then setAttr(pup, "Shachi", mx) end
+        ST.pupShMax = mx                                                  -- §357 每帧补杀气（TOUCH.keepShachi）用，省得每帧读上限
+        if mx and cur and cur < mx and not (AISYNC and AISYNC.ownShachi()) then setAttr(pup, "Shachi", mx) end   -- §353 本地 AI 交手中不补
         -- §113 暗源同理：对方放成功了才会发来，替身自己不在铃铛回复，以前打几局就耗光、影之武装放不出来
         local smx, scur = attrOf(pup, "SpiritShadow_Max"), attrOf(pup, "SpiritShadow")
         if smx and scur and scur < smx then setAttr(pup, "SpiritShadow", smx) end
@@ -4984,8 +5056,13 @@ function NET.drive(p1, pup, tn)
     local c = hpOf(pup)
     if c and c > 0 and NET.remoteHp and NET.remoteHp > 0 then
         local want = TOUCH.localCur(NET.remoteHp)                -- §207 / §301
-        if c < want - 1 then setAttr(pup, "Health", want) end
+        if c < want - 1 then
+            TOUCH.harvest(pup, tn, c)                            -- §357 写回去之前先把这次掉血记成碰到
+            setAttr(pup, "Health", want)
+            if not PEER.on then ST.pupHpSeen = want end
+        end
     end
+    TOUCH.distStep(p1, pup, tn)                                  -- §357 落空诊断（只在本地 AI、出招 3 秒内）
 end
 
 
@@ -5956,6 +6033,8 @@ end
 
 function NET.rulesEnd(p1, why)
     if not valid(p1) then p1 = getP1() end
+    local okC, errC = pcall(RT.endCleanse, p1, why or "对局结束")      -- §362 打完清 buff / debuff（妖气侵蚀等），先于饰品 / 标准数值还原
+    if not okC then out("!! §362 对局结束清状态失败：%s", tostring(errC)) end
     GCD.reset(why or "对局结束")      -- §184 火枪冷却清零
     DCD.reset(why or "对局结束")      -- §200 闪避冷却清零
     if valid(p1) then ACC.restore(p1) end          -- §170.1 饰品换回（§170.5 先于标准数值还原：还原的属性是饰品没换时记的）
@@ -7579,9 +7658,9 @@ function NETUI.wbanItems(kind, lb, items, toPage)
 end
 -- 11-16 用户"一键改成武林盟主模式的设置，直接加在任何房间设置中"：房间设置页"返回"上面一行，点两下（3 秒内）把本机房间设置整套写成盟主规则。
 -- 规则来源：联机程序拿到过的盟主规则（lobby.txt rkrules=，当前是武林盟主方式时才有）优先，没有就用下面这串
--- （= 排位服务端的 RULES；改盟主规则时这里一起改）；串里没写的键按 NET.RK_DEF（火枪冷却 / 闪避扣杀气 / 瞬影冷却 / 精防硬直开、逆天者）。
+-- （= 排位服务端的 RULES；改盟主规则时这里一起改）；串里没写的键按 NET.RK_DEF（火枪冷却 / 瞬影冷却 / 精防硬直开、逆天者；闪避扣杀气 / 切武器保持杀气 11-16 起串里写明关）。
 -- 只写本机 rules.txt（和逐项点一样，下一局生效）；客机 / 定死规则生效时不显示
-NET.RK_PRESET = "bo=3;dm=35;med=0;bal=1;ctr=1;ab=0;npos=1;ultx=200;std=1;ult0=0;sp0=3;resm=0;acc=2;accn=3;tl=180;accban=BreakRegen,MagicWeapon,AnimMovement"
+NET.RK_PRESET = "bo=3;dm=35;med=0;bal=1;ctr=1;ab=0;npos=1;ultx=200;std=1;ult0=0;sp0=3;resm=0;acc=2;accn=3;tl=180;dgc=0;swk=0;accban=BreakRegen,MagicWeapon,AnimMovement"
 function NET.rkPresetApply(lb)
     local src = lb and lb.rkrules and lb.rkrules ~= "" and lb.rkrules or NET.RK_PRESET
     local r = NET.rkParse(src) or NET.rkParse(NET.RK_PRESET)
@@ -7778,6 +7857,10 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
     local aiLevel = { label = T("AI 难度：", "AI LEVEL: ") .. (({ [0] = T("简单", "EASY"), T("普通", "NORMAL"), T("困难", "HARD"), T("测伤木桩", "TRAINING DUMMY") })[aiLv] or "?"),
                       act = function() netuiCmd("ailevel", "level=" .. ((aiLv + 1) % 4) .. "\n") end }     -- §342 第 4 档木桩（LocalAi.Levels 下标 3）
     local dstatBtn = { label = T("招式伤害统计…", "DAMAGE PER MOVE..."), act = page("dstat") }      -- §342
+    -- §354 AI 跟随你（存在 AI 装备里：netcfg aifol=，命令 aiload fol=）。关 = AI 原地不动、离多远都不瞬移到你面前（测距离 / 拉开打远程）
+    local aiFol = lb.aifol ~= "0"
+    local aiFollow = { label = T("AI 跟随你：", "AI FOLLOWS YOU: ") .. (aiFol and T("开", "ON") or T("关（原地不动、不瞬移）", "OFF (STAYS PUT)")),
+                       act = function() netuiCmd("aiload", "fol=" .. (aiFol and "0" or "1") .. "\n") end }
     -- §85 AI 对战时同时开房等真人（开关）+ 开房方式（开关开着才显示；按一下换下一种，跳过 ai）；
     -- 有人进来联机程序就停掉 AI、改成和他联机（lobby.txt 的 mode 跟着变成房间的方式）
     local roomOn, roomMode = lb.airoom == "1", lb.airoommode or "lan"
@@ -7805,6 +7888,7 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
                               act = function() NETUI.step(1) end }
         items[#items + 1] = { label = T("开始 AI 对战", "START AI BATTLE"), act = function() netuiCmd("host") end }
         items[#items + 1] = aiLevel
+        items[#items + 1] = aiFollow     -- §354
         items[#items + 1] = { label = T("AI 装备…", "AI LOADOUT..."), act = page("aiload") }     -- §114
         items[#items + 1] = dstatBtn
         aiRoomItems()
@@ -7820,6 +7904,7 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
     if lb.mode == "ai" and (lb.role or "none") ~= "none" then
         items[#items + 1] = { label = T("结束 AI 对战", "END AI BATTLE"), act = function() netuiCmd("stop") end }
         items[#items + 1] = aiLevel
+        items[#items + 1] = aiFollow     -- §354
         items[#items + 1] = { label = T("AI 装备…", "AI LOADOUT..."), act = page("aiload") }     -- §114
         items[#items + 1] = dstatBtn
         aiRoomItems()
@@ -10825,7 +10910,8 @@ bind(Key.INS, function() UIM.next("Insert") end, "界面三态")       -- §314 
 -- 全局表（最外层 local 已经很多，不再加）
 -- §342 招式伤害统计（base_dstat.lua；面板页 "dstat"，在本地 AI 那两页里进）
 -- §352 本地 AI 按真人那套：我还在放的招（act=）、替身挨打 / 被控（pst=）（base_aisync.lua）
-AISYNC = BASEPARTS.load("aisync", { out = function(...) return out(...) end, NET = NET, ST = ST, G = G, isAttackAbility = isAttackAbility })
+AISYNC = BASEPARTS.load("aisync", { out = function(...) return out(...) end, NET = NET, ST = ST, G = G, isAttackAbility = isAttackAbility,
+    attrOf = function(...) return attrOf(...) end })      -- §353 psq=：替身本机杀气
 DSTAT = BASEPARTS.load("dstat", { out = function(...) return out(...) end, NET = NET })     -- §342.4 T / 颜色模块里经 EXTCTX 现取（这里的 T / COL_* 是 nil）
 
 DIAG = BASEPARTS.load("diag", { ST = ST, NET_DIR = NET_DIR, G = G,
@@ -11050,6 +11136,8 @@ function BASEX.multiCtx()
                 hasAi = function() local X = EXTCTX; local N = X and X.NETUI; return N and N.lobby and N.lobby.hasai == "1" end,
                 aiLevel = function() local X = EXTCTX; local N = X and X.NETUI; return tonumber(N and N.lobby and N.lobby.ailevel) end,
                 myAtkInfo = function() local id = NET.myAtkId or 0; return id, NET.myAtkAt or 0, NET.evName and NET.evName[id] end,
+                -- §357 我最近这一招的技能还挂在我身上（还在放）：多人房 AI 掉血归属用，起手慢 / 后段才打到的招不再过了 0.6 秒就不算
+                myAtkLive = function() local n = NET.evName and NET.evName[NET.myAtkId or 0]; return n ~= nil and NET.prevAbs ~= nil and NET.prevAbs[n] ~= nil end,
                 calcTouch = function(id, d, tn, prevDmg, capKey) return TOUCH.calc(id, d, tn, true, prevDmg, true, capKey) end,
                 flushTouchCap = function(capKey, dmg) if AIF and AIF.flush then AIF.flush(capKey, dmg) end end,
                 -- ②d 多行提示（排名）：rows = { { 文字, "title" | "me" | "row" [, 字号] }, … }

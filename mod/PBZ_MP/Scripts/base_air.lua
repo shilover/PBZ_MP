@@ -217,29 +217,36 @@ end
 --   对方生效、替身没有 / 段不对 → 给替身上那一段的 GE（冰冻 → 攻击方出 Y；追击照常发 ev=，对方替身放冰冻突袭在他那边判，双开实测打得中）；
 --   对方没生效、替身有 → 跟着对方上的马上撤；本机自己积出来的等 grace（含往返）秒对方还没有就撤（对方确实中了的话 inf= 会先到）；
 --   替身的积累比对方多 → 压回对方的值（本机多积的是对方没认的刀）。旧版对方没有 inf= → 不动替身（和以前一样）
--- 类型表（资产名字表，HANDOVER §160.5）：lv[i] = 第 i 段 { 标签, 上的 GE, 撤时连带撤的 GE… }
+-- §355 严格只听挨打方（用户 11-16"替身进了冰冻然后还活蹦乱跳的"→"替身绝不自己进异常状态"，同马车 §269.15 的思路）：
+--   ① 替身在本机不积异常：对方发 inf= 时把替身的承受积累倍率 TakenReductionMultiplier_<res>（中性 1）写 0，本机砍替身不涨积累、
+--      攒不满就不会自己冻住（以前替身先冻住、出 Y，但位置照样跟着没冻的对方走 = "冻住还活蹦乱跳"，等 grace 才撤）；
+--      对方不发 inf=（本地 AI / 旧版）→ 写回 1（§237 替身复用给本地 AI 时 AI 要能被真冻住）。雷没有这个属性、混沌没有积累 → 照旧靠下面撤
+--   ② 替身身上有、对方没有的（不是跟着对方上的）马上撤，不再等 grace
+--   ③ 对方还在、替身那份 GE 自己到时间掉了 → 隔 REAPPLY 秒补上（以前"掉了也不补"→ 替身比真人先解冻）；同一次最多补 REAPPLY_MAX 回
+-- 类型表（资产名字表，HANDOVER §160.5）：lv[i] = 第 i 段 { 标签, 上的 GE, 撤时连带撤的 GE… }；res = 承受积累倍率属性的后缀
 INF = { ROOT = "CharacterState.StatusInfliction", GE_DIR = "/PBZCombatAsset/Prototypes/GameplayEffects/Inflictions/",
         EVERY = 3, ACC_EVERY = 9, GRACE = 0.15, GRACE_MAX = 0.6, ACC_SLACK = 1.0, LOG_MAX = 60, logs = 0,
+        REAPPLY = 0.3, REAPPLY_MAX = 20, immune = nil,
         st = { mirror = 0, strip = 0, clamp = 0 }, me = {}, pup = {}, r = nil,
         TYPES = {
-            { id = "frost", name = "冰冻", acc = "Frost_Accumulation",
+            { id = "frost", name = "冰冻", acc = "Frost_Accumulation", res = "FrostAccumulation",
               lv = { { "CharacterState.StatusInfliction.Frost.Effect", "GE_Frost" } } },
-            { id = "ignite", name = "点燃", acc = "Ignite_Accumulation",
+            { id = "ignite", name = "点燃", acc = "Ignite_Accumulation", res = "IgniteAccumulation",
               lv = { { "CharacterState.StatusInfliction.Ignite", "GE_Ignite" } } },
-            { id = "poison", name = "中毒", acc = "Poison_Accumulation",
+            { id = "poison", name = "中毒", acc = "Poison_Accumulation", res = "PoisonAccumulation",
               lv = { { "CharacterState.StatusInfliction.Poison.Phase0", "GE_Poison_Phase0" },
                      { "CharacterState.StatusInfliction.Poison.Phase1", "GE_Poison_Phase1" },
                      { "CharacterState.StatusInfliction.Poison.Phase2", "GE_Poison_Phase2" },
                      { "CharacterState.StatusInfliction.Poison.Phase3", "GE_Poison_Phase3" } } },
-            { id = "elec", name = "感电", acc = "Electrified_Accumulation",
+            { id = "elec", name = "感电", acc = "Electrified_Accumulation", res = "ElectrifiedAccumulation",
               lv = { { "CharacterState.StatusInfliction.Electrified", "GE_Electrified" } } },
-            { id = "bleed", name = "流血", acc = "Bleed_Accumulation",
+            { id = "bleed", name = "流血", acc = "Bleed_Accumulation", res = "BleedAccumulation",
               lv = { { "CharacterState.StatusInfliction.Bleed.Small", "GE_BleedSmall" } } },
             { id = "chaos", name = "混沌",
               lv = { { "CharacterState.StatusInfliction.Chaos", "GE_ChaosEffect", "GE_Chaos" } } },
             { id = "thunder", name = "雷", acc = "Thunder_Accumulation", lv = {} },
-            { id = "bburst", name = "血爆", acc = "BloodBurst_Accumulation", lv = {} },
-            { id = "water", name = "水", acc = "Water_Accumulation", lv = {} },
+            { id = "bburst", name = "血爆", acc = "BloodBurst_Accumulation", res = "BloodBurstAccumulation", lv = {} },
+            { id = "water", name = "水", acc = "Water_Accumulation", res = "WaterAccumulation", lv = {} },
         } }
 
 function INF.say(fmt, ...)
@@ -334,10 +341,46 @@ function INF.strip(pup, ty)
     return ok
 end
 
+-- §355 ① 替身不在本机积异常：on = true 把 TakenReductionMultiplier_<res> 写 0（每 ACC_EVERY 帧复查一次，被游戏重算回去就再写），
+-- on = false 写回 1。INF.immune = 写过 0 的那个替身的路径
+function INF.setImmune(pup, on)
+    local key = pathOf(pup)
+    if not on then
+        if INF.immune ~= key then return end
+        INF.immune = nil
+        for _, ty in ipairs(INF.TYPES) do
+            if ty.res then setAttr(pup, "TakenReductionMultiplier_" .. ty.res, 1.0) end
+        end
+        INF.say("  替身的异常积累倍率写回 1（对方不发 inf=：本地 AI / 旧版，替身照常在本机积；§355）")
+        return
+    end
+    if INF.immune == key and ST.ticks % INF.ACC_EVERY ~= 0 then return end
+    local wrote = {}
+    for _, ty in ipairs(INF.TYPES) do
+        if ty.res then
+            local a = "TakenReductionMultiplier_" .. ty.res
+            local v = attrOf(pup, a)
+            if v and v > 0.001 then
+                setAttr(pup, a, 0.0)
+                wrote[#wrote + 1] = string.format("%s %.2f→%s", ty.name, v, tostring(attrOf(pup, a)))
+            end
+        end
+    end
+    if INF.immune ~= key or #wrote > 0 then
+        INF.say("  替身不在本机积异常（只跟对方的 inf=；§355）：%s", #wrote > 0 and table.concat(wrote, "，") or "已经是 0")
+    end
+    INF.immune = key
+end
+
 -- 接收方每 EVERY 帧：替身的异常状态逐类型跟对方走。p.ours = 替身这次的状态是跟着对方的（对方一结束马上撤）
 function INF.step(pup, tn)
     local R = INF.r
-    if not R or REP.on or ST.ticks % INF.EVERY ~= 0 then return end
+    if REP.on or ST.ticks % INF.EVERY ~= 0 then return end
+    if not R then
+        if INF.immune then INF.setImmune(pup, false) end       -- §355 对方不发 inf=：替身照常在本机积
+        return
+    end
+    INF.setImmune(pup, true)                                   -- §355 ① 替身不在本机积
     local plv = INF.levels(pup)
     local readAcc = ST.ticks % INF.ACC_EVERY == 0
     for _, ty in ipairs(INF.TYPES) do
@@ -362,10 +405,17 @@ function INF.step(pup, tn)
             local key = r.n .. ":" .. r.lv
             if cur == r.lv then
                 p.ours, p.key = true, key
+            elseif p.key == key and cur == 0 and p.ours and (p.re or 0) < INF.REAPPLY_MAX
+                   and tn - (p.fixAt or -1e9) >= INF.REAPPLY then
+                -- §355 ③ 对方还在、替身那份到时间先掉了 → 补上（只认上成功过的那次：上不去的不反复试）
+                p.fixAt, p.re = tn, (p.re or 0) + 1
+                local ge = ty.lv[math.min(r.lv, #ty.lv)][2]
+                local ok = LO.applyGE(pup, INF.gePath(ge), "替身" .. ty.name)
+                INF.say("※ 对方还在%s，替身那份先掉了 → 补上 %s（这次第 %d 回）：%s", ty.name, ge, p.re, ok and "已上" or "上不去")
             elseif p.key ~= key or (cur > 0 and tn - (p.fixAt or -1e9) >= INF.grace()) then
                 -- 每次生效（每一段）只上一次，上不上去都不反复试（替身的 GE 先到时掉了也不补）；
                 -- 替身在别的段上（本机自己积到更重的中毒）→ 隔 grace 换回对方那一段
-                p.key, p.fixAt = key, tn
+                p.key, p.fixAt, p.re = key, tn, 0
                 if cur > 0 then INF.strip(pup, ty) end
                 local ge = ty.lv[math.min(r.lv, #ty.lv)][2]
                 local ok = LO.applyGE(pup, INF.gePath(ge), "替身" .. ty.name)
@@ -379,10 +429,7 @@ function INF.step(pup, tn)
             if p.ours then
                 why = "对方的结束了"
             else
-                p.localAt = p.localAt or tn
-                if tn - p.localAt >= INF.grace() then
-                    why = string.format("本机自己积出来的，对方没有（对方积累 %.0f，等了 %.2f 秒）", r.acc, tn - p.localAt)
-                end
+                why = string.format("本机自己上的，对方没有（对方积累 %.0f；§355 不等）", r.acc)   -- §355 ② 马上撤
             end
             if why then
                 local ok = INF.strip(pup, ty)
@@ -445,7 +492,17 @@ RT = { INV_GE = "/Game/PBZContent/Blueprint/FlowGraph/GameplayEffect/GE_FlowInvu
        shield = nil, taken = 0, hp = nil, round = 0, rtk = nil, info = nil, logs = 0,
        -- 不管有没有时限都撤的（INF 段的异常状态 GE + 持续伤害 / 积累标记，资产名字表 Prototypes/GameplayEffects/Inflictions/）
        FORCE = { GE_Ignite_Dot = true, GE_Poison_Dot_Phase1 = true, GE_Poison_Dot_Phase2 = true, GE_Poison_Dot_Phase3 = true,
-                 GE_Electrified_VFX = true, GE_Frost_HasAccumulation = true, GE_Thunder_HasAccumulation = true, GE_Suffocation = true } }
+                 GE_Electrified_VFX = true, GE_Frost_HasAccumulation = true, GE_Thunder_HasAccumulation = true, GE_Suffocation = true,
+                 -- §362 妖锯妖气（挨打方身上的侵蚀 + 引爆后约 3 秒的不可格挡标记，资源图 _tools/gasgraph/yaoju.json）：有没有时限都撤
+                 GE_YaoJu_Erosion = true, GE_YaoJu_Explode_CanNotDeflect = true,
+                 -- §362.1 其他挂在挨打方身上、DurationPolicy = Infinite 的 debuff（按时限规则撤不掉；bp_decode 读的资产，11-16）：
+                 -- 红妆鬼斩石蒜花毒（GuiTouBlade_Debuff* / InDebuffArea*）、血滴子流血、虚空化山、玉簪陷阱
+                 GE_Hun_GuiTouBlade_Debuff = true, GE_Hun_GuiTouBlade_Debuff_Tick = true, GE_Hun_GuiTouBlade_Debuff_Effect = true,
+                 GE_Hun_GuiTouBlade_Debuff_Effect_BigFlower = true, GE_Hun_GuiTouBlade_Debuff_Effect_UltraFlower = true,
+                 GE_Hun_GuiTouBlade_InDebuffArea = true, GE_Hun_GuiTouBlade_InDebuffArea_BigFlower = true, GE_Hun_GuiTouBlade_ExitDebuffArea = true,
+                 GE_ShachiWeapon_XueDiZi_BleedInitial = true, GE_ShachiWeapon_XueDiZi_Bleed_Lv1 = true,
+                 GE_ShachiWeapon_XueDiZi_Bleed_Lv2 = true, GE_ShachiWeapon_XueDiZi_Bleed_Lv3 = true,
+                 GE_ShachiWeapon_XuKongHuaShan_Debuff = true, GE_YuZan_TrapDebuff = true, GE_YuZan_TrapDebuff_Tick = true } }
 for _, ty in ipairs(INF.TYPES) do
     for _, l in ipairs(ty.lv) do for k = 2, #l do RT.FORCE[l[k]] = true end end
 end
@@ -467,7 +524,8 @@ function RT.keep()
     return k
 end
 
-function RT.cleanse(actor, who, self_)
+-- phase：日志里的叫法（nil = 交手开始；§362 对局结束也走这里，规则同一套）
+function RT.cleanse(actor, who, self_, phase)
     if not valid(actor) then return end
     local keep = RT.keep()
     -- §173.11 只读：按规则没撤的（天赋 / 饰品 / 武器无时限的）、留着的有时限效果；§208 加 时长读不到的、其他无时限的
@@ -506,10 +564,10 @@ function RT.cleanse(actor, who, self_)
         end
     end
     if done == nil then
-        out("!! 交手开始清状态（%s）：读不到效果表", who)
+        out("!! %s清状态（%s）：读不到效果表", phase or "交手开始", who)
     elseif #done + #fail + #acc > 0 or RT.logs < 6 then
         RT.logs = RT.logs + 1
-        out("交手开始清状态（%s）：撤掉 %d 个效果 %s%s；异常积累 %s", who, #done, table.concat(done, ","),
+        out("%s清状态（%s）：撤掉 %d 个效果 %s%s；异常积累 %s", phase or "交手开始", who, #done, table.concat(done, ","),
             #fail > 0 and ("；撤不掉 " .. table.concat(fail, ",")) or "", #acc > 0 and table.concat(acc, "，") or "无")
     end
     -- §208 替身撤掉的里有对方 wge= 同步来的（LO.wgeOn）：LO.wgeOn 照旧记着"上过了"，对方读秒前的旧 wge= 还带着它时不会马上补回来；
@@ -526,7 +584,7 @@ function RT.cleanse(actor, who, self_)
             out("  替身撤掉的里有对方 wge= 同步来的：%s（等对方新的 wge= 不带它了再按对方的补）", table.concat(hit, " "))
         end
     end
-    if done ~= nil then      -- §173.11 每次开打一行（只读，不改行为）：按规则没撤的 + 留着的有时限效果和剩余时间，查漏撤的药 / 误撤
+    if done ~= nil and not phase then      -- §173.11 每次开打一行（只读，不改行为）：按规则没撤的 + 留着的有时限效果和剩余时间，查漏撤的药 / 误撤
         local function joinOr(t) return #t > 0 and table.concat(t, ",") or "-" end
         out("开打留着的效果（%s）：按规则没撤 天赋 %s；饰品 %s；武器 %s；有时限的 %s；时长读不到的 %s", who, joinOr(ruled.tal),
             joinOr(ruled.acc), joinOr(ruled.wpn), joinOr(timedLeft), joinOr(unk))
@@ -570,6 +628,32 @@ function RT.fightStart(p1)
     NET.wgeStr = nil                                -- §208 武器增益撤了：下一包重算 wge=，别让对方按读秒前的旧列表给替身补回去
     local pup = puppet()
     if valid(pup) then RT.cleanse(pup, "替身", false); INF.pup = {} end
+    RT.stopBullets(p1, pup, "交手开始")
+end
+
+-- §362 对局结束也清（用户 11-16："玩家身上的各种 buff 和 debuff 在结束一局战斗时清理掉，比如妖气侵蚀"）：
+-- 以前只在开打时清，打完带着对方挂的妖气 / 中毒 / 点燃和喝药、武技增益回自由活动。规则和开打一样（RT.cleanse），
+-- 在 NET.rulesEnd 开头调（1v1 回自由活动、对决选手离场、多人对局结束都走它），先于饰品 / 标准数值还原（keep 还认得它们挂的），之后照常回满。
+function RT.endCleanse(p1, why)
+    local phase = "对局结束（" .. tostring(why or "-") .. "）"
+    if valid(p1) then RT.cleanse(p1, "自己", true, phase) end
+    NET.wgeStr = nil
+    local pup = puppet()
+    if valid(pup) then RT.cleanse(pup, "替身", false, phase); INF.pup = {} end    RT.stopBullets(p1, pup, phase)
+end
+
+-- 留场的召唤子弹（邪扇冰晶、红妆鬼斩石蒜花 BP_Hun_GuiTouBlade_Flower_* 等）：自己的和替身的都收掉；
+-- 召唤出来的角色（绝影分身、剑客召集令的 NPC）不动（删角色有崩溃前科，v0.11.0）。
+-- §362.1 开打也收一次（用户 11-16："开完大招迅速投降重开一把，石蒜花没有立即刷新掉"）
+-- §362.2 按角色类收：自己 + 所有替身（多人房每人一个）放的一次扫完；p1 拿不到时退回只收替身的
+function RT.stopBullets(p1, pup, phase)
+    if not G.stopBullets then return end
+    local who, a = "自己和替身", p1
+    if not valid(a) then who, a = "替身", pup end
+    if not valid(a) then return end
+    local okS, n, info = pcall(G.stopBullets, a, true)
+    if not okS then out("!! %s收留场子弹（%s）失败：%s", phase, who, tostring(n))
+    elseif n > 0 then out("%s收掉留场子弹（%s）%d 个：%s", phase, who, n, info) end
 end
 
 -- §261 交手中给自己挂"战斗中"（玩家反馈 11-12："用白山的双刀好像维持不了他的元素状态"）。

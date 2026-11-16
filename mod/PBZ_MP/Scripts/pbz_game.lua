@@ -1849,6 +1849,38 @@ function E.destroyActor(e)
     return okD or okK
 end
 
+-- §362 对局结束收掉某个角色名下还在场上的子弹 / 发射器（圣母邪扇 DB"寒冰造物"冰晶 BD_Hun_XieShan_DB_Ice_*_Spawner 留场 9.6–15 秒、
+-- 火柱 / 雷场这类留场判定）。子弹可能是池子里复用的：只调子弹自己的 Deactivate(0)（游戏收子弹的正路），不 K2_DestroyActor。
+-- 只认 BulletOwnerAvatar = owner 且状态 2（在跑）的。返回 收掉的个数, 摘要（"类名×个数 …"）
+-- 【适配】FindAllOf("BulletActorBase") + BulletOwnerAvatar / BulletStatus + BulletInterface:Deactivate
+-- §362.2 byClass = true：不只认 owner 本人，主人和 owner 同一个角色类的都算（替身是 SpawnActor 玩家 1 的类，
+-- 这样 1v1 替身、多人房每个替身、自己一次扫完）
+function E.stopBullets(owner, byClass)
+    if not valid(owner) then return 0, "没有主人" end
+    local ok, l = pcall(function() return FindAllOf("BulletActorBase") end)
+    local n, kinds = 0, {}
+    local okC, cls = pcall(function() return owner:GetClass() end)
+    local function mine(o)
+        if sameObj(o, owner) then return true end
+        if not (byClass and okC and valid(cls) and valid(o)) then return false end
+        local okO, oc = pcall(function() return o:GetClass() end)
+        return okO and sameObj(oc, cls)
+    end
+    for _, b in ipairs(ok and l or {}) do
+        if valid(b) and rawProp(b, "BulletStatus") == 2 and mine(rawProp(b, "BulletOwnerAvatar")) then
+            local cls = full(b):match("^(%S+)") or "?"
+            if pcall(function() b:Deactivate(0.0) end) then
+                n = n + 1
+                kinds[cls] = (kinds[cls] or 0) + 1
+            end
+        end
+    end
+    local parts = {}
+    for k, c in pairs(kinds) do parts[#parts + 1] = k .. "×" .. c end
+    table.sort(parts)
+    return n, #parts > 0 and table.concat(parts, " ") or "没有"
+end
+
 -- （obj 给了就列它全部函数：10:28 子系统里没有 CreateBullet，exe 里它挨着 GetBulletClass / NewData，多半是子弹数据自己的函数）
 -- §139.6 只读：子弹子系统（光柱伤害发射器 BP_PBZ_ProjectileEmitter_C < BulletActorBase 是它生成的）里名字带
 -- Bullet / Create / Spawn 的函数和参数（名字:类型）。返回 日志行列表
@@ -4839,7 +4871,7 @@ return {
     tagsMatching = tagsMatching, puppetDiag = puppetDiag, discardPuppet = discardPuppet, stashAway = stashAway,
     montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, flushInput = HOLDC.flushRun, gameInputBlock = E.gameInputBlock, inputFlushMsg = function() return E.flushMsg end, uiCtxStrip = E.uiCtxStrip, uiCtxRestore = E.uiCtxRestore, unpause = E.unpause, capsuleSize = E.capsuleSize, spawnFxAt = E.spawnFxAt, fxActive = E.fxActive, worldFx = E.worldFx, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = E.holdTaskProbe, inputEnsure = E.inputEnsure, worldTime = E.worldTime, linkAbilityInput = E.linkAbilityInput, inputHold = E.inputHold, inputHoldDump = E.inputHoldDump,
     teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
-    laserEmitterSpawn = E.laserEmitterSpawn, emitterInfo = E.emitterInfo, moveEmitter = E.moveEmitter, destroyActor = E.destroyActor,
+    laserEmitterSpawn = E.laserEmitterSpawn, emitterInfo = E.emitterInfo, moveEmitter = E.moveEmitter, destroyActor = E.destroyActor, stopBullets = E.stopBullets,
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
     puppet = puppet, gstat = gstat, now = now, attrSetOf = attrSetOf, attrOf = attrOf, hpOf = hpOf,

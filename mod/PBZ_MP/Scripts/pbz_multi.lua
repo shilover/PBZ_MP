@@ -1117,6 +1117,21 @@ local function isRangedOrSummon(name)
     return false
 end
 
+MP.AI_LIVE_MAX = 8.0
+-- §357 挨打的 AI 附近（近战距离内）有没有别的替身正在出招（不分队）
+function MP.otherAttackerNear(s, sLoc, tn)
+    for _, o in ipairs(NETP.list or {}) do
+        if o ~= s and not o.idle and not o.fallen and valid(o.pup) then
+            local om = G.montageOf and (G.montageOf(o.pup) or "") or ""
+            if (o.atkAt and tn - o.atkAt <= 0.8) or (om ~= "" and MP.isAtkMontage(om)) then
+                local oLoc = loc(o.pup)
+                if not oLoc or not sLoc or d2(oLoc, sLoc) <= MP.AI_MELEE_DIST then return true end
+            end
+        end
+    end
+    return false
+end
+
 -- 本地 AI 受击归因（两队/三队队友替身也能本地打伤敌方 AI；收紧时间+距离+排除近处正在出招的友方替身）
 local function shouldAttributeAiDrop(s, tn)
     if RULE.my ~= 0 then return false, nil end      -- §336 我倒地 / 出局时打出的不算我的
@@ -1136,6 +1151,16 @@ local function shouldAttributeAiDrop(s, tn)
     local win = ranged and MP.AI_RANGED_WIN or MP.AI_ATK_WIN
     local recentAtk = atkId and atkAt and (tn - atkAt <= win)
     local recentContact = s.aiContactAt and (tn - s.aiContactAt <= MP.AI_ATK_WIN) and atkId and atkAt and (tn - atkAt <= 1.2)
+    -- §357 起手慢 / 后段才打到的招（重武器连段末段、蓄力、大招）：掉血时这招还挂在我身上就算我的（最多 AI_LIVE_MAX 秒），
+    -- 以前过了 0.6 秒（有受击 1.2 秒）一律不算，AI 一点血不掉。放宽的这条另外要求附近没有别的替身在出招（不管哪队），免得把别人的刀算我头上
+    if not recentAtk and not recentContact and atkId and atkAt and tn - atkAt <= MP.AI_LIVE_MAX
+       and ctx.myAtkLive and ctx.myAtkLive() and not MP.otherAttackerNear(s, sLoc, tn) then
+        MP.liveAttr = (MP.liveAttr or 0) + 1
+        if MP.liveAttr <= 20 or MP.liveAttr % 50 == 0 then
+            out(string.format("§357 多人 AI #%d 掉血：我的招 %s 放出 %.1f 秒、还在放 → 算我的（第 %d 次）", s.idx, tostring(atkName), tn - atkAt, MP.liveAttr))
+        end
+        recentAtk = true
+    end
     if not recentAtk and not recentContact then
         return false, nil
     end

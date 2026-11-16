@@ -215,6 +215,14 @@ end
 
 -- 一招的系数（纯函数），返回 系数, 依据
 function BAL.moveScale(name)
+    local sp = CAP and CAP.SPREAD and name and CAP.SPREAD[name]          -- §359 按段摊开（见 CAP.SPREAD）
+    if sp then
+        local f, why = BAL.moveScale0(name)
+        return f * sp, (why or "系数") .. string.format(" × 摊开 %.3f", sp)
+    end
+    return BAL.moveScale0(name)
+end
+function BAL.moveScale0(name)
     local o = BAL.MOVE[name]
     if o then return o, "单招" end
     local fam = name:match("^GA_Hun_(%w+)_")
@@ -319,6 +327,17 @@ CAP = { SLACK = 1.25, REF_ATK = 200, n = 0,
         -- 裂斩直接 -917 + 点燃（游戏不认替身增伤）累计到 -1480 才被 1.25 倍门槛（1459）拦住，一招约 1.4 倍预算。
         -- 裂斩 1050 = §183 L1+圈一招预算；第二段 _CB_C（§183.1 预算 500）没有原版数，直接伤害可能自己就到 500，先不列
         TOTAL = { GA_GlobalActionAbility_LieZhan_C_C = 1050 }, TOTAL_SLACK = 1.0 }
+-- §359 大招"除了第一刀后面都没伤害"（内测反馈 11-16，v0.34.1 日志）：§197 / §203 列的天玄青铜剑 / 荡寇凶刃 / 玉双环大招，
+-- 原版是只采到一段（青铜剑 1572、荡寇 1952）或打空下限（玉双环 3039）——整招按游戏数据是 6860 / 8884 / 6365（base_capdata.lua
+-- §339.2、data/move_game.csv 1632 × 3.9）。上限 = 原版 × 系数 × …，第一刀就把它吃满，后面每一段都被吃掉（日志"改过之后又吃掉 N 跳"）。
+-- 平衡系数当初也是按偏低的原版调的，所以现在**整招总伤害**是对的、只是全压在第一刀。修法：原版改成整招的数，系数乘 旧 / 新（SPREAD）——
+-- 上限 = 新原版 × 系数 × 旧 / 新 = 跟以前一样；每一下伤害按同一比例缩小，整招打满正好到上限 → 每段都出伤害，总伤害不变。
+-- 只改代码、不动下发的数值表：旧版本（表一样、原版旧）照旧是"第一刀吃满"，同一份表新旧版本总伤害一致，不会因为版本不同差 4 倍
+-- §359.2 玉双环大招整招按实战改 17200（v0.34.3 玩家日志 11-16 21:16–21:17 三次打满约 13 段：不截时合计 1991 / 1852 / 1856，
+-- 伤害 35%、系数 0.66 × 3039/6365 → 1900 ÷ (0.315 × 0.35) ≈ 17200；6365 = move_game.csv 1632 × 3.9 只算了一部分环，第 7 段起照样被截）
+CAP.SPREAD_RAW = { GA_Hun_BronzeSword_C_C = { 1572, 6860 }, GA_Hun_Horizontal_C_C = { 1952, 8884 }, GA_Hun_Jade_C_Range_C = { 3039, 17200 } }
+CAP.SPREAD = {}
+for n, p in pairs(CAP.SPREAD_RAW) do CAP.RAW[n] = p[2]; CAP.SPREAD[n] = p[1] / p[2] end
 -- 这一招按表应有的一招总伤害（纯函数）：原版 × 系数 × 伤害倍率 × 对方攻击 / 200 × 等级倍率 / 30 级倍率。
 -- 返回 数, 说明, 门槛倍数（超过 数 × 门槛倍数 才改）；不管的招 nil
 -- §217 本地 AI（攻击方是我）：atkIn / lmIn = 我的攻击力 / 我这一下的等级倍率（不传 = 挨打方口径，读对方的）
@@ -479,6 +498,56 @@ function CAP.hitFix(p1, name, step, hpBefore, tn)
     CAP.hitN = CAP.hitN + 1
     out("!! 单下受伤上限：招 %s 这一下 -%.0f 改成 -%.0f（%s；§340，第 %d 次）", tostring(name), step, lim, why, CAP.hitN)
     return lim
+end
+
+-- §361 妖锯妖气爆发 −95%（第四轮平衡反馈，用户 11-16"现在做"）。爆发不是一招：妖锯连砍给挨打方挂妖气 GE_YaoJu_Erosion，
+-- 它把 GA_YaoJu_MonsterErosion_BP 给到挨打方身上；引爆时这个技能在挨打方身上同时挂 GE_YaoJu_Explode_CanNotDeflect（带标签
+-- CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect，约 3 秒）和伤害 GE_YaoJu_Explode_Damage_Lv1/Lv2（资源图 _tools/gasgraph/yaoju.json）。
+-- 伤害记在替身当时那一招头上，平衡表分不出来 → 挨打方本机认：掉血那一帧身上**刚出现**这个标签（上一次问的时候还没有，
+-- 或上一次问已经是 YQX.GAP 秒前）= 爆发那一下，补回 (1 − MULT)。游戏先扣血、下一帧才挂标签时：掉血先记着，YQX.LATE 秒内
+-- 标签出现（那一帧没再掉血）再补。爆发状态里其余的刀照常（标签一直在 = 不是刚出现）。
+-- 只在交手中 + 武器平衡开着（和系数表同一个开关）。每帧只读血量；掉血那一帧 / 等标签的 LATE 秒内才问一次标签。
+YQX = { MULT = 0.05, TAG = "CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect", GAP = 3.0, LATE = 0.25,
+        hp = nil, had = false, askAt = -100, pend = nil, n = 0 }
+function YQX.has(p1)
+    local t = G.tagsMatching(p1, { YQX.TAG })
+    return t ~= nil and #t > 0
+end
+function YQX.refund(p1, hpNow, drop, tn, late)
+    local back = drop * (1 - YQX.MULT)
+    if not setAttr(p1, "Health", hpNow + back) then return hpNow end
+    YQX.n = YQX.n + 1
+    out("!! 妖锯妖气爆发：这一下 -%.0f 只留 -%.0f（×%.0f%%%s；§361，第 %d 次）", drop, drop - back, YQX.MULT * 100,
+        late and "，标签晚一帧到" or "", YQX.n)
+    return hpNow + back
+end
+-- netJudge 开头每帧调（在它的早返回之前）：返回补过血之后的血量（没动 = nil）
+function YQX.fix(p1, tn)
+    if not (NET.fighting() and BAL.active()) then YQX.hp, YQX.pend = nil, nil; return nil end
+    local hp = attrOf(p1, "Health")
+    if type(hp) ~= "number" then return nil end
+    local prev = YQX.hp
+    YQX.hp = hp
+    if hp > (prev or hp) + 0.5 then YQX.pend = nil end              -- 回过血（喝药 / 补满）：等着的那下作废
+    local p = YQX.pend
+    if p and tn - p.at > YQX.LATE then YQX.pend, p = nil, nil end
+    local drop = (prev and hp < prev - 0.5) and (prev - hp) or nil
+    if not drop and not p then return nil end
+    local has = YQX.has(p1)
+    local fresh = has and (not YQX.had or tn - YQX.askAt > YQX.GAP)   -- 标签刚出现
+    YQX.had, YQX.askAt = has, tn
+    if not has then
+        if drop then YQX.pend = { drop = drop, at = tn } end          -- 标签可能下一帧才到
+        return nil
+    end
+    YQX.pend = nil
+    if not fresh then return nil end                                 -- 爆发状态里的后续刀：照常
+    -- 这一帧掉了血 → 标签和伤害同一帧到，就是这一下（上一帧记着的那下是普通刀）；这一帧没掉血 → 是上一帧那下
+    local amount, late = drop, false
+    if not amount then amount, late = p.drop, true end
+    local hp2 = YQX.refund(p1, hp, amount, tn, late)
+    YQX.hp = hp2
+    return hp2
 end
 
 -- §199 持续伤害（点燃 / 流血 / 中毒 / 混沌）按"挂上它的那招"钉住系数（用户 11-10："点燃和本身伤害合在一起算，首先削点燃伤害，
@@ -696,6 +765,14 @@ function AIF.say(fmt, ...)
     AIF.logs = AIF.logs + 1
     out(fmt, ...)
 end
+-- §359 上限改了伤害的那两条单独计数：以前和等级系数 / 冰缓 / 持续伤害共用 30 行，冰缓来回几次就用完，之后截伤害一行不记
+-- （11-16 玩家日志 17:48 之后荡寇 / 青铜剑大招被截全是静默的）。前 60 次都记，之后每 20 次记一次
+AIF.CAP_LOG_MAX, AIF.capLogs = 60, 0
+function AIF.capSay(fmt, ...)
+    AIF.capLogs = AIF.capLogs + 1
+    if AIF.capLogs > AIF.CAP_LOG_MAX and AIF.capLogs % 20 ~= 0 then return end
+    out(fmt, ...)
+end
 function AIF.name(id) return id and ((NET.evBal and NET.evBal[id]) or (NET.evName and NET.evName[id])) or nil end
 -- 我手上这把（edge = 影之武装）的本机等级倍率（手上的一定装着）；认不出 / 读不到 → nil
 function AIF.myMult(edge, id)
@@ -769,7 +846,7 @@ function AIF.cap(id, add, tn)
     end
     AIF.capped[ck] = { name = name, n = 0, eat = 0 }
     AIF.capN = AIF.capN + 1
-    AIF.say("!! 本地 AI 绕过平衡的一下：我第 #%d 招 %s / 本机报 -%.0f（这招累计 -%.0f）/ 改成 -%.0f（累计 -%.0f；%s，超过 ×%.2f 才改；之后这招再超出的整跳吃掉；§197 挨打方同一套，§217，第 %d 次）",
+    AIF.capSay("!! 本地 AI 绕过平衡的一下：我第 #%d 招 %s / 本机报 -%.0f（这招累计 -%.0f）/ 改成 -%.0f（累计 -%.0f；%s，超过 ×%.2f 才改；之后这招再超出的整跳吃掉；§197 挨打方同一套，§217，第 %d 次）",
         id, name, add, prev + add, allow, prev + allow, why, slack or CAP.SLACK, AIF.capN)
     return allow
 end
@@ -779,7 +856,7 @@ function AIF.flush(id, reportedDmg)
     if not c then return end
     AIF.capped[id] = nil
     if c.n > 0 then
-        AIF.say("!! 本地 AI 绕过平衡：我第 #%d 招 %s 改过之后又吃掉 %d 跳、共 -%.0f（td= 这招停在 -%.0f；§217）", id, c.name or "?", c.n, c.eat, reportedDmg or TOUCH.dmg[id] or 0)
+        AIF.capSay("!! 本地 AI 绕过平衡：我第 #%d 招 %s 改过之后又吃掉 %d 跳、共 -%.0f（td= 这招停在 -%.0f；§217）", id, c.name or "?", c.n, c.eat, reportedDmg or TOUCH.dmg[id] or 0)
     end
 end
 -- 替身挂上一种持续伤害：来源 = 1 秒内刚打中替身的招，没有就按 HOLD 内我放的招；钉住 = 伤害倍率 × 等级系数 × 持续系数（挨打方 DOT.onStart 的镜像）

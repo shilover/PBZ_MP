@@ -5,10 +5,13 @@
 --                     （真人那边是替身还在播这一招就接着等，LAT.stillPlaying；以前 AI 固定 1.5 秒，紫冥剑大招 2–4 秒才打到 → §351）
 --   pst=0/1           替身在我游戏里正在播受击 / 倒地 / 起身动作（LO.isHitMontage），或身上有控制类异常（BAL.CTRL 里的类型，冰冻）
 --                     → AI 这段时间不出招、不喝药、不举架势，被打中也防不了（真人挨打硬直里一样动不了）
--- 旧版联机程序不认这两个键 → 照旧。发包这一帧顺带算，不额外轮询：动作每帧本来就在读，异常标签每 EVERY 帧读一次。
+--   psq=<杀气>        §353 替身在我游戏里的实际杀气。联机程序回 sqp=1 时，交手中不再把替身杀气补满（main.lua 每 10 帧那段），
+--                     挨打掉、放技能花、打中涨都是游戏自己算；打空了替身在我这边真的破防（不掐，pst=1 让 AI 停手）
+-- 旧版联机程序不认这几个键 → 照旧。发包这一帧顺带算，不额外轮询：动作每帧本来就在读，异常标签每 EVERY 帧读一次。
 return function(ctx)
 local out, NET, ST, G = ctx.out, ctx.NET, ctx.ST, ctx.G
-local A = { KEEP = 10.0, EVERY = 3, mine = {}, pst = "0", why = nil, LOG_MAX = 60, logs = 0, n = { busy = 0 } }
+local A = { KEEP = 10.0, EVERY = 3, mine = {}, pst = "0", why = nil, LOG_MAX = 60, logs = 0, n = { busy = 0, brk = 0 }, psq = nil,
+            BREAK = { "Break", "MoTian_Dodge" } }
 
 function A.log(...)
     if A.logs < A.LOG_MAX then A.logs = A.logs + 1; out(...) end
@@ -39,11 +42,30 @@ function A.wireAct(tn)
     return table.concat(ids, ",")
 end
 
+-- §353 交手中、对手是本地 AI、联机程序说了 sqp=1、不是木桩：替身杀气按游戏自己的（不补满、破防照播）
+function A.ownShachi()
+    if not (A.on() and NET.rsqp and not NET.rdummy) then return false end
+    if NET.fighting then return NET.fighting() == true end
+    return false
+end
+
+-- §353 替身在我这边破防了（suppressLocalReact 看到破防动作、没掐）
+function A.noteBreak(name)
+    if A.brkM == name then return end
+    A.brkM = name
+    A.n.brk = A.n.brk + 1
+    A.log("§353 替身杀气打空、在你这边破防了（%s，第 %d 次）→ 照播，本地 AI 这段时间停手", tostring(name), A.n.brk)
+end
+
 -- 替身现在为什么动不了（nil = 能动）
 function A.busyWhy(pup)
     if not (G.valid(pup)) then return nil end
     local m = LAT and LAT.activeMontage and select(3, LAT.activeMontage(pup)) or nil
     if m and LO and LO.isHitMontage(m) then return m end
+    if m and A.ownShachi() then
+        for _, k in ipairs(A.BREAK) do if m:find(k, 1, true) then return m end end      -- §353 破防 / 挣脱
+    end
+    if not m then A.brkM = nil end
     if INF and INF.levels and BAL and BAL.CTRL and next(BAL.CTRL) then
         local lv = INF.levels(pup)
         for ty in pairs(BAL.CTRL) do
@@ -70,12 +92,18 @@ end
 -- 状态包里接在 tc= / td= 后面；对手不是本地 AI 时什么都不发（省流）
 function A.wire(tn)
     if not A.on() then return "" end
-    return "act=" .. A.wireAct(tn) .. "\npst=" .. A.wirePst(tn) .. "\n"
+    local s = "act=" .. A.wireAct(tn) .. "\npst=" .. A.wirePst(tn) .. "\n"
+    if ST.ticks % A.EVERY == 0 or A.psq == nil then
+        local v = ctx.attrOf and ctx.attrOf(G.puppet(), "Shachi")
+        A.psq = type(v) == "number" and v or A.psq
+    end
+    if A.psq then s = s .. string.format("psq=%.0f\n", A.psq) end          -- §353
+    return s
 end
 
 -- 换对手 / 对局结束时清掉
 function A.reset()
-    A.mine, A.pst, A.why = {}, "0", nil
+    A.mine, A.pst, A.why, A.psq, A.brkM = {}, "0", nil, nil, nil
 end
 
 return A

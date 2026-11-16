@@ -36,6 +36,10 @@ namespace ForNet
         // §352 模组发了 act=（你还在放的攻击招）：这招放完还没碰到才判落空（同真人那边替身还在播就接着等），最多 ActMax 秒；
         // 没有 act= 的旧版模组照旧 TouchWait。pst=1（替身在你游戏里挨打 / 倒地 / 冻住）：AI 停手、不喝药、放下架势、这段时间防不了
         const double ActMax = 8.0;
+        // §353 模组发了 psq=（替身在你游戏里的实际杀气）：AI 的杀气就用它（挨打掉、放技能花、打中涨，都是游戏自己算的），
+        // 不再自己每秒回 150、不再按格挡扣；杀气不到 SkillSh 不放技能（武器技 / 招式技能，影之武装花的是暗源不受影响）。
+        // 包里带 sqp=1 告诉模组"交手中别再把替身杀气补满"，杀气打空了替身在你游戏里真的破防（AI 那段时间停手，§352 pst=）
+        const double SkillSh = 120;
         static readonly double[] DmSteps = { 10, 20, 30, 40, 50, 75, 100, 150, 200, 300 };   // §86 伤害倍率档位（同 main.lua NET.DM_STEPS）
         const double AiAir = 0.15, HopVz = 750, HopG = 1800, HopLead = 0.25;
 
@@ -85,6 +89,9 @@ namespace ForNet
             public string Outfit = "";               // 皮肤行名（of=）；空 = 不发（替身穿本机的外观）
             public int Potions = 0;                  // 一回合能喝几次药（自己回血 + 发 med= 播喝药动作）；0 = 不喝
             public string Acc = null;                // 饰品被动（逗号分隔的 GA 名）；null = 不发 pas=（替身带的是本机的天赋 / 饰品），"" = 不带饰品
+            // §354 AI 跟随你（玩家反馈 11-16："AI 会自动瞬移到我脸上"，木桩测攻击距离 / 对战练习拉开身位打远程都要能关）：
+            // 开（默认）= 照旧走到你面前、离你超过 30 米瞬移到你面前；关 = 原地不动、不瞬移（第一次出现 / 换图 / 回合开战点照旧摆）。存 netcfg aifol=
+            public bool Follow = true;
 
             static readonly Regex PathRe = new Regex(@"^/PBZCombatAsset/[A-Za-z0-9_/]+\.[A-Za-z0-9_]+$");
             static readonly Regex WordRe = new Regex(@"^[A-Za-z0-9_]+$");
@@ -122,28 +129,29 @@ namespace ForNet
                 }
                 Acc = string.Join(",", l); return true;
             }
+            public bool SetFollow(string v) { v = (v ?? "").Trim(); if (v != "0" && v != "1") return false; Follow = v == "1"; return true; }
             public string AccWire() { return Acc ?? "-"; }
             public string WeaponWire() { return Fam + "|" + Wc; }
             public Loadout Clone() { return (Loadout)MemberwiseClone(); }
 
             // F5：基底经 IAiLoad 存取，键名 / 顺序和以前写死在联机程序里的一字不差
-            static readonly string[] Cmd = { "w", "e", "o", "med", "acc" };
+            static readonly string[] Cmd = { "w", "e", "o", "med", "acc", "fol" };
             string[] IAiLoad.CmdKeys { get { return Cmd; } }
             bool IAiLoad.Set(string k, string v)
             {
-                switch (k) { case "w": return SetWeapon(v); case "e": return SetEdge(v); case "o": return SetOutfit(v); case "med": return SetPotions(v); case "acc": return SetAcc(v); }
+                switch (k) { case "w": return SetWeapon(v); case "e": return SetEdge(v); case "o": return SetOutfit(v); case "med": return SetPotions(v); case "acc": return SetAcc(v); case "fol": return SetFollow(v); }
                 return false;
             }
             bool IAiLoad.LoadCfg(string k, string v)
             {
-                switch (k) { case "aiw": return SetWeapon(v); case "aie": return SetEdge(v); case "aio": return SetOutfit(v); case "aimed": return SetPotions(v); case "aiacc": return SetAcc(v); }
+                switch (k) { case "aiw": return SetWeapon(v); case "aie": return SetEdge(v); case "aio": return SetOutfit(v); case "aimed": return SetPotions(v); case "aiacc": return SetAcc(v); case "aifol": return SetFollow(v); }
                 return false;
             }
             void IAiLoad.SaveCfg(StringBuilder sb)
             {
                 sb.Append("aiw=").Append(WeaponWire()).Append('\n').Append("aie=").Append(Edge).Append('\n')
                   .Append("aio=").Append(Outfit).Append('\n').Append("aimed=").Append(Potions).Append('\n')
-                  .Append("aiacc=").Append(AccWire()).Append('\n');
+                  .Append("aiacc=").Append(AccWire()).Append('\n').Append("aifol=").Append(Follow ? 1 : 0).Append('\n');
             }
             void IAiLoad.LobbyKv(Action<string, string> kv)
             {
@@ -153,6 +161,7 @@ namespace ForNet
                 kv("aio", Outfit);
                 kv("aimed", Potions.ToString());
                 kv("aiacc", AccWire());
+                kv("aifol", Follow ? "1" : "0");     // §354
             }
             IAiLoad IAiLoad.Clone() { return Clone(); }
         }
@@ -174,9 +183,12 @@ namespace ForNet
         // 对局里的状态（只在 Run 线程里动）
         internal int seq = 500000, evId, resId, dead, curRound = -1;
         internal double hp = -1, sh = -1, lastT, nextHit, guardUntil, hopT0 = -1, holdZ = double.NaN;
-        internal bool pupBusy;                           // §352 包里 pst=1：替身在你游戏里挨打 / 被控
+        internal bool pupBusy;
+        internal bool shGate;                            // §353 杀气以替身为准（psq=）：技能要看杀气够不够                           // §352 包里 pst=1：替身在你游戏里挨打 / 被控
         internal int busyN;                              // §352 停手过几次（测试 / 日志看）
         internal double[] fpos;
+        double stayZ = double.NaN;                       // §354 不跟随时站着的高度（摆到你面前 / 开战点那一刻的）
+        string stayMap;                                  // §354 不跟随时换了图要重新摆
         internal List<string> combo = new List<string>();
         internal List<Ev> events = new List<Ev>();
         Dictionary<int, Ans> answered = new Dictionary<int, Ans>();
@@ -459,7 +471,7 @@ namespace ForNet
                         events.Add(new Ev { Id = ++evId, T = tnow, Name = "GA_Hun_Jump_C" });
                     }
                     else if (r < 0.2 && edgeCombos.Count > 0) { combo = new List<string>(edgeCombos[rnd.Next(edgeCombos.Count)]); skill = true; }
-                    else if (r < 0.45) { combo = new List<string>(Pick(mv.Skills)); skill = true; }
+                    else if (r < 0.45 && (!shGate || sh >= SkillSh)) { combo = new List<string>(Pick(mv.Skills)); skill = true; }   // §353 杀气不够不放技能
                     else combo = new List<string>(Pick(mv.Combos));
                 }
                 events.Add(new Ev { Id = ++evId, T = tnow + lead, Name = combo[0] });
@@ -489,10 +501,12 @@ namespace ForNet
             return ev.ToString();
         }
 
-        internal void StepApproach(double dt, double px, double py, double yaw, double[] spot, bool hold, out double vx, out double vy, out double holdZ)
+        // follow = false（§354 AI 不跟随）：已经摆好了就原地不动，离多远都不瞬移；第一次（fpos 还是 null）照旧摆到你面前
+        internal void StepApproach(double dt, double px, double py, double yaw, double[] spot, bool hold, out double vx, out double vy, out double holdZ, bool follow = true)
         {
             vx = 0; vy = 0; holdZ = double.NaN;
             if (spot != null) { fpos = new[] { spot[0], spot[1] }; holdZ = spot[2]; }
+            else if (!follow && fpos != null) { }
             else if (hold && fpos != null && Math.Sqrt((fpos[0] - px) * (fpos[0] - px) + (fpos[1] - py) * (fpos[1] - py)) <= JumpDist) { }
             else if (fpos == null || Math.Sqrt((fpos[0] - px) * (fpos[0] - px) + (fpos[1] - py) * (fpos[1] - py)) > JumpDist)
             {
@@ -603,7 +617,19 @@ namespace ForNet
             bool dummy = lv.Dummy;                           // §342 木桩：一直按"倒计时站着不动"走（离你超过 30 米 / 换图才挪到你面前）
             double[] spot = hold ? AspGuest(Get(me, "asp")) : null;
             double vx, vy, holdZ;
-            StepApproach(dt, px, py, yaw, spot, hold || dummy, out vx, out vy, out holdZ);
+            bool follow = Load.Follow;                       // §354
+            string map = Get(me, "map");
+            if (!follow && map.Length > 0 && map != stayMap) { if (stayMap != null) fpos = null; stayMap = map; }     // 换图：重新摆到你面前
+            var fpos0 = fpos;
+            StepApproach(dt, px, py, yaw, spot, hold || dummy, out vx, out vy, out holdZ, follow);
+            if (!follow)
+            {
+                // 站着不动时高度定住（以前跟你的高度走：你跳起来 / 上坡它跟着上下）；刚摆到你面前用你那时的高度，开战点用开战点的
+                if (!double.IsNaN(holdZ)) stayZ = holdZ;
+                else if (fpos != fpos0 || double.IsNaN(stayZ)) stayZ = pz;
+                holdZ = stayZ;
+            }
+            else stayZ = double.NaN;
             double x = fpos[0], y = fpos[1];
             double face = Math.Atan2(py - y, px - x) * 180 / Math.PI;
             seq++;
@@ -611,7 +637,9 @@ namespace ForNet
             if (hpm <= 0) hpm = 3085.5;
             double shm = Num(me, "shm", 800);
             if (shm <= 0) shm = 800;
-            sh = sh < 0 ? shm : Math.Min(shm, sh + 150 * dt);
+            shGate = !dummy && me.ContainsKey("psq");                                  // §353
+            if (shGate) sh = Math.Max(0, Math.Min(shm, Num(me, "psq", sh < 0 ? shm : sh)));
+            else sh = sh < 0 ? shm : Math.Min(shm, sh + 150 * dt);
             var ld = Load;
             // §342 木桩对局外也扣血（血条看得到掉了多少），只在倒计时 / 换回合时补满
             if (hp < 0 || (!dummy && (mstate == "" || mstate == "idle")) || mstate == "cd" || mround != curRound)
@@ -698,7 +726,7 @@ namespace ForNet
                 }
                 res.Append(res.Length > 0 ? "," : "").Append(a.Rid).Append(':').Append(kv.Key).Append(':').Append(a.Kind).Append(':')
                    .Append(a.Kind == "hit" ? Kv.F(a.Dmg, "0") : "0");
-                if (counted.Add(a.Rid) && (a.Kind == "block" || a.Kind == "parry")) sh = Math.Max(0, sh - (a.Kind == "block" ? 300 : 100));
+                if (counted.Add(a.Rid) && !shGate && (a.Kind == "block" || a.Kind == "parry")) sh = Math.Max(0, sh - (a.Kind == "block" ? 300 : 100));   // §353 杀气以替身为准时不自己扣
                 if (a.Kind == "hit" && a.Dmg > a.Paid + 0.5)
                 {
                     if (dummy && mstate != "cd")
@@ -720,7 +748,8 @@ namespace ForNet
 
             if (dummy && ld.Acc == null) { ld = ld.Clone(); ld.Acc = ""; }      // §342 木桩默认不带饰品（AI 装备里自选了饰品就用自选的）
             var body = BuildPacketBody(me, x, y, (double.IsNaN(holdZ) ? pz : holdZ) + hopH, face, vx, vy, ld, evStr, hpm, res.ToString(), dead, shm, hopV, wcs);
-            if (dummy) body += "dummy=1\n";                 // §342 游戏据此：不按回合时限判负、替身本机一直留伤害余量、面板写木桩
+            if (dummy) body += "dummy=1\n";
+            else body += "sqp=1\n";                         // §353 交手中替身杀气按游戏自己的（模组别补满）                 // §342 游戏据此：不按回合时限判负、替身本机一直留伤害余量、面板写木桩
             if (mb != null) mb.SetLocal(body);
         }
     }
