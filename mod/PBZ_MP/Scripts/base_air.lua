@@ -77,6 +77,7 @@ function AIR.fire(p1, pup, e, tn)
         CHG.upgrade(pup, e.name, CHG.PRE[e.name])    -- §92.7 / §243 放之前补前置 GE
         if e.name == "GA_Hun_SlitheringSword_Potential_C" then CHG.potDiag(pup, "放之前") end
     end
+    if e.name == TORN.CLS then TORN.start("op", tn) end      -- §383 对方火蓄力：开始数替身的火焰龙卷
     if LO.isEdgeAttack(e.name) then ST.pupEdgeAt = tn end      -- v0.23.7 影之武装伤害系数
     -- §106 武器平衡：放之前就把这招的系数写进替身攻击力（以前等下一次驱动，前摇极短的招可能先出伤害）
     -- §203 summon 行里有的招不算攻击也记（玉双环鬼魅闪身：残影反打的追踪飞环按闪身那一下的系数 + 留场秒数算，闪身本身不进 isAttackAbility）
@@ -89,10 +90,15 @@ function AIR.fire(p1, pup, e, tn)
     if isAttackAbility(e.name) then
         if ok then openJudge(p1, e.id, tn, e.name); ST.pupAtkAt = tn else addResult("miss", e.id, 0, tn) end
     end
+    -- §385 挨打方诊断：对方这招在我这边有没有碰到我（本地 AI 的招不记）
+    if ok and HMISS and isAttackAbility(e.name) and (spec or not NET.rai) then
+        HMISS.onFire(pup, e, tn, spec and PEER.cur and PEER.cur.tag or nil)
+    end
     if pend and SNAP then SNAP.log("  §243 %s 先排到闪避后重放，判定窗口已开（等前摇）", e.name) end
     if ok and not pend and not CHG.isHold(e.name) then LAT.afterFire(pup, e, before, tn) end     -- v0.27.0 追帧（§92 蓄力招不追：跳前摇会把蓄力段跳乱）
     if ok and not pend then ANIM.afterFire(pup, e, before, tn) end     -- §100 放成功却没换动作 → 补
     if ok and not pend and CHG.isHold(e.name) then CHG.onFire(pup, e, tn) end        -- §92 替身按对方的松手时刻松手
+    if ok and not pend and SHOT.FAM[e.name] then SHOT.onFire(pup, e, tn) end         -- §377 羽弓 / 虎炮：按对方每一发出手
     if CHG.fired[e.id] then CHG.fired[e.id].inp = inp end
     if ok and inp then INP.log("输入实验：远端#%d 替身技能接上 Ability Input Component：%s", e.id, G.linkAbilityInput(pup, e.name)) end
     if not ok and inp then INP.release(e.id, "没放出来") end
@@ -224,13 +230,17 @@ end
 --   ② 替身身上有、对方没有的（不是跟着对方上的）马上撤，不再等 grace
 --   ③ 对方还在、替身那份 GE 自己到时间掉了 → 隔 REAPPLY 秒补上（以前"掉了也不补"→ 替身比真人先解冻）；同一次最多补 REAPPLY_MAX 回
 -- 类型表（资产名字表，HANDOVER §160.5）：lv[i] = 第 i 段 { 标签, 上的 GE, 撤时连带撤的 GE… }；res = 承受积累倍率属性的后缀
+-- §373 替身在本机被游戏冻住时上的是怪物版 GE_Frost_Mob（父类 GE_Frost，替身身上同时出现 GE_Frost_Resistance_Mob 可证），
+-- 感电同理有 GE_Electrified_Mob / 拙壁盾的 GE_Electrified_ZhuoBiDun。RemoveActiveGameplayEffectBySourceEffect 只认**同一个类**
+-- （不认子类），以前只撤 GE_Frost → 替身的 GE_Frost_Mob 撤不掉、日志照样写"已撤"（只看调用有没有报错），替身一直冻着放不出招，
+-- 位置照样跟网络走 = 内测"冻住后对方还能动，但对方打不出伤害"。变体都列成"撤时连带撤的 GE"，INF.strip 撤完按标签读回确认
 INF = { ROOT = "CharacterState.StatusInfliction", GE_DIR = "/PBZCombatAsset/Prototypes/GameplayEffects/Inflictions/",
         EVERY = 3, ACC_EVERY = 9, GRACE = 0.15, GRACE_MAX = 0.6, ACC_SLACK = 1.0, LOG_MAX = 60, logs = 0,
-        REAPPLY = 0.3, REAPPLY_MAX = 20, immune = nil,
-        st = { mirror = 0, strip = 0, clamp = 0 }, me = {}, pup = {}, r = nil,
+        REAPPLY = 0.3, REAPPLY_MAX = 20, immune = nil, STUCK_LOG_MAX = 12, stuckLogs = 0,
+        st = { mirror = 0, strip = 0, clamp = 0, stuck = 0 }, me = {}, pup = {}, r = nil,
         TYPES = {
-            { id = "frost", name = "冰冻", acc = "Frost_Accumulation", res = "FrostAccumulation",
-              lv = { { "CharacterState.StatusInfliction.Frost.Effect", "GE_Frost" } } },
+            { id = "frost", name = "冰冻", acc = "Frost_Accumulation", res = "FrostAccumulation", key = "Frost",
+              lv = { { "CharacterState.StatusInfliction.Frost.Effect", "GE_Frost", "GE_Frost_Mob" } } },
             { id = "ignite", name = "点燃", acc = "Ignite_Accumulation", res = "IgniteAccumulation",
               lv = { { "CharacterState.StatusInfliction.Ignite", "GE_Ignite" } } },
             { id = "poison", name = "中毒", acc = "Poison_Accumulation", res = "PoisonAccumulation",
@@ -238,8 +248,8 @@ INF = { ROOT = "CharacterState.StatusInfliction", GE_DIR = "/PBZCombatAsset/Prot
                      { "CharacterState.StatusInfliction.Poison.Phase1", "GE_Poison_Phase1" },
                      { "CharacterState.StatusInfliction.Poison.Phase2", "GE_Poison_Phase2" },
                      { "CharacterState.StatusInfliction.Poison.Phase3", "GE_Poison_Phase3" } } },
-            { id = "elec", name = "感电", acc = "Electrified_Accumulation", res = "ElectrifiedAccumulation",
-              lv = { { "CharacterState.StatusInfliction.Electrified", "GE_Electrified" } } },
+            { id = "elec", name = "感电", acc = "Electrified_Accumulation", res = "ElectrifiedAccumulation", key = "Electrified",
+              lv = { { "CharacterState.StatusInfliction.Electrified", "GE_Electrified", "GE_Electrified_Mob", "GE_Electrified_ZhuoBiDun" } } },
             { id = "bleed", name = "流血", acc = "Bleed_Accumulation", res = "BleedAccumulation",
               lv = { { "CharacterState.StatusInfliction.Bleed.Small", "GE_BleedSmall" } } },
             { id = "chaos", name = "混沌",
@@ -332,13 +342,33 @@ function INF.grace()
     return math.min(INF.GRACE + (rtt and rtt * 1.5 / 1000 or 0.15), INF.GRACE_MAX)
 end
 
--- 撤掉替身身上这个类型所有段的 GE（含连带的）
-function INF.strip(pup, ty)
-    local ok = false
+-- 撤掉 actor 身上这个类型所有段的 GE（含连带的、§373 的 _Mob 变体）。
+-- §373 撤完按标签读回：返回 true = 这个类型的标签真没了（以前返回"调用没报错"，撤不掉也写"已撤"）；
+-- 读回标签还在 → false，并记一行身上还挂着哪些相关 GE（名字带类型关键字的；最多 STUCK_LOG_MAX 行），下回再撤
+function INF.strip(actor, ty)
+    local called = false
     for _, l in ipairs(ty.lv) do
-        for k = 2, #l do ok = LO.removeGE(pup, INF.gePath(l[k])) or ok end
+        for k = 2, #l do called = LO.removeGE(actor, INF.gePath(l[k])) or called end
     end
-    return ok
+    if #ty.lv == 0 then return called end
+    local tags = {}
+    for i, l in ipairs(ty.lv) do tags[i] = l[1] end
+    local left = G.tagsMatching(actor, tags)
+    if left == nil then return called end            -- 读不到标签（没有 ASC）：只能按调用结果算
+    if #left == 0 then return true end
+    INF.st.stuck = INF.st.stuck + 1
+    if INF.stuckLogs < INF.STUCK_LOG_MAX then
+        INF.stuckLogs = INF.stuckLogs + 1
+        local names = {}
+        local set = G.geSet and G.geSet(actor)
+        for n in pairs(set or {}) do
+            if ty.key and n:find(ty.key, 1, true) then names[#names + 1] = n end
+        end
+        table.sort(names)
+        out("!! %s撤完标签还在（%s）：身上相关的 GE %s（§373，第 %d 次；下回再撤）", ty.name, table.concat(left, ","),
+            set and (#names > 0 and table.concat(names, ",") or "没有名字带 " .. tostring(ty.key) .. " 的") or "读不到", INF.st.stuck)
+    end
+    return false
 end
 
 -- §355 ① 替身不在本机积异常：on = true 把 TakenReductionMultiplier_<res> 写 0（每 ACC_EVERY 帧复查一次，被游戏重算回去就再写），
@@ -436,10 +466,14 @@ function INF.step(pup, tn)
                 if ty.acc then setAttr(pup, ty.acc, r.acc) end
                 p.ours, p.localAt = nil, nil
                 INF.st.strip = INF.st.strip + 1
-                INF.say("※ 替身撤掉%s（%s）：%s", ty.name, why, ok and "已撤" or "撤不掉")
+                -- §373 撤不掉的下回（EVERY 帧后）接着撤；同一段撤不掉只记第一次（细节 INF.strip 记）
+                if ok or not p.stuck then
+                    INF.say("※ 替身撤掉%s（%s）：%s", ty.name, why, ok and "已撤" or "撤不掉（标签还在，接着撤）")
+                end
+                p.stuck = (not ok) or nil
             end
         else
-            p.ours, p.localAt = nil, nil
+            p.ours, p.localAt, p.stuck = nil, nil, nil
         end
     end
 end
@@ -629,6 +663,12 @@ function RT.fightStart(p1)
     local pup = puppet()
     if valid(pup) then RT.cleanse(pup, "替身", false); INF.pup = {} end
     RT.stopBullets(p1, pup, "交手开始")
+    -- §376 开打时切武器冷却归零（用户 11-17："武器切换冷却在进入战斗的瞬间没有恢复到可使用状态"）：
+    -- 读秒里 / 上一回合切过武器留下的冷却会带进交手，开打第一下切不了。和 §245 替身放切刀斩前同一个调用。
+    if LO.swtCooldown then
+        local okW = LO.swtCooldown(p1)
+        out("§376 开打清切武器冷却（自己）：%s", okW and "已清" or "!! 调用失败")
+    end
 end
 
 -- §362 对局结束也清（用户 11-16："玩家身上的各种 buff 和 debuff 在结束一局战斗时清理掉，比如妖气侵蚀"）：
@@ -1329,8 +1369,38 @@ end
 -- 日志写清"自己飞了几把 / 补射几把"，实测一次就知道原因在哪。net/fj_off.txt 存在 = 只记不补射
 FJ = { FIN = { GA_Hun_ZiMingJian_New_ABB_C = true, GA_Hun_ZiMingJian_New_BBB_C = true, GA_Hun_ZiMingJian_New_AAAAA_C = true,
                GA_Hun_ZiMingJian_New_AABB_C = true, GA_Hun_ZiMingJian_New_AAABB_C = true },
-       CLS = "BP_Hun_ZIMingJian_FlyingSword_Aim_C", FIRED = "Fired?", FIRE = "Fire", WAIT = 1.2, LOGS = 40, logs = 0 }
+       CLS = "BP_Hun_ZIMingJian_FlyingSword_Aim_C", FIRED = "Fired?", FIRE = "Fire", WAIT = 1.2, LOGS = 40, logs = 0,
+       FLY = 1.5, win = nil, holdLogs = 0 }
 FJ.OFF_FILE = NET_DIR .. "/fj_off.txt"
+
+-- §370 飞剑打到我的时候，收尾招的判定窗口常常已经关了（用户 11-17"B 攻击产生的所有飞剑经常丢失判定"）：
+-- 收尾招开窗口后 JUDGE_WIN 1.2 秒没掉血判落空、中过的多段累加也只等最后一段后 1.2 秒；飞剑却是收尾招放出 WAIT 1.2 秒后才补射
+-- （游戏自己射也要在收尾招中途），再飞 0.3–1 秒才到（B_Hun_ZiMingJian_FlyingSword_Shoot：初速 500、追踪、第一段最多 1 秒）。
+-- 窗口一关，飞剑掉的血不记在任何一招上（攻击方收不到"命中"，替身不播受击、招式统计里没有）。
+-- 现在：收尾招放出时替身肩上有剑 → 记一个"飞剑在路上"的窗口（放招后 WAIT + FLY 秒），这段时间这一招的判定窗口 / 多段累加不过期
+function FJ.live(id, tn)
+    local w = FJ.win
+    return w ~= nil and id == w.id and tn <= w.untilT
+end
+function FJ.holdLog(id, tn, what)
+    local w = FJ.win
+    if w.logged or FJ.holdLogs >= 30 then return end
+    w.logged, FJ.holdLogs = true, FJ.holdLogs + 1
+    out("§370 紫冥剑飞剑：远端#%d %s 放出 %.1f 秒，飞剑还在路上 → %s接着等到 %.1f 秒", id, w.name, tn - w.at, what, w.untilT - w.at)
+end
+-- netJudge：判定窗口到期时问一下（true = 接着等）
+function FJ.keepJudge(j, tn)
+    if not (j and FJ.live(j.id, tn)) then return false end
+    FJ.holdLog(j.id, tn, "判定窗口")
+    return true
+end
+-- netJudge：上一下中招的多段累加到期时问一下（true = 接着累加）
+function FJ.holdHit(lh, tn)
+    local id = lh and lh.r and lh.r.atk
+    if not (id and FJ.live(id, tn)) then return false end
+    FJ.holdLog(id, tn, "多段累加")
+    return true
+end
 
 function FJ.log(...)
     if FJ.logs < FJ.LOGS then FJ.logs = FJ.logs + 1; out(...) end
@@ -1345,6 +1415,7 @@ function FJ.onFire(pup, e, tn)
     if not FJ.FIN[e.name] then return end
     local s = LO.bulletsOf(pup, FJ.CLS, FJ.FIRED)
     FJ.pend = { id = e.id, name = e.name, at = tn, n = #s }
+    if #s > 0 then FJ.win = { id = e.id, name = e.name, at = tn, untilT = tn + FJ.WAIT + FJ.FLY } end   -- §370
     FJ.log("紫冥剑飞剑：远端#%d %s，替身肩上 %d 把", e.id, e.name, #s)
     if #s > 0 and not FJ.probed then
         FJ.probed = true

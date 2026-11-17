@@ -42,7 +42,7 @@ MP.MODES = {
 MP.MODES_GAME = { "elim", "score", "duel" }
 local DUEL = nil
 MP.TEAMS = { 0, 1, 3 }       -- 分队：0 各自为战 / 1 两队（历史值，包里 / mp.txt 都是 1）/ 3 三队（§317）
-MP.MIN3 = 4                  -- §317 三队至少几个人才开（3 人 = 一人一队，等于各自为战）
+MP.MIN3 = 3                  -- §317 三队至少几个人才开（11-17 用户：4 → 3，3 人一人一队也能开）
 function MP.teamCount(t)     -- 几队：0（不分队）/ 2 / 3
     t = tonumber(t)
     if t == 1 then return 2 elseif t == 3 then return 3 end
@@ -859,6 +859,7 @@ local function netDrop(s, why)
     if s.followReady then G.rootMotionScale(s.pup, 1.0) end
     hideOne(s.pup)
     NETP.side[s.idx] = nil
+    if NETP.pmap then NETP.pmap[s.idx] = nil end
     local keep = {}
     for _, v in ipairs(NETP.list) do if v ~= s then keep[#keep + 1] = v end end
     NETP.list = keep
@@ -1436,20 +1437,38 @@ local barsStep = wrap("·多人血条", function(tn)
         boss, overhead = duelBoss, {}
         for _, s in ipairs(shown) do if s ~= boss then overhead[#overhead + 1] = s end end
     end
+    -- 11-17 用户"对战的两个人没各自注册 boss 血条"：对决观众在开打后（倒计时 / 交手 / 回合之间）两位选手各一条 Boss 血条（同旧版观战）
+    local bosses = { boss }
+    if DUEL ~= nil and DUEL.isDuel() and not duelBoss
+        and (DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend") then
+        local me = myPid()
+        if me ~= DUEL.fa and me ~= DUEL.fb then
+            local sa, sb = NETP.side[DUEL.fa], NETP.side[DUEL.fb]
+            bosses = {}
+            for _, x in ipairs({ sa, sb }) do
+                if x and valid(x.pup) and not x.idle and x.barMode > 0 then bosses[#bosses + 1] = x end
+            end
+            boss = bosses[1]
+            overhead = {}
+            for _, s in ipairs(shown) do if s ~= sa and s ~= sb then overhead[#overhead + 1] = s end end
+        end
+    end
+    local isBoss = {}
+    for _, b in ipairs(bosses) do isBoss[b] = true end
     if NETP.boss ~= boss then
-        if NETP.boss and NETP.boss.barReg then
+        if NETP.boss and NETP.boss.barReg and not isBoss[NETP.boss] then
             G.bossBarHide(NETP.boss.pup)
             NETP.boss.barReg, NETP.boss.bar, NETP.boss.barMiss = false, nil, 0
         end
         NETP.boss = boss
-        if boss then out("多人：Boss 血条换成 %s（锁定）", boss.tag) end
+        if boss then out("多人：Boss 血条换成 %s%s", boss.tag, #bosses > 1 and "（对决观众：两位选手各一条）" or "（锁定）") end
     end
     local claimed = {}
     for _, s in ipairs(overhead) do
         if valid(s.bar) then claimed[#claimed + 1] = s.bar end
     end
     for _, s in ipairs(NETP.list) do
-        if s ~= boss and s.barReg then
+        if not isBoss[s] and s.barReg then
             G.bossBarHide(s.pup)
             s.barReg, s.bar, s.barMiss, s.barWant = false, nil, 0, false
         end
@@ -1457,15 +1476,22 @@ local barsStep = wrap("·多人血条", function(tn)
             tagDrop(s)
         end
     end
-    if boss then
-        boss.barWant = true
-        local key = MP.barKey(boss)
-        if not valid(boss.bar) or key ~= boss.barKey then
-            if bossBarStep(boss, tn, claimed) and valid(boss.bar) then boss.barKey = key end
-        elseif tn - (boss.nameAt or 0) > 1.0 then
-            bossBarStep(boss, tn, claimed)
+    for _, b in ipairs(bosses) do
+        -- 两条 Boss 血条时互相让开对方已经认领的控件
+        local cl = claimed
+        if #bosses > 1 then
+            cl = {}
+            for _, x in ipairs(claimed) do cl[#cl + 1] = x end
+            for _, o in ipairs(bosses) do if o ~= b and valid(o.bar) then cl[#cl + 1] = o.bar end end
         end
-        tagDrop(boss)       -- 锁定的人只留 Boss 血条，别再叠一个头顶条
+        b.barWant = true
+        local key = MP.barKey(b)
+        if not valid(b.bar) or key ~= b.barKey then
+            if bossBarStep(b, tn, cl) and valid(b.bar) then b.barKey = key end
+        elseif tn - (b.nameAt or 0) > 1.0 then
+            bossBarStep(b, tn, cl)
+        end
+        tagDrop(b)       -- 有 Boss 血条的人别再叠一个头顶条
     end
     for _, s in ipairs(overhead) do
         if not s.idle and valid(s.pup) then
@@ -1657,6 +1683,21 @@ function MP.feed(t, tn)
     -- 自己在哪张图：每 2 秒读一次（以前每个包都 GetWorld 一遍）
     if not NETP.mapAt or tn - NETP.mapAt > 2.0 or tn < NETP.mapAt then NETP.mapAt, NETP.myMap = tn, G.mapName and G.mapName(p1) or nil end
     local myMap = NETP.myMap
+    if t.map and t.map ~= "" then NETP.pmap = NETP.pmap or {}; NETP.pmap[pid] = t.map end     -- 给 sameMapAs 比地图名用（11-17）
+    -- 11-17 排查补齐：每人的版本（联机程序在状态包里加的 av=），成员名单 / 屏幕提示里写"版本和你不同"
+    if t.av and t.av ~= "" then
+        NETP.pav = NETP.pav or {}
+        if NETP.pav[pid] ~= t.av then
+            NETP.pav[pid] = t.av
+            if ctx.version and t.av ~= ctx.version then out("!! 版本不一致：我 v%s，%s v%s", ctx.version, nameOf(pid), t.av) end
+        end
+    end
+    -- 11-17 跨地图去房主那里要房主的位置：在别的图时替身不摆、s.last 不更新，这里单独记
+    if t.map and t.map ~= "" and tonumber(t.x) then
+        NETP.ppos = NETP.ppos or {}
+        NETP.ppos[pid] = { X = tonumber(t.x), Y = tonumber(t.y) or 0, Z = tonumber(t.z) or 0, yaw = tonumber(t.yaw) or 0 }
+        if pid == hostPid() and MP.travelOnHostPkt then MP.travelOnHostPkt(tn) end
+    end
     if t.map and t.map ~= "" and myMap and t.map ~= myMap then
         if s then s.lastAt = tn; netIdle(s, true) end
         if not NETP.warnMap or tn - NETP.warnMap > 10 then NETP.warnMap = tn; out("多人：%d 号在另一张地图 %s（我在 %s），先不摆", pid, t.map, myMap) end
@@ -1788,7 +1829,7 @@ RULE = {
     mtd = {}, aiState = {}, aiGen = 0, aiAutoSynced = nil,
 }
 MP.rule = RULE
-MP.cfg = { size = 4, lives = 1, tl = 300, mode = "elim", teams = 0, buffs = 1, siege = 1, duelRot = "loser", ai = 0 }     -- §295 观众上限不在这里：用房间设置"观战 / 排队人数上限"（联机程序的 maxspec）
+MP.cfg = { size = 4, lives = 1, tl = 300, mode = "duel", teams = 0, buffs = 1, siege = 1, duelRot = "fixed", ai = 0 }     -- §295 观众上限不在这里：用房间设置"观战 / 排队人数上限"（联机程序的 maxspec）
 MP.SIZES, MP.LIVES, MP.TLS = { 3, 4, 5, 6, 8, 10, 12 }, { 1, 2, 3, 5 }, { 120, 180, 300, 600 }
 local ST_NAME = { idle = "没开打", cd = "倒计时", fight = "交手中", ["end"] = "打完了" }
 
@@ -1812,6 +1853,14 @@ inMatch = function() return RULE.st ~= "idle" end
 part = function(pid) return RULE.parts[pid] ~= nil end
 
 factionFor = function(s)
+    -- 11-17：对决里只有交手中的对手是敌对（pbz_duel 在开打 / 回合结束时用 setPeerFaction 切）；空闲时现在大家都显示，
+    -- 以前生成时一律 FOE，对决空闲又不锁血，排队的人能把你打掉血
+    if DUEL and DUEL.isDuel() then
+        local me = myPid()
+        local opp = (me == DUEL.fa and DUEL.fb) or (me == DUEL.fb and DUEL.fa) or 0
+        if DUEL.state == "fight" and opp > 0 and s.idx == opp then return FOE end
+        return FRIEND
+    end
     -- §306 T3 / T6：出生保护期间敌方替身一律临时改玩家阵营（打不到我、我也打不到他），
     -- 围攻保护也并进这里算：两个保护同时存在时不管哪个先结束，updatePuppetFactions 都能恢复成正确阵营。
     local prot = RULE.protTill ~= nil and now() < RULE.protTill
@@ -1873,8 +1922,8 @@ function MP.cfgLoad()
     MP.cfg.size = pick(kv.size, MP.SIZES, 4)
     MP.cfg.lives = pick(kv.lives, MP.LIVES, 1)
     MP.cfg.tl = pick(kv.tl, MP.TLS, 300)
-    MP.cfg.mode = (kv.mode == "score" or kv.mode == "elim" or kv.mode == "duel") and kv.mode or "elim"
-    MP.cfg.duelRot = (kv.duelRot == "both" or kv.duelRot == "loser") and kv.duelRot or "loser"
+    MP.cfg.mode = (kv.mode == "score" or kv.mode == "elim" or kv.mode == "duel") and kv.mode or "duel"
+    MP.cfg.duelRot = (kv.duelRot == "both" or kv.duelRot == "loser" or kv.duelRot == "fixed") and kv.duelRot or "fixed"
     MP.cfg.teams = (tonumber(kv.teams) == 1 and 1) or (tonumber(kv.teams) == 3 and 3) or 0     -- §317 三队 = 3
     MP.cfg.buffs = (kv.buffs == "0" or tonumber(kv.buffs) == 0) and 0 or 1
     MP.cfg.siege = (kv.siege == "0" or tonumber(kv.siege) == 0) and 0 or 1
@@ -1995,6 +2044,10 @@ local function renameBars()
             prefix = (myTm == sTm) and T("[队友] ", "[ALLY] ") or T("[敌] ", "[FOE] ")
         end
         local suffix = ""
+        -- 11-17 用户"接下来进入对决的人，要在名字上给个标记（即将对决）"：叫号中的两位选手头顶加标记
+        if DUEL and DUEL.isDuel() and DUEL.state == "ready" and (pid == DUEL.fa or pid == DUEL.fb) then
+            suffix = DUEL.readySet[pid] and T("  （即将对决 · 已准备）", "  (UP NEXT · READY)") or T("  （即将对决）", "  (UP NEXT)")
+        end
         if inMatch() and part(pid) then
             if RULE.mode == "score" then
                 local st = (RULE.stats and RULE.stats[pid]) or { k = 0, d = 0 }
@@ -2019,7 +2072,9 @@ local function specTargets()
     for _, s in ipairs(NETP.list) do
         if valid(s.pup) and not s.idle then
             if isD then
-                if s.idx == DUEL.fa or s.idx == DUEL.fb then list[#list + 1] = s end
+                -- 11-17：只看不上场的人全程观战；不交手的阶段场上所有人都可以看
+                local live = DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend"
+                if (not live) or s.idx == DUEL.fa or s.idx == DUEL.fb then list[#list + 1] = s end
             elseif not inMatch() or (part(s.idx) and s.pst ~= 2) then
                 list[#list + 1] = s
             end
@@ -2031,7 +2086,7 @@ local function specStart(kind)
     if SPEC.on then return end
     local p1, pc = getP1(), getP1PC()
     if not (valid(p1) and valid(pc)) then return end
-    SPEC.on, SPEC.idx = true, 1
+    SPEC.on, SPEC.idx, SPEC.mi = true, 1, 1
     pcall(function() p1:SetActorHiddenInGame(true) end)
     local cm = rawProp(p1, "CharacterMovement")
     if valid(cm) then pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end); pcall(function() cm:DisableMovement() end) end
@@ -2046,7 +2101,9 @@ local function specStart(kind)
     out("多人：进观战视角（镜头 %s）", valid(SPEC.cam) and "已建" or "建不了，镜头不动")
     if ctx.notice then
         if DUEL and DUEL.isDuel() then
-            ctx.notice(T("观战 1v1 对决", "SPECTATING 1V1 DUEL"), T("小键盘 * 切换视角", "NUMPAD * SWITCH TARGET"), 3.0)
+            ctx.notice(T("观战 1v1 对决", "SPECTATING 1V1 DUEL"),
+                       MP.specCam and T("PgUp / PgDn（或小键盘 *）换视角：侧面 / 跟 A / 跟 B / 自由", "PGUP / PGDN (OR NUM*): SIDE / FOLLOW A / FOLLOW B / FREE")
+                       or T("小键盘 * 切换视角", "NUMPAD * SWITCH TARGET"), 3.0)
         elseif kind == "late" then      -- §322 对局中进房
             ctx.notice(T("对局进行中：这局先观战", "MATCH IN PROGRESS: SPECTATING"), T("打完自动参加下一局 · 小键盘 * 换人看", "YOU JOIN THE NEXT MATCH · NUMPAD * SWITCH TARGET"), 4.0)
         elseif kind == "watch" then     -- §318
@@ -2067,13 +2124,57 @@ local function specStop()
     end
     if valid(pc) then
         pcall(function() pc:ResetIgnoreMoveInput() end)
+        pcall(function() pc:ResetIgnoreLookInput() end)      -- 11-17 借来的镜头切过固定视角会忽略视角输入，退出时放开
         if valid(p1) then pcall(function() pc:SetViewTargetWithBlend(p1, 0.4, 0, 0.0, false) end) end
     end
+    if MP.specCam then MP.specCam.reset() end
     out("多人：退出观战视角")
+end
+-- 11-17 用户："原有的第三视角和自由视角，PgUp / PgDn 切换都没了"：借观战 mod 的镜头（MP.specCam = SP.extCam，没装观战就没有）。
+-- 视角列表：对决 = 侧面中点 / 跟 A / 跟 B / 自由视角（同旧版 1v1 观战）；淘汰 / 积分 = 跟一个人（小键盘 * 换人）/ 自由视角。
+-- 0 = 多人房自己的"跟一个人"镜头
+SPEC.mi = 1
+function SPEC.modes()
+    local X = MP.specCam
+    if not X then return { 0 } end
+    if DUEL and DUEL.isDuel() then return { 1, 2, 3, X.FREE } end
+    return { 0, X.FREE }
+end
+function SPEC.mode()
+    local m = SPEC.modes()
+    if SPEC.mi > #m then SPEC.mi = 1 end
+    return m[SPEC.mi]
+end
+function SPEC.modeName(m)
+    local X = MP.specCam
+    if m == 0 or not X then return T("跟一个人（小键盘 * 换人）", "FOLLOW ONE (NUM* SWITCH)") end
+    return X.names[m] or tostring(m)
+end
+-- d = 1 下一个（PgDn）、-1 上一个（PgUp）
+function MP.stepView(d)
+    if not SPEC.on then return false end
+    local m = SPEC.modes()
+    if #m < 2 then return false end
+    local was = SPEC.mode()
+    SPEC.mi = (SPEC.mi - 1 + d) % #m + 1
+    local now_ = SPEC.mode()
+    local X = MP.specCam
+    if X and (was == X.FREE) ~= (now_ == X.FREE) and valid(SPEC.cam) then X.free(SPEC.cam, now_ == X.FREE) end
+    out("多人观战镜头 → %s", SPEC.modeName(now_))
+    if ctx.notice then ctx.notice(T("视角：", "CAMERA: ") .. SPEC.modeName(now_), "", 1.5) end
+    return true
 end
 -- 每帧：镜头放到目标身后 4.5 米、高 2 米，看着他
 local function specFrame()
     if not (SPEC.on and valid(SPEC.cam)) then return end
+    local m, X = SPEC.mode(), MP.specCam
+    if m ~= 0 and X then
+        local a, b
+        if DUEL and DUEL.isDuel() then a, b = NETP.side[DUEL.fa], NETP.side[DUEL.fb] end
+        if m == X.FREE or (a and b and valid(a.pup) and valid(b.pup)) then
+            if X.place(SPEC.cam, a, b, m) then return end
+        end
+    end
     local list = specTargets()
     if #list == 0 then return end
     if SPEC.idx > #list then SPEC.idx = 1 end
@@ -2088,6 +2189,7 @@ end
 MP.specFrameP = ctx.prof and ctx.prof("·多人观战镜头", specFrame) or specFrame
 function MP.nextView()
     if not SPEC.on then return false end
+    if SPEC.mode() ~= 0 then return MP.stepView(1) end     -- 对决 / 自由视角里小键盘 * = 下一个视角（同旧版观战）
     SPEC.idx = SPEC.idx + 1
     local list = specTargets()
     if SPEC.idx > #list then SPEC.idx = 1 end
@@ -2542,6 +2644,11 @@ enter = function(st, tn, why)
         if #absent > 0 then out("多人对局：%s 不在这张图 / 没包，这局不参加", table.concat(absent, "、")) end
 
         if ctx.rulesBegin then ctx.rulesBegin("cd", "多人对局倒计时", true, tn) end
+        -- 11-17 排查补齐（同对决 / 旧版 1v1 的 enter("cd")）：倒计时无敌 + 清火流星特效 / 拙壁盾、站起、补满
+        if part(myPid()) and ctx.cdStart then
+            local p1 = getP1()
+            if valid(p1) then ctx.cdStart(p1) end
+        end
 
         local who = {}
         for pid in pairs(RULE.parts) do who[#who + 1] = nameOf(pid) end
@@ -2567,6 +2674,12 @@ enter = function(st, tn, why)
         end
         if ctx.rulesBegin then ctx.rulesBegin("fight", "多人对局开打", false, tn) end
         if ctx.arnUnlock then ctx.arnUnlock("多人开打") end
+        -- 11-17 排查补齐（同对决 / 旧版 1v1 的 enter("fight")）：开打清 buff / debuff、清倒计时里按下的键、收留场召唤物、
+        -- 挂上"战斗中"状态（风雷剑 / 炽刃火形等要它）
+        if part(myPid()) and ctx.fightStart then
+            local p1 = getP1()
+            if valid(p1) then ctx.fightStart(p1) end
+        end
         updatePuppetFactions()
         -- §322 中途进房（第一次收到房主的对局状态就是交手中）/ 只看不上场：这局不参加，进观战镜头，不弹"开打！"
         local benchedMe = not part(myPid())
@@ -2586,6 +2699,8 @@ enter = function(st, tn, why)
         end
         if ctx.rulesEnd then ctx.rulesEnd("多人对局结束") end
         if ctx.arnUnlock then ctx.arnUnlock("多人结束") end
+        if ctx.pcbOff then ctx.pcbOff("多人对局结束") end     -- 11-17 撤"战斗中"状态
+        if ctx.unshield then local p1 = getP1(); if valid(p1) then ctx.unshield(p1) end end
         if ctx.onMatchEnd and RULE.matchStarted then
             ctx.onMatchEnd(RULE.activeMid or RULE.mid, "对局结束")
             RULE.matchStarted = false
@@ -2604,6 +2719,7 @@ enter = function(st, tn, why)
         if ctx.rulesClear then ctx.rulesClear() end
         RULE.arena = nil
         if ctx.arnUnlock then ctx.arnUnlock("多人回自由活动") end
+        if ctx.pcbOff then ctx.pcbOff("多人回自由活动") end     -- 11-17 撤"战斗中"状态
         if ctx.onMatchEnd and RULE.matchStarted then
             ctx.onMatchEnd(RULE.activeMid or RULE.mid, why or "对局取消")
             RULE.matchStarted = false
@@ -2746,14 +2862,46 @@ checkHostChange = function(tn)
     lastHostPid = curHost
 end
 
+-- 11-17 排查补齐：3 秒内按两次 F1 才算（同旧版 1v1 / 对决的认输、停止）
+MP.ARM_SEC = 3.0
+local function f1Arm(kind, tn)
+    if MP.armKind == kind and MP.armAt and tn - MP.armAt <= MP.ARM_SEC then MP.armKind, MP.armAt = nil, nil; return true end
+    MP.armKind, MP.armAt = kind, tn
+    return false
+end
 function MP.f1()
     local tn = now()
+    -- 11-17 排查补齐（同旧版 1v1 matchStart）：Phantom Pact 合作联机中不准备、不开局（对局中的认输 / 取消照常）。
+    -- 血量 0 的检查不搬：房间里对局外锁血会把血钳在 0.01，倒计时本来就补满
+    local busy = not inMatch() and not (DUEL and DUEL.isDuel() and DUEL.inMatch())
+    if busy and ctx.ppOn and ctx.ppOn() then
+        if ctx.notice then ctx.notice(T("Phantom Pact 合作联机中", "PHANTOM PACT CO-OP IS ON"), T("先断开它再开对局", "DISCONNECT IT FIRST"), 3.0) end
+        return
+    end
     if DUEL and DUEL.isDuel() then return DUEL.f1() end
     if not isHost() then
+        -- 11-17 排查补齐：单局淘汰交手中客机 3 秒内按两次 F1 = 弃权（这局出局、进观战）；积分赛没有出局，不能弃权
+        if RULE.st == "fight" and part(myPid()) and RULE.mode ~= "score" and RULE.my ~= 2 then
+            if f1Arm("surrender", tn) then
+                RULE.deaths, RULE.my = RULE.lives, 2
+                out("多人对局：我弃权（这局出局）")
+                specStart()
+                if ctx.notice then ctx.notice(T("已弃权", "YOU GAVE UP"), T("这局出局，观战中", "OUT FOR THIS MATCH; SPECTATING"), 2.5) end
+            elseif ctx.notice then
+                ctx.notice(T("再按一次 F1 弃权（这局出局）", "PRESS F1 AGAIN TO GIVE UP (OUT FOR THIS MATCH)"), "", 2.5)
+            end
+            return
+        end
+        if MP.travelF1(tn) then return end
         if ctx.notice then ctx.notice(T("多人对局由房主开始（不用准备）", "THE HOST STARTS THE MATCH (NO READY CHECK)"), inMatch() and ("现在：" .. (ST_NAME[RULE.st] or RULE.st)) or "", 2.0) end
         return
     end
     if inMatch() and RULE.st ~= "end" then
+        -- 11-17 排查补齐：以前按一下就取消整局，现在 3 秒内按两次才取消
+        if not f1Arm("cancel", tn) then
+            if ctx.notice then ctx.notice(T("再按一次 F1 取消这一局", "PRESS F1 AGAIN TO CANCEL THE MATCH"), "", 2.5) end
+            return
+        end
         out("多人对局：主机取消")
         enter("idle", tn)
         return
@@ -3912,6 +4060,18 @@ end
 local hudRowsBase
 function MP.hudRows(tn)
     local rows = hudRowsBase(tn)
+    -- 11-17 排查补齐：房里有人版本和我不同（以前只有旧版 1v1 的空闲提示有，房间里看不到）——对局外右侧一行小字
+    if rows and ctx.version and NETP.pav and not inMatch() and not (DUEL and DUEL.inMatch()) then
+        local diff = {}
+        for pid, av in pairs(NETP.pav) do
+            if av ~= ctx.version and NETP.side[pid] then diff[#diff + 1] = string.format("%s v%s", nameOf(pid), av) end
+        end
+        if #diff > 0 then
+            table.sort(diff)
+            rows[#rows + 1] = { c = string.format(T("版本不一致（你 v%s）：%s", "VERSION MISMATCH (YOU v%s): %s"), ctx.version, table.concat(diff, "、")),
+                                col = { R = 255, G = 140, B = 40, A = 255 }, size = 0.6 }
+        end
+    end
     -- §336 场地道具剩余秒数（以前只有捡到那一下的提示，看不出效果还在不在）
     tn = tn or now()
     if rows and RULE.st == "fight" then
@@ -3933,7 +4093,7 @@ hudRowsBase = function(tn)
         local modeName = isHost() and (c.mode == "score" and T("积分赛", "SCORE ATTACK") or T("单局淘汰", "ELIMINATION")) or nil     -- 客机不知道房主选的玩法，不写
         local n = tonumber(ses().mpn) or 0
         local rows = {}
-        rows[#rows + 1] = { c = string.format(T("多人房间 · %d 人", "MULTIPLAYER ROOM · %d"), n) .. (modeName and (" · " .. modeName) or ""),
+        rows[#rows + 1] = { c = string.format(T("房间 · %d 人", "ROOM · %d"), n) .. (modeName and (" · " .. modeName) or ""),
                             col = { R = 255, G = 215, B = 90, A = 255 } }
         local how = isHost() and T("按 F1 开始多人对局（房里的人都参加）", "PRESS F1 TO START (EVERYONE IN THE ROOM PLAYS)")
                     or T("等待房主按 F1 开局（不用准备）", "WAITING FOR THE HOST TO PRESS F1 (NO READY CHECK)")
@@ -4067,6 +4227,8 @@ function MP.memberRows(items, T_)
         if m.isMe then bits[#bits + 1] = T_("（我）", "(ME)") end
         local line = table.concat(bits, " ")
         line = line .. "  " .. (m.state == "here" and T_("同图", "HERE") or T_("别的图", "ELSEWHERE"))
+        local av = (not m.isMe) and NETP.pav and NETP.pav[m.pid]       -- 11-17 版本和我不同
+        if av and ctx.version and av ~= ctx.version then line = line .. string.format(T_("  [版本 v%s]", "  [v%s]"), av) end
         -- 对局中：队伍 + 战绩 / 剩命
         if inMatch() and part(m.pid) then
             if MP.teamsOn(RULE.teams) and RULE.teamOf then
@@ -4151,7 +4313,7 @@ end
 -- 挪到"玩法设置"页（mods/multi/init.lua 用 ui.addPage 登记 MP.rulesPage）。只有房主有入口；入口和"房间设置… / 系统设置…"并排（base.playBtns）
 function MP.rulesRows(items, pT)
     local T_ = pT or T
-    if not MP.inMp() then items[#items + 1] = { label = T_("（不在多人房间里）", "(NOT IN A MULTIPLAYER ROOM)") }; return end
+    if not MP.inMp() then items[#items + 1] = { label = T_("（不在房间里）", "(NOT IN A ROOM)") }; return end
     local isD = DUEL and DUEL.isDuel()
     local idle = (not inMatch()) and not (DUEL and DUEL.inMatch())
     -- 客机的 MP.cfg 是自己本地的 mp.txt，不是房主的（对局开始才收到房主的 RULE），所以客机不列（和以前一样）
@@ -4240,6 +4402,85 @@ function MP.rulesEntry(items, pT)
 end
 
 -- 面板（main.lua 连着时那一页调）：多人房间的状态、主机的设置和开始按钮
+-- 11-17 用户："为啥不做成进入房间时自动传送。离开过远提示按两下 F1 传送"。
+-- 进房后第一次收到房主的包：房主在别的图、或同图 50 米以外 → 自动走游戏传送过去（会自动存档，旧版 1v1 那套 MAPGO）。
+-- 之后走远了（别的图 / 50 米以外）：对局外一直挂提示"连按两次 F1 传送过去"；面板里也有一行。
+-- 传送前先撤房间锁血（MAPGO.dirty 见到锁血会拒绝：游戏要自动存档），到了以后房间循环自己会再挂上。
+MP.TRAVEL_NEAR, MP.TRAVEL_NAG = 50.0, 6.0     -- 11-17 实测：提示 3 秒、15 秒一次太短，改成离远期间一直挂着（每 6 秒续 6 秒）
+function MP.travelTarget()
+    if not MP.inMp() or isHost() then return nil end
+    if inMatch() or (DUEL and DUEL.liveMatch and DUEL.liveMatch()) then return nil end
+    if ST.travel then return nil end
+    local hp = hostPid()
+    if not hp or hp <= 0 or hp == myPid() then return nil end
+    local hmap = NETP.pmap and NETP.pmap[hp]
+    local hpos = NETP.ppos and NETP.ppos[hp]
+    local p1 = getP1()
+    if not (hmap and hpos and valid(p1)) then return nil end
+    local mine = NETP.myMap or (G.mapName and G.mapName(p1)) or nil
+    if not mine then return nil end
+    if hmap ~= mine then return { cross = true, map = hmap, pos = hpos } end
+    local l = loc(p1)
+    if not l then return nil end
+    return { cross = false, map = hmap, pos = hpos, dist = d2(l, hpos) / 100.0 }
+end
+-- 11-17 用户："离开 50 米就给提示，回到 50 米内就变回准备，别搞 2 套"。
+-- 离远 = 别的图 / 超过 50 米：挂提示、F1 管传送（不算准备）、面板有按钮、进房自动传；回到 50 米内全部取消
+function MP.travelFar(tt)
+    tt = tt or MP.travelTarget()
+    if not tt then return false, nil end
+    return (tt.cross or tt.dist > MP.TRAVEL_NEAR) == true, tt
+end
+function MP.travelGo(why)
+    local tt = MP.travelTarget()
+    if not tt then return false, "现在不能传送" end
+    if not ctx.goToMap then return false, "这个版本没有传送" end
+    local p1 = getP1()
+    if NETP.locked and valid(p1) then G.unlockSelf(p1, "传送前撤锁血（游戏会自动存档）"); NETP.locked = nil end
+    local ok, err = ctx.goToMap(tt.map, tt.pos, tt.pos.yaw, not tt.cross)
+    out("多人：%s传送到房主那里（%s）：%s", why or "", tt.cross and ("别的图 " .. tt.map) or string.format("同图 %.0f 米", tt.dist or 0),
+        ok and "已开始" or ("失败：" .. tostring(err)))
+    if not ok and ctx.notice then ctx.notice(T("不能传送到房主那里", "CAN'T TRAVEL TO THE HOST"), tostring(err or ""), 3.0) end
+    return ok, err
+end
+function MP.travelOnHostPkt(tn)
+    local s = ses()
+    local key = tostring(s and s.mpid) .. "|" .. tostring(s and s.mphost)
+    if MP.travelKey ~= key then MP.travelKey, MP.travelDone, MP.travelNagAt = key, nil, nil end
+    local tt = MP.travelTarget()
+    if not MP.travelDone then
+        if not tt then return end
+        MP.travelDone = true
+        if tt.cross or tt.dist > MP.TRAVEL_NEAR then
+            if not MP.travelGo("进房自动") and ctx.notice then
+                ctx.notice(T("没能自动传送到房主那里", "COULDN'T AUTO-TRAVEL TO THE HOST"), T("对局外连按两次 F1 再试", "PRESS F1 TWICE (OUT OF A MATCH) TO RETRY"), 4.0)
+            end
+        end
+        return
+    end
+    local far = MP.travelFar(tt)
+    if far and (not MP.travelNagAt or tn - MP.travelNagAt > MP.TRAVEL_NAG) then
+        MP.travelNagAt = tn
+        if ctx.notice then
+            ctx.notice(tt.cross and T("房主在另一张地图", "THE HOST IS ON ANOTHER MAP")
+                or string.format(T("离房主 %.0f 米", "%.0f M FROM THE HOST"), tt.dist),
+                T("连按两次 F1 传送过去（会自动存档）", "PRESS F1 TWICE TO TRAVEL THERE (AUTO-SAVES)"), MP.TRAVEL_NAG + 0.5)
+        end
+    end
+end
+-- F1：能传送时第一次提示、3 秒内第二次就传。返回 true = 这次 F1 用掉了
+function MP.travelF1(tn)
+    local far, tt = MP.travelFar()
+    if not far then return false end
+    if f1Arm("travel", tn) then MP.travelGo("F1 两次")
+    elseif ctx.notice then
+        ctx.notice(tt.cross and T("再按一次 F1 前往房主所在地图", "PRESS F1 AGAIN TO GO TO THE HOST'S MAP")
+            or string.format(T("再按一次 F1 传送到房主身边（%.0f 米）", "PRESS F1 AGAIN TO TELEPORT TO THE HOST (%.0f M)"), tt.dist),
+            T("会自动存档", "AUTO-SAVES"), 2.5)
+    end
+    return true
+end
+
 function MP.panel(items, pT)
     local T_ = pT or T
     if not MP.inMp() then return end
@@ -4252,7 +4493,7 @@ function MP.panel(items, pT)
     elseif inMatch() then
         stTxt = "  · " .. (ST_NAME[RULE.st] or RULE.st)
     end
-    items[#items + 1] = { label = string.format(T_("多人房间：我是 %s 号，房间 %s 人%s", "MULTIPLAYER: I AM #%s, %s IN ROOM%s"),
+    items[#items + 1] = { label = string.format(T_("房间：我是 %s 号，房间 %s 人%s", "ROOM: I AM #%s, %s IN ROOM%s"),
         tostring(s.mpid), tostring(s.mpn), stTxt) }
     -- §309：房是我开的、我也是对局主机时不再列"对局主机：你"（标题行已经写了房主地址），给面板行数留余量；
     -- 服务器房里当对局主机的玩家照旧显示（标题行看不出来）
@@ -4266,27 +4507,18 @@ function MP.panel(items, pT)
         items[#items + 1] = { label = string.format(T_("对局主机：%s（%d号%s）", "MATCH HOST: %s (#%d%s)"), hostName(hp), hp, extraAddr) }
     end
 
-    -- §306 T4：对局外的客机，房主替身在同一张图且离我 30 米以上 → 一键传送到房主身边
+    -- 11-17 用户："进入房间时自动传送，离开过远提示按两下 F1 传送"。面板里也留一行手动的（房主在别的图 / 同图 50 米以外）
     local function addTeleport()
-        if isHost() or inMatch() or (DUEL and DUEL.inMatch()) then return end
-        local hs = NETP.side[hostPid()]
-        if not (hs and valid(hs.pup) and not hs.idle) then return end
-        local hm = hs.last and hs.last.map
-        if hm and hm ~= "" and NETP.myMap and hm ~= NETP.myMap then return end
-        local p1, hl = getP1(), loc(hs.pup)
-        if not (valid(p1) and hl) then return end
-        local l = loc(p1)
-        if not l or d2(l, hl) <= 3000.0 then return end
-        local yaw = G.yawOf and G.yawOf(hs.pup) or 0
-        local ang = math.rad(yaw) - math.pi / 2     -- 房主右手边 1.5 米
-        local target = { X = hl.X + math.cos(ang) * 150.0, Y = hl.Y + math.sin(ang) * 150.0, Z = hl.Z }
-        items[#items + 1] = { label = T_("传送到房主身边", "TELEPORT TO HOST"), act = function()
-            local me = getP1()
-            if valid(me) and ctx.safePlace then
-                ctx.safePlace(me, target, hl, yaw, "多人传送到房主身边")
-                out("多人：传送到房主身边")
-            end
-        end }
+        local far, tt = MP.travelFar()
+        if not far then return end
+        local label
+        if tt.cross then
+            local where = ctx.mapLabel and ctx.mapLabel(tt.map, tt.pos) or tt.map
+            label = T_("前往房主所在地图：", "GO TO THE HOST'S MAP: ") .. where .. T_("（会自动存档）", " (AUTO-SAVES)")
+        else
+            label = string.format(T_("传送到房主身边（离 %.0f 米，会自动存档）", "TELEPORT TO HOST (%.0f M AWAY, AUTO-SAVES)"), tt.dist)
+        end
+        items[#items + 1] = { label = label, act = function() MP.travelGo("面板") end }
     end
 
     if not isHost() then
@@ -4349,6 +4581,10 @@ MP.rfpCtx = function()
 end
 -- §307 D4：基础联机包（CDL.active / NET.resApply / 规则指纹）问对决的轻量快照；不在对决里 = nil
 MP.duelInfo = function() return (DUEL and DUEL.info and DUEL.info()) or nil end
+-- 11-17 排查补齐：单局淘汰 / 积分赛倒计时里我参加 = 禁出招（main.lua CDL.active，以前只认旧版 1v1 和对决）
+MP.cdActive = function() return RULE.st == "cd" and part(myPid()) end
+-- 11-17 对决开战点光柱（main.lua ARN.want 问）
+MP.duelMarkers = function(myMap) return DUEL and DUEL.markers and DUEL.markers(myMap) or nil end
 -- §307 D4：规则指纹 RFP.build 的 bo / tl 覆盖（fornet_match.lua 的 ctx.rfpOverride 或 BASEHOOK.mp.rfpOverride）
 -- 对决 = 1v1 的局数 / 时限；多人（非对决）= bo=0、多人时限；不在多人房 = nil（照旧用 1v1 的 MATCH）
 MP.rfpOverride = function()
@@ -4364,6 +4600,7 @@ do
         isHost = function() return isHost() end,
         myPid = function() return myPid() end,
         hostPid = function() return hostPid() end,
+        travelF1 = function() return MP.travelF1(now()) end,
         nameOf = function(pid) return nameOf(pid) end,
         roster = function()
             -- §306 T9：和 MP.members() 同一份名单（mpl + 房主 + 我，不拿 NETP.side 补人）
@@ -4424,6 +4661,14 @@ do
         sameMapAs = function(pid)
             pid = tonumber(pid) or 0
             if pid <= 0 or pid == myPid() then return true end
+            -- 11-17 实测：对决叫号那一瞬对手的替身还藏着（idle 不生成），以前只按"替身在不在"判，房主会闪一下"不在对决地图"。
+            -- 有对方包里的地图名就直接比地图名；没有才退回看替身
+            local theirs = NETP.pmap and NETP.pmap[pid]
+            if theirs then
+                local p1 = getP1()
+                local mine = valid(p1) and G.mapName and G.mapName(p1) or NETP.myMap
+                if mine and mine ~= "" then return theirs == mine end
+            end
             local s = NETP.side[pid]
             if not s then return true end
             if s.idle then return false end
@@ -4516,6 +4761,8 @@ do
             local s = NETP.side[pid]
             if s and valid(s.pup) then setFaction(s.pup, isFoe and FOE or FRIEND) end
         end,
+        renameBars = function() renameBars() end,      -- 11-17 头顶名字"（即将对决）"跟着叫号 / 准备变
+        arnRefresh = function(why) if ctx.arnRefresh then ctx.arnRefresh(why) end end,     -- 11-17 开战点光柱
         pruneNonFighters = function(fa, fb)
             for pid, s in pairs(NETP.side) do
                 if pid ~= fa and pid ~= fb then netIdle(s, true) end
@@ -4584,6 +4831,9 @@ function MP.attach(opts)
     on("base.mapLoad", function() MP.onMapLoad() end)
     on("base.puppetContact", function(pup, tn) MP.noteContact(pup, tn) end)
     ask("base.f1", function() if MP.inMp and MP.inMp() then MP.f1(); return true end end)    -- 多人房里 F1 = 准备 / 开始
+    ask("base.navKey", function(what)                                             -- 11-17 观战中、面板关着：PgDn / PgUp 换视角
+        if SPEC.on and (what == "up" or what == "down") then return MP.stepView(what == "down" and 1 or -1) end
+    end)
     pcall(MP.cfgLoad)
     if opts.bind and Key then
         local open = opts.panelOpen or function() return false end

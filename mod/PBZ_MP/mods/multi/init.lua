@@ -25,6 +25,8 @@ if not (P and P.multiCtx and P.setMp) then error("基础联机包没有提供 pv
 local MP = mk(P.multiCtx())
 if not MP then error("多人构造失败") end
 P.setMp(MP)     -- 登记成基础联机包的多人房查询口（BASEHOOK.mp）
+-- 11-17 多人房 / 对决的观战借观战 mod 的镜头（侧面 / 跟 A / 跟 B / 自由视角）；没装观战就只有多人房自己的跟随镜头
+do local ok, SPM = pcall(M.use, "spec"); if ok and type(SPM) == "table" and SPM.extCam then MP.specCam = SPM.extCam end end
 -- §309 房间成员单独一页（房间面板里只留一行入口；以前直接列，房主面板 3 人以上挤掉"房间设置… / 系统设置…"）
 if UIS and UIS.addPage and UIS.go then
     MP.membersPage = UIS.addPage({ id = "members", title = "房间成员", titleEn = "ROOM MEMBERS", back = "main", room = true,     -- 11-15 room：房间里的页，不列进"已装的玩法"

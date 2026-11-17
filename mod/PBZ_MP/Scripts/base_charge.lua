@@ -387,6 +387,7 @@ end
 
 -- 这一招最多等多久（判定窗口 / 记录保留）
 function CHG.maxAge(name)
+    if SHOT and SHOT.FAM[name] then return math.max(CHG.JUDGE_MAX, SHOT.END_MAX) end   -- §377 一招里好几发：等到对方收招
     return name == CHG.LASER.name and CHG.LASER.max or CHG.JUDGE_MAX
 end
 
@@ -806,6 +807,7 @@ function CHG.pupStep(pup, tn)
     for id, f in pairs(CHG.fired) do
         CHG.selfStep(pup, id, f, tn)
         CHG.laserStep(pup, id, f, tn)       -- §139
+        if f.shot then SHOT.pupStep(pup, id, f, tn) end   -- §377
         local secs = CHG.rel[id]
         if CHG.VEHICLE.names[f.name] and valid(pup) then
             if secs and tn >= f.at + secs then CHG.vehicleOff(pup, id, f, tn, string.format("对方按了 %.2f 秒", secs))
@@ -825,6 +827,7 @@ function CHG.keepJudge(j, tn, pupM)
     if late and age < late then return true end
     if not (j.name and CHG.isHold(j.name)) or age > CHG.maxAge(j.name) then return false end
     local f = CHG.fired[j.id]
+    if f and f.shot and not f.shot.done then return true end          -- §377 对方还在一发一发地射
     if f and pupM and pupM ~= "" and f.mon[pupM] then return true end     -- 替身还在播这一招的动作（蓄力 / 出招）
     local secs = CHG.rel[j.id]
     if secs then return age < secs + JUDGE_WIN end
@@ -1035,7 +1038,264 @@ function CHG.step(p1, pup, tn)
     end
     CHG.list = keep
 end
+
+-- ============================================================ §377 一个技能里点按出好几发的影之武装（羽弓 / 虎炮）
+-- 11-17 玩家：羽弓点 Ctrl 连射三箭（扣 3 点暗源），对面看到的是一发蓄满、只吃一箭伤害；虎炮蓄不蓄力对面都是蓄满那一炮。
+-- 日志：发送方一次 GA_UnnamedBow_C 里 Charge → Shoot_Normal 三回；替身 Charge → 2.96 秒 Shoot_Max 一发就收。
+-- 原因：出哪一档、出几发是技能里按"现在按没按着"定的，替身没有输入组件（§140 造输入走不通），永远当一直按着 → 蓄满一发。
+-- 做法（同 §276.10 马车：看发送方自己的状态变化，不靠按键 / 秒数）：
+--   发：我播到这几招的出手动作 → 等最多 WAIT 秒看我名下新出现的子弹是哪一档（子弹数据 / 类名带 Normal / Max / Great / Perfect），
+--       发 sub=<次数>:<出手动作>-<档位>；离开这把武器的动作 → 发 sub=<次数>:SHOTEND-<键>。状态包带 shs=1 表示我会发这些
+--   收（对方 shs=1）：替身照常放这招（攻击力系数、判定窗口照旧），蓄力动作播到 pauseAt 秒暂停（不让它自己蓄满出手）；
+--       每收到一发，用这招技能实例在替身身上生成那一档的子弹（同 §139.7 激光发射器：CreateBullet + Initialize + Start）；
+--       收到 SHOTEND / 等太久 → 取消替身的这招、停掉蓄力动作。对方旧版（没有 shs=）照旧
+SHOT = {
+    FAM = {
+        GA_UnnamedBow_C = { key = "UnnamedBow", charge = "AM_Hun_UnnamedBow_Charge", pauseAt = 0.5,
+            dir = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/ShachiWeapon/",
+            shots = { AM_Hun_UnnamedBow_Shoot_Normal = "Normal", AM_Hun_UnnamedBow_Shoot_Max = "Max" },
+            tiers = { Normal = "B_UnnamedBow_Normal", Max = "B_UnnamedBow_Max", Perfect = "B_UnnamedBow_Perfect" } },
+        GA_TigerCannon_C = { key = "TigerCannon", charge = "AM_Hun_TigerCannon_Prepare", pauseAt = 0.8,
+            dir = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/ShachiWeapon/TigerCannon/",
+            shots = { AM_Hun_TigerCannon_Launch_NormalGreat = "Normal", AM_Hun_TigerCannon_Launch_Perfect = "Perfect" },
+            tiers = { Normal = "B_TigerCannon_Normal", Great = "B_TigerCannon_Great", Perfect = "B_TigerCannon_Perfect" } },
+    },
+    TIER_ORDER = { "Perfect", "Great", "Max", "Normal" },      -- 名字里找档位的顺序（NormalGreat 先认 Great）
+    DATA_KEYS = { "BulletData", "Data", "CurrentBulletData", "BulletDataAsset" },
+    WAIT = 0.25, END_GAP = 0.2, END_MAX = 12.0, UP = 60.0, FWD = 40.0,
+    byMon = {}, bdCache = {}, logN = 0, LOG_MAX = 80, probed = {},
+    send = { known = {} },
+}
+for name, fam in pairs(SHOT.FAM) do
+    fam.name = name
+    for m in pairs(fam.shots) do SHOT.byMon[m] = name end
+end
+
+function SHOT.log(fmt, ...)
+    SHOT.logN = SHOT.logN + 1
+    if SHOT.logN <= SHOT.LOG_MAX then out(fmt, ...) end
+end
+
+-- 名字里的档位（按 TIER_ORDER，fam.tiers 里有的才算）
+function SHOT.tierIn(fam, s)
+    if not s then return nil end
+    for _, t in ipairs(SHOT.TIER_ORDER) do
+        if fam.tiers[t] and s:find(t, 1, true) then return t end
+    end
+    return nil
+end
+
+-- 子弹的数据名（几个可能的变量名挨个试）
+function SHOT.dataName(b)
+    for _, k in ipairs(SHOT.DATA_KEYS) do
+        local v = rawProp(b, k)
+        if v ~= nil and valid(v) then return shortName(full(v)), k end
+    end
+    return nil
+end
+
+-- 我名下在跑的、这一招放出来的子弹：{ key = 全名, cls = 类名, data = 数据名 }
+function SHOT.myBullets(p1, fam)
+    local ok, l = pcall(function() return FindAllOf("BulletActorBase") end)
+    local r = {}
+    for _, b in ipairs(ok and l or {}) do
+        if valid(b) and rawProp(b, "BulletStatus") == 2 and sameObj(rawProp(b, "BulletOwnerAvatar"), p1) then
+            local src = rawProp(b, "BulletSourceAbility")
+            local sn = valid(src) and shortName(full(src)) or ""
+            if sn == "" or sn:find(fam.key, 1, true) then
+                r[#r + 1] = { key = full(b), cls = shortName(full(b)), data = SHOT.dataName(b), src = sn }
+            end
+        end
+    end
+    return r
+end
+
+-- 发：这一发定下档位 → 发出去
+function SHOT.emit(p1, s, tn)
+    local fam = SHOT.FAM[s.fam]
+    local tier, from = nil, "动作默认"
+    for _, b in ipairs(SHOT.myBullets(p1, fam)) do
+        if not SHOT.send.known[b.key] then
+            SHOT.send.known[b.key] = true
+            local t = SHOT.tierIn(fam, b.data) or SHOT.tierIn(fam, b.cls)
+            if t and not tier then tier, from = t, string.format("子弹 %s / %s", tostring(b.cls), tostring(b.data)) end
+        end
+    end
+    if not tier and tn - s.at < SHOT.WAIT then return false end      -- 子弹还没出来：下一帧再看
+    tier = tier or fam.shots[s.mon]
+    NET.subN, NET.subT = (NET.subN or 0) + 1, s.mon .. "-" .. tier
+    SHOT.send.lastAt = tn
+    SHOT.log("§377 我 %s 出手 %s → 发 %s 档（%s，%.2f 秒后）", s.fam, s.mon, tier, from, tn - s.at)
+    return true
+end
+
+-- 发：每帧（netSend 里，hm = 我现在的动作，prev = 上一帧的）
+function SHOT.mine(p1, hm, prev, tn)
+    local S = SHOT.send
+    if S.pend and SHOT.emit(p1, S.pend, tn) then S.pend = nil end
+    if hm ~= prev and hm then
+        local name = SHOT.byMon[hm]
+        for n, fam in pairs(SHOT.FAM) do
+            if hm == fam.charge and S.active ~= n then
+                S.active, S.known = n, {}
+                for _, b in ipairs(SHOT.myBullets(p1, fam)) do S.known[b.key] = true end   -- 起手时已经在场的不算
+            end
+        end
+        if name then
+            S.active = S.active or name
+            if S.pend then SHOT.emit(p1, S.pend, tn + SHOT.WAIT); S.pend = nil end    -- 上一发还没定：按动作默认先发
+            S.pend = { mon = hm, fam = name, at = tn }
+            if SHOT.emit(p1, S.pend, tn) then S.pend = nil end
+        end
+    end
+    -- 离开这把武器的动作：发结束（和上一发隔开 END_GAP，不然同一个包里 sub= 只剩最后一个）
+    if S.active and not S.pend and not (type(hm) == "string" and hm:find(SHOT.FAM[S.active].key, 1, true))
+        and tn - (S.lastAt or -99) >= SHOT.END_GAP then
+        NET.subN, NET.subT = (NET.subN or 0) + 1, "SHOTEND-" .. SHOT.FAM[S.active].key
+        S.lastAt = tn
+        SHOT.log("§377 我 %s 收招（动作 %s）→ 发 SHOTEND", S.active, tostring(hm))
+        S.active = nil
+    end
+end
+
+function SHOT.wire() return "shs=1\n" end
+function SHOT.recv(v) NET.rshs = (v == "1") end
+
+-- 收：sub= 里是不是这类（出手 / 结束）
+function SHOT.isWire(sm)
+    if not sm then return false end
+    if sm:find("SHOTEND-", 1, true) == 1 then return true end
+    local mon = sm:match("^(.-)%-%a+$")
+    return mon ~= nil and SHOT.byMon[mon] ~= nil
+end
+
+-- 收：替身放出这一招（AIR.fire 放成功时）
+function SHOT.onFire(pup, e, tn)
+    local fam = SHOT.FAM[e.name]
+    local f = CHG.fired[e.id]
+    if not (fam and f and NET.rshs) then return end
+    f.shot = { at = tn, n = 0 }
+    SHOT.log("§377 替身放 远端#%d %s：对方会发每一发（shs=1）→ 蓄力动作到 %.2f 秒停住，按对方出手生成子弹", e.id, e.name, fam.pauseAt)
+end
+
+-- 这一招最近一次放出、还没收的那条
+function SHOT.latest(name)
+    local id, f = nil, nil
+    for i, x in pairs(CHG.fired) do
+        if x.shot and not x.shot.done and (not name or x.name == name) and (not id or i > id) then id, f = i, x end
+    end
+    return id, f
+end
+
+-- 子弹数据：先按数据资产找（B_x.B_x），再找蓝图类的默认对象（B_x.Default__B_x_C）。找到哪种记一次
+function SHOT.bd(fam, tier)
+    local b = fam.tiers[tier]
+    if not b then return nil, "没有这一档" end
+    local c = SHOT.bdCache[b]
+    if c and valid(c.o) then return c.o, c.how end
+    local p = fam.dir .. b
+    local tries = { { p .. "." .. b, "数据资产" }, { p .. "." .. "Default__" .. b .. "_C", "类默认对象" } }
+    for _, t in ipairs(tries) do
+        local o = G.findOrLoad(t[1])
+        if valid(o) then
+            SHOT.bdCache[b] = { o = o, how = t[2] }
+            SHOT.log("§377 子弹数据 %s：%s（%s）", b, t[2], full(o))
+            return o, t[2]
+        end
+    end
+    if type(LoadAsset) == "function" then pcall(LoadAsset, p) end       -- 类默认对象要类先加载
+    local o = G.findOrLoad(p .. ".Default__" .. b .. "_C")
+    if valid(o) then SHOT.bdCache[b] = { o = o, how = "加载类后的默认对象" }; return o, "加载类后的默认对象" end
+    return nil, "找不到 " .. p
+end
+
+-- 出手的朝向：对方锁着你 / 没收到镜头朝向 → 对准你；否则对方镜头朝向（羽弓发 aim=）
+function SHOT.aim(at, tn)
+    local r = not NET.rlk and BOWAIM.peer(tn)
+    if r then return { Pitch = r.Pitch, Yaw = r.Yaw }, "对方镜头" end
+    local me = CHG.laserAimAt()
+    if me and at then
+        local dx, dy, dz = me.X - at.X, me.Y - at.Y, me.Z - at.Z
+        return { Pitch = math.deg(math.atan(dz, math.sqrt(dx * dx + dy * dy))), Yaw = math.deg(math.atan(dy, dx)) }, "对准你"
+    end
+    return { Pitch = 0, Yaw = 0 }, "没有目标"
+end
+
+-- 收：对方出手一发 / 收招。返回 是否处理了
+function SHOT.onSub(pup, sm, tn)
+    local endKey = sm:match("^SHOTEND%-(.+)$")
+    if endKey then
+        for id, f in pairs(CHG.fired) do
+            local fam = SHOT.FAM[f.name]
+            if fam and fam.key == endKey and f.shot and not f.shot.done then SHOT.finish(pup, id, f, tn, "对方收招") end
+        end
+        return true
+    end
+    local mon, tier = sm:match("^(.-)%-(%a+)$")
+    local name = SHOT.byMon[mon]
+    local fam = SHOT.FAM[name]
+    local id, f = SHOT.latest(name)
+    if not f then SHOT.log("§377 对方出手 %s %s 档：替身没在放这招（没放出来 / 对方是旧版放法），跳过", mon, tier); return true end
+    if not valid(pup) then return true end
+    local inst = LO.activeInstance(pup, name)
+    if not inst then SHOT.log("§377 对方出手 %s 档：远端#%d 替身的 %s 已经不在放了", tier, id, name); return true end
+    if not SHOT.probed[name] then                 -- 第一次：技能里和子弹有关的变量（查子弹数据放在哪）
+        SHOT.probed[name] = true
+        SHOT.log("§377 探针 %s 技能变量（Bullet）：%s", name, tostring(LO.propsLike(inst, { "Bullet" })))
+    end
+    local bd, how = SHOT.bd(fam, tier)
+    if not bd then SHOT.log("§377 对方出手 %s 档：子弹数据%s", tier, tostring(how)); return true end
+    local loc = try("shot loc", function() return pup:K2_GetActorLocation() end)
+    if not loc then SHOT.log("§377 对方出手 %s 档：读不到替身位置", tier); return true end
+    local rot0, aimHow = SHOT.aim(loc, tn)
+    local y = math.rad(rot0.Yaw or 0)
+    local at = { X = loc.X + math.cos(y) * SHOT.FWD, Y = loc.Y + math.sin(y) * SHOT.FWD, Z = loc.Z + SHOT.UP }
+    local rot = SHOT.aim(at, tn)
+    G.setControlRot(pup, rot); setYaw(pup, rot.Yaw)
+    local tc = LO.targetingComp(pup)                 -- 子弹按锁定目标找人（BP_BulletTargetSelector_LockTarget）：同火枪 / 眼睛
+    if tc then ZMX.tcLock(tc); if not NET.rlk then ZMX.tcUnlockAt = math.max(ZMX.tcUnlockAt or 0, tn + 3.0) end end
+    local e, info = G.laserEmitterSpawn(inst, pup, at, rot, bd)
+    f.shot.n = f.shot.n + 1
+    SHOT.log("§377 对方出手 %s %s 档 → 远端#%d 替身第 %d 发：%s（%s；瞄 %s P%.0f Y%.0f）", mon, tier, id, f.shot.n,
+        e and G.emitterInfo(e) or "没生成", tostring(info), aimHow, rot.Pitch or 0, rot.Yaw or 0)
+    return true
+end
+
+-- 收：每帧（CHG.pupStep 里）：蓄力动作到点停住；替身自己出手了记一笔；等太久就收
+function SHOT.pupStep(pup, id, f, tn)
+    local s = f.shot
+    if not s or s.done then return end
+    local fam = SHOT.FAM[f.name]
+    if not valid(pup) then s.done = true; return end
+    if tn - s.at > SHOT.END_MAX then SHOT.finish(pup, id, f, tn, "等太久没收到收招"); return end
+    local _, _, m, pos = LAT.activeMontage(pup)
+    if not s.paused then
+        if m == fam.charge and pos and pos >= fam.pauseAt then
+            local ok = G.montagePause(pup, true)
+            s.paused = ok
+            SHOT.log("§377 远端#%d %s 替身蓄力动作到 %.2f 秒 → 暂停 %s", id, f.name, pos, ok and "成功" or "失败")
+        end
+    elseif m ~= s.lastM and m ~= fam.charge then
+        SHOT.log("§377 远端#%d %s 替身动作换成 %s%s", id, f.name, tostring(m),
+            SHOT.byMon[m or ""] and "（替身自己出手了：暂停没拦住）" or "")
+    end
+    s.lastM = m
+end
+
+-- 收：收掉替身的这一招（先取消技能再停动作，免得恢复动作后它自己蓄满出手）
+function SHOT.finish(pup, id, f, tn, why)
+    local s = f.shot
+    if not s or s.done then return end
+    s.done = true
+    local gone = valid(pup) and G.cancelAbilities(pup, function(n) return n == f.name end) or {}
+    local m = valid(pup) and montageOf(pup)
+    local cut = (m == SHOT.FAM[f.name].charge) and cutMontage(pup) or nil
+    SHOT.log("§377 远端#%d %s %s：替身共 %d 发，取消技能 %s%s", id, f.name, why, s.n,
+        #gone > 0 and table.concat(gone, ",") or "（已经没在放）", cut ~= nil and ("，停蓄力动作 " .. tostring(cut)) or "")
+end
+
 return {
+    SHOT = SHOT,
     CHG = CHG,
     INP = INP,
     BOWEYE = BOWEYE,

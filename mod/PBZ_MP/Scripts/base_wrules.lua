@@ -37,6 +37,8 @@ function GCD.reset(why)
     GCD.side = { me = {}, op = {} }
     GCD.hintTill, GCD.wrote = 0, nil
     GDMG.reset()                     -- §212
+    ZDB.reset()                      -- §370
+    TORN.reset()                     -- §383
     SUMD.reset()                     -- §242
     if had then GCD.log("火枪冷却清零（%s）", why or "-") end
 end
@@ -183,6 +185,7 @@ function GDMG.onSub(who, sm, tn)
     GDMG.noteOther(who, sm, tn)
 end
 function GDMG.noteOther(who, why, tn)
+    ZDB.start(who, why, tn)          -- §370 锤 / 铁伞 / 漏了的召唤动作：开始看布局分件
     if not GDMG.other[who].t0 then
         GDMG.log("§212 火枪每发伤害：%s %s → 锤 / 伞 / 反击可能在场，这段时间%s火枪的命中不改", who == "me" and "我" or "对方", why, who == "me" and "我" or "对方")
     end
@@ -201,6 +204,10 @@ end
 function GDMG.frame(p1, pup, hm, tn)
     GDMG.step("me", p1, hm, tn)
     GDMG.step("op", pup, nil, tn)
+    ZDB.step("me", p1, tn)          -- §370 布局分件：锤 / 幻化锤 / 铁伞在不在场
+    ZDB.step("op", pup, tn)
+    TORN.step("me", p1, tn)         -- §383 刺骨混沌火焰龙卷在不在场
+    TORN.step("op", pup, tn)
 end
 function GDMG.step(who, owner, m, tn)
     if GDMG.inField(who, tn) then
@@ -264,6 +271,250 @@ function GDMG.mine(id, d, tn)
     GDMG.n.me = GDMG.n.me + 1
     GDMG.log("§212 火枪每发伤害：我的火枪打中替身（本机掉 %.0f）→ 回报按 %g（#%d，第 %d 发）", d, v, id, GDMG.n.me)
     return v
+end
+
+-- ============================================================ §370 紫冥剑布局（DB）分件倍数（第五轮平衡，HANDOVER §370）
+-- 用户 11-17 第五轮："布局大锤、布局铁壁攻击 +25%"、"强化后的幻化大锤产生的后续火焰特殊攻击 −25%"。锤 / 铁伞 / 火焰都算在
+-- GA_Hun_ZiMingJian_New_DB_C 这一招上（系数表定值，§193），表里分不开 → 和 §212 火枪一样按"场上有什么"认这一下是哪件打的，再乘倍数。
+-- 资产（_tools/gasgraph 判定字段.jsonl，11-17 离线查）：
+--   大锤 B_ZiMingJian_DBB_01 → BP_ZiMingJian_FlyingHammer（Blunt.IronBall，受击强度 Knockback.Heavy）
+--   幻化大锤 B_ZiMingJian_DBB_01_Enhanced → BP_ZiMingJian_FlyingHammer_Enhanced（同上），子子弹 B_ZiMingJian_DBB_Flame
+--     （标签 Damage.Feature.ElementalConvert.GroundTick、受击强度 None = 地上的火，一跳一跳掉血、不播受击）
+--   爆炸 B_ZiMingJian_DBB_03 / 04（Magic.Explosion，受击 Middle）：不确定是哪件生的，按锤算
+--   铁壁 = 铁伞 B_ZiMingJian_DBC_01 → BP_ZiMingJian_TieSan（召唤动作 Summon_TieChi，技能函数 TrySummonTieSan）+ 飞镖 B_ZiMingJian_DBC_Dart
+--   火枪 DBA_01–03 / DBA_Enhanced_01–05 → FlyingGun_Bullet：走 §212 GDMG（每发固定点数），这里不管
+-- 认法（同 GDMG，宁可不改也不乱改）：① 这一下记在 DB 那一招上 ② 同一方的锤 / 幻化锤 / 铁伞对象在场（召唤动作起 SCAN 秒数一次
+--   召唤者名下的子弹，没了再宽 LINGER 秒；一直数不到按 CAP 秒放弃）③ 火枪不在场（两样一起在场分不开 → 不改）。
+--   幻化锤见过之后 FLAME_HOLD 秒内、挨打的这一下**没有新受击动作**（受击动作位置 < REACT_POS 秒才算新的）→ 算火焰 ×0.75；
+--   其余（有新受击）→ 锤 / 铁伞 ×1.25（两件倍数一样，不用再分）。
+-- 两边：挨打方（真人联机，对方替身的锤打我）改这一帧掉的血（GDMG.setHp）；本地 AI（我的锤打替身）td= 按倍数报。
+-- 只在交手中 + 武器平衡开；net/zdb_off.txt 存在 = 不改（只记日志）。倍数写在这里没进数值表：sd= 不认新键（旧客户端会整张表不收）
+ZDB = { MULT = { hammer = 1.25, wall = 1.25, flame = 0.75 }, NAME = { hammer = "大锤", wall = "铁壁（铁伞）", flame = "幻化大锤火焰" },
+        PAT = { "FlyingHammer", "TieSan", "DBC_Dart" }, SCAN = 0.25, SEEN_FROM = 0.2, LINGER = 1.0, CAP = 10.0, FLAME_HOLD = 6.0,
+        REACT_POS = 0.3, side = { me = {}, op = {} }, n = { me = 0, op = 0 }, LOGS = 80, logs = 0 }
+ZDB.OFF_FILE = (NET_DIR or "net") .. "/zdb_off.txt"
+function ZDB.log(...)
+    if ZDB.logs < ZDB.LOGS then ZDB.logs = ZDB.logs + 1; out(...) end
+end
+function ZDB.reset() ZDB.side = { me = {}, op = {} } end
+function ZDB.off()
+    local f = io.open(ZDB.OFF_FILE, "r")
+    if f then f:close(); return true end
+    return false
+end
+function ZDB.who(who) return who == "me" and "我" or "对方" end
+-- 召唤动作 / 漏了召唤动作（GDMG.noteOther 一并调）：开始（或续上）看这一方的锤 / 铁伞
+function ZDB.start(who, why, tn)
+    local s = ZDB.side[who]
+    if not s.t0 then
+        ZDB.side[who] = { t0 = tn, why = why, seen = {}, nextScan = tn + ZDB.SEEN_FROM, capAt = tn + ZDB.CAP }
+        return
+    end
+    s.capAt, s.why = tn + ZDB.CAP, why
+end
+-- 召唤者名下的锤 / 幻化锤 / 铁伞 / 飞镖各几个（G.summonCount 的分类串 "类×个数 ..."）
+function ZDB.classify(info)
+    local c = { hammer = 0, enh = 0, wall = 0 }
+    for cls, k in tostring(info or ""):gmatch("(%S+)×(%d+)") do
+        k = tonumber(k) or 0
+        if cls:find("FlyingHammer_Enhanced", 1, true) then c.enh = c.enh + k
+        elseif cls:find("FlyingHammer", 1, true) then c.hammer = c.hammer + k
+        elseif cls:find("TieSan", 1, true) or cls:find("Dart", 1, true) then c.wall = c.wall + k end
+    end
+    return c
+end
+-- 每次发包驱动（GDMG.frame 里）：数一遍，见过的记时间；幻化锤见过 → 之后 FLAME_HOLD 秒火焰可能在烧
+function ZDB.step(who, owner, tn)
+    local s = ZDB.side[who]
+    if not s.t0 then return end
+    if tn >= s.nextScan then
+        s.nextScan = tn + ZDB.SCAN
+        local n, info = 0, nil
+        if valid(owner) then n, info = G.summonCount(owner, ZDB.PAT) end
+        if n > 0 then
+            local c = ZDB.classify(info)
+            for k, v in pairs(c) do
+                if v > 0 then
+                    if not s.seen[k] then
+                        ZDB.log("§370 布局分件：%s的%s在场（%s，召唤动作后 %.2f 秒）", ZDB.who(who), k == "enh" and "幻化大锤" or ZDB.NAME[k], tostring(info), tn - s.t0)
+                    end
+                    s.seen[k] = tn
+                end
+            end
+            if c.enh > 0 then s.flameUntil = tn + ZDB.FLAME_HOLD end
+        end
+    end
+    local last
+    for _, t in pairs(s.seen) do if not last or t > last then last = t end end
+    local flame = s.flameUntil and tn <= s.flameUntil
+    if (last and tn - last > ZDB.LINGER and not flame) or (not last and tn > s.capAt) then
+        ZDB.log("§370 布局分件：%s的锤 / 铁伞（%s）%s", ZDB.who(who), s.why or "-", last and "收掉了" or ("一直没数到，按上限 " .. ZDB.CAP .. " 秒放弃"))
+        ZDB.side[who] = {}
+    end
+end
+-- 挨打的那个（victim）这一帧有没有新受击动作：受击 / 击退动作、而且刚开始播（位置 < REACT_POS 秒）
+function ZDB.react(victim)
+    if not (G.activeMontage and valid(victim)) then return false, "-" end
+    local _, _, name, pos = G.activeMontage(victim)
+    name = name or ""
+    local hit = name:find("_Hit_", 1, true) ~= nil or name:find("Knockback", 1, true) ~= nil
+    return hit and (pos == nil or pos < ZDB.REACT_POS), name ~= "" and string.format("%s@%.2f", name, pos or -1) or "没动作"
+end
+-- 这一下是哪件：返回 "hammer" / "wall" / "flame" / nil（不改），第二个返回值是日志用的受击动作
+function ZDB.kind(who, victim, tn)
+    local s = ZDB.side[who]
+    if not s.t0 then return nil end
+    if GDMG.inField(who, tn) then return nil, "火枪也在场" end
+    local function live(k) return s.seen[k] ~= nil and tn - s.seen[k] <= ZDB.LINGER end
+    local react, rm = ZDB.react(victim)
+    if not react and s.flameUntil and tn <= s.flameUntil then return "flame", rm end
+    if live("hammer") or live("enh") then return "hammer", rm end
+    if live("wall") then return "wall", rm end
+    return nil, rm
+end
+function ZDB.per() return NET.fighting() and BAL.active() end
+-- 挨打方（netJudge 掉血那一帧，在 GDMG.fix 之后）：认作对方布局的锤 / 铁伞 / 火焰 → 改这一帧掉的血，返回改后的；不管 → nil
+function ZDB.fix(p1, id, name, step, hpBefore, tn)
+    if name ~= ZMX.CLS or not step or step <= 0.5 or not hpBefore or hpBefore <= 0 or not ZDB.per() then return nil end
+    local k, rm = ZDB.kind("op", p1, tn)
+    if not k then return nil end
+    if hpBefore - step <= 0 then return nil end                 -- 本来就打死了：不动（直接写 0 血不走游戏的死亡流程）
+    local v = step * ZDB.MULT[k]
+    if hpBefore - v < 1 then v = hpBefore - 1 end              -- 乘了倍数会打死的：留 1 血（同上）
+    if math.abs(v - step) < 0.5 then return nil end
+    if ZDB.off() then
+        ZDB.log("§370 布局分件：对方%s打中我 -%.0f（有 net/zdb_off.txt，不改）", ZDB.NAME[k], step)
+        return nil
+    end
+    if not GDMG.setHp(p1, hpBefore - v) then return nil end
+    ZDB.n.op = ZDB.n.op + 1
+    ZDB.log("§370 布局分件：对方%s打中我 -%.0f → ×%g = -%.0f（远端#%s，我的动作 %s，第 %d 下）", ZDB.NAME[k], step, ZDB.MULT[k], v, tostring(id), rm or "-", ZDB.n.op)
+    return v
+end
+-- 本地 AI（TOUCH.calc，GDMG.mine 之后）：add = 这一下本来要报的；认作我布局的锤 / 铁伞 / 火焰 → 返回乘过倍数的；不管 → nil
+function ZDB.mine(id, add, tn)
+    if not add or add <= 0 or not (NET.evName and NET.evName[id] == ZMX.CLS) or not ZDB.per() then return nil end
+    local k, rm = ZDB.kind("me", puppet(), tn)
+    if not k or ZDB.off() then return nil end
+    ZDB.n.me = ZDB.n.me + 1
+    ZDB.log("§370 布局分件：我的%s打中替身 %.0f → ×%g = %.0f（#%d，替身动作 %s，第 %d 下）", ZDB.NAME[k], add, ZDB.MULT[k], add * ZDB.MULT[k], id, rm or "-", ZDB.n.me)
+    return add * ZDB.MULT[k]
+end
+
+-- ============================================================ §383 刺骨混沌火蓄力：火焰龙卷触发后的伤害再 ×1.2（第六轮平衡，HANDOVER §383）
+-- 用户 11-17 第六轮："火模式_重攻击蓄力伤害 +10%（成功触发火焰龙卷以后的伤害全部 +20%）"。+10% 已进系数表（§379，整招 ×1.1）；
+-- 龙卷的伤害也记在 GA_Hun_Chaos_B_Hold_Fire_C 这一招上，表里一招一个数分不开 → 照 §370 ZDB"按场上有什么认"，龙卷那部分再 ×1.2。
+-- 资产（_tools/gasgraph chaos.json / 判定字段.jsonl，11-17 离线查）：
+--   这一刀 B_Hun_Chaos_B_01_Fire_Hold（扫掠判定 SweepTrace，物理 1.0 + 元素 1.0，受击强度 Knockback.Heavy）
+--   龙卷 B_Hun_Chaos_B_03_Fire_Hold → BP_ChaosBlade_ChaosTornadoSuck（投射物，锁定目标、落地、5 秒，混沌 3.0 + 元素 3.0，受击 Middle）
+--     开始时和每 0.2 秒生子子弹 B_Hun_Chaos_B_02_Fire_Hold → BP_ChaosBlade_ChaosTornado（重叠判定、跟着龙卷、每 0.5 秒一跳、混沌 0.35、受击 Light）
+--     + 吸人的 B_Hun_Chaos_B_04_Fire_Hold_RootmotionSource（0 伤害）
+--   日志（E:\Download\mp_probe (30).log 10:46:08–10:46:15，我打本地 AI）：同一招 #1216 先 −243（替身 Hit_Knockback）= 那一刀，之后 −71、
+--   每 0.5 秒左右 −35 = 龙卷；本机 11-16 10:20:02 对方火蓄力那一刀打中我 −430、之后没有龙卷（没触发）→ 龙卷是"那一刀打中 + 条件满足"才生
+-- 认法（宁可不改也不乱改）：① 这一下记在火蓄力这一招上 ② 同一方名下的龙卷（G.summonCount 名字带 ChaosTornado）在**更早的一次扫描**里
+--   已经见过、最近 LINGER 秒内还在（龙卷是那一刀打中才生的：那一刀掉血那一帧龙卷最多刚出现，按"同一帧才见到"排除）
+--   ③ 挨打的这一下不是新的击退受击（那一刀是 Knockback.Heavy，龙卷是 Middle / Light；双保险，防止龙卷比那一刀先生）。
+-- 开始数：放火蓄力（我：ULT.emit；对方：替身放这招 AIR.fire）；没见到前每 SCAN 秒扫一次、见到后 SCAN_LIVE 秒；CAP 秒没见到放弃。
+-- 两边：挨打方（真人联机，对方替身的龙卷打我）改这一帧掉的血（GDMG.setHp）；本地 AI（我的龙卷打替身）td= 按倍数报。
+-- 只在交手中 + 武器平衡开；net/torn_off.txt 存在 = 不改（只记日志）。倍数写在这里没进数值表（同 §370：sd= 不认新键）。
+-- 旧版客户端没有这段：对旧版来说龙卷照原样（只有表里的 ×1.1）
+TORN = { CLS = "GA_Hun_Chaos_B_Hold_Fire_C", MULT = 1.2, PAT = { "ChaosTornado" }, SCAN = 0.1, SCAN_LIVE = 0.25, LINGER = 0.6,
+         CAP = 5.0, REACT_POS = 0.3, side = { me = {}, op = {} }, n = { me = 0, op = 0 }, LOGS = 80, logs = 0 }
+TORN.OFF_FILE = (NET_DIR or "net") .. "/torn_off.txt"
+function TORN.log(...)
+    if TORN.logs < TORN.LOGS then TORN.logs = TORN.logs + 1; out(...) end
+end
+function TORN.reset() TORN.side = { me = {}, op = {} } end
+function TORN.off()
+    local f = io.open(TORN.OFF_FILE, "r")
+    if f then f:close(); return true end
+    return false
+end
+function TORN.who(who) return who == "me" and "我" or "对方" end
+-- 放火蓄力：开始（或续上）数这一方的龙卷。上一个龙卷还在场就接着认（它后面的跳伤会记在新这一招上，照样是龙卷）
+function TORN.start(who, tn)
+    local s = TORN.side[who]
+    if not s.t0 then
+        TORN.side[who] = { t0 = tn, nextScan = tn, capAt = tn + TORN.CAP }
+        return
+    end
+    s.t0, s.capAt, s.nextScan = tn, tn + TORN.CAP, math.min(s.nextScan or tn, tn)
+end
+-- 每次发包驱动（GDMG.frame 里）：数一遍龙卷，记第一次见到 / 最近见到的时刻
+function TORN.step(who, owner, tn)
+    local s = TORN.side[who]
+    if not s.t0 then return end
+    if tn >= s.nextScan then
+        s.nextScan = tn + (s.seenAt and TORN.SCAN_LIVE or TORN.SCAN)
+        local n, info = 0, nil
+        if valid(owner) then n, info = G.summonCount(owner, TORN.PAT) end
+        if n > 0 then
+            if not s.seenAt then
+                s.seenAt = tn
+                TORN.log("§383 火焰龙卷：%s的龙卷在场（%s，放火蓄力后 %.2f 秒）", TORN.who(who), tostring(info), tn - s.t0)
+            end
+            s.last = tn
+        end
+    end
+    if s.last and tn - s.last > TORN.LINGER then
+        TORN.log("§383 火焰龙卷：%s的龙卷收掉了（在场 %.1f 秒）", TORN.who(who), s.last - s.seenAt)
+        if tn < s.capAt then s.seenAt, s.last = nil, nil else TORN.side[who] = {} end     -- 又放了一次火蓄力：接着等新的
+    elseif not s.last and tn > s.capAt then
+        TORN.log("§383 火焰龙卷：%s放了火蓄力，%g 秒内没见到龙卷（没触发，或类名对不上）", TORN.who(who), TORN.CAP)
+        TORN.side[who] = {}
+    end
+end
+-- 挨打的那个（victim）这一帧是不是新的击退受击（那一刀 Knockback.Heavy）
+function TORN.slash(victim)
+    if not (G.activeMontage and valid(victim)) then return false, "-" end
+    local _, _, name, pos = G.activeMontage(victim)
+    name = name or ""
+    local kb = name:find("Knockback", 1, true) ~= nil
+    return kb and (pos == nil or pos < TORN.REACT_POS), name ~= "" and string.format("%s@%.2f", name, pos or -1) or "没动作"
+end
+-- 这一下算不算龙卷：返回 true / false, 日志用的说法
+function TORN.kind(who, victim, tn)
+    local s = TORN.side[who]
+    if not (s.seenAt and s.last) or tn - s.last > TORN.LINGER then return false, "龙卷不在场" end
+    local slash, rm = TORN.slash(victim)
+    if s.seenAt >= tn then return false, "龙卷这一帧才出现，算那一刀（" .. rm .. "）" end
+    if slash then return false, "新的击退受击，算那一刀（" .. rm .. "）" end
+    return true, rm
+end
+function TORN.per() return NET.fighting() and BAL.active() end
+-- 挨打方（netJudge 掉血那一帧，在 ZDB.fix 之后）：认作对方的龙卷 → 改这一帧掉的血，返回改后的；不管 → nil
+function TORN.fix(p1, id, name, step, hpBefore, tn)
+    if name ~= TORN.CLS or not step or step <= 0.5 or not hpBefore or hpBefore <= 0 or not TORN.per() then return nil end
+    local ok, rm = TORN.kind("op", p1, tn)
+    if not ok then
+        if TORN.side.op.seenAt then TORN.log("§383 火焰龙卷：对方火蓄力打中我 -%.0f，不乘（%s，远端#%s）", step, rm, tostring(id)) end
+        return nil
+    end
+    if hpBefore - step <= 0 then return nil end                 -- 本来就打死了：不动（同 §370）
+    local v = step * TORN.MULT
+    if hpBefore - v < 1 then v = hpBefore - 1 end              -- 乘了会打死的：留 1 血
+    if math.abs(v - step) < 0.5 then return nil end
+    if TORN.off() then
+        TORN.log("§383 火焰龙卷：对方龙卷打中我 -%.0f（有 net/torn_off.txt，不改）", step)
+        return nil
+    end
+    if not GDMG.setHp(p1, hpBefore - v) then return nil end
+    TORN.n.op = TORN.n.op + 1
+    TORN.log("§383 火焰龙卷：对方龙卷打中我 -%.0f → ×%g = -%.0f（远端#%s，我的动作 %s，第 %d 下）", step, TORN.MULT, v, tostring(id), rm or "-", TORN.n.op)
+    return v
+end
+-- 本地 AI（TOUCH.calc，ZDB.mine 之后）：add = 这一下本来要报的；认作我的龙卷 → 返回乘过倍数的；不管 → nil
+function TORN.mine(id, add, tn)
+    if not add or add <= 0 or not (NET.evName and NET.evName[id] == TORN.CLS) or not TORN.per() then return nil end
+    local ok, rm = TORN.kind("me", puppet(), tn)
+    if not ok then
+        if TORN.side.me.seenAt then TORN.log("§383 火焰龙卷：我的火蓄力打中替身 %.0f，不乘（%s，#%d）", add, rm, id) end
+        return nil
+    end
+    if TORN.off() then return nil end
+    TORN.n.me = TORN.n.me + 1
+    TORN.log("§383 火焰龙卷：我的龙卷打中替身 %.0f → ×%g = %.0f（#%d，替身动作 %s，第 %d 下）", add, TORN.MULT, add * TORN.MULT, id, rm or "-", TORN.n.me)
+    return add * TORN.MULT
 end
 
 -- ============================================================ §242 召唤类影之武装：召唤物打中一下只扣 1 点（用户 11-11 定）
@@ -551,7 +802,7 @@ end
 -- §246 角色放招事件（只在 cast 时调；不每帧轮询世界）：探针 + 可选补特效
 function HLFX.cast(side, actor, use, tn)
     if use ~= HLFX.NAME or not valid(actor) then return end
-    if not (MATCH and MATCH.state == "fight") then return end
+    if not (MATCH and NET.fighting()) then return end     -- 11-17 新版房间交手中也补火流星特效
     local P = HLFX.PROBE
     if P and not HLFX.probeOff() and (P.n[side] or 0) < P.MAX then
         local dup = nil
@@ -950,6 +1201,172 @@ function SWK.frame(p1, tn, sh, shm)
     return sh
 end
 
+-- ============================================================ §372 斩马刀重击自伤（交手中不扣自己血）+ 充能显示重绑
+-- 游戏怎么做的（资产 + 游戏界面脚本，11-17 查，HANDOVER §372）：
+--   · 重击一路（B / BB / AB / AAB / AAAB / B_Dash / Air_B …）的父类蓝图 GA_Hun_ZhanMa_HeavyAttack_Base：角色挂上
+--     CharacterState.AbilityState.ZhanMa.DrawBlood 时，算 Health_Max × HealthCostPercent（蓝图变量，B 0.1 / BB 0.15 / AB 0.2 /
+--     AAB 0.225 / AAAB 0.25 …），> 0 就给自己发游戏事件 GameplayEvent.Ability.ZhanMa.HeavyAttackVirtualDamage；
+--   · 武器被动 GA_ZhanMa_Passive（原生 GA_ZhanMa_PassiveBase）收到后记进"虚血"充能对象 VirtualDamages（UIChargeObject，
+--     TableRow = ZhanMa_VirtualDamage），血量不动；VirtualDamageDealtDelay 12 秒后一次性结算成真掉血（挨打 / 轻击吸血会提前结算 / 回补）。
+--   v0.34.3 玩家日志 11:56:14–19 AB + B + BB + B → 11:56:31 "★ 血量 3086.0 -> 1388.7 (-1697.3)" = (0.2+0.1+0.15+0.1) × 3086，
+--   最后一次重击后正好 12 秒。打替身吸不到血（游戏规则：对人偶无效，§37），虚血一点回补不了，全额结算 → 能直接打输。
+-- ① 对局里（NET.rulesBegin → rulesEnd，1v1 / 多人房 / 对决共用）：把我技能格里斩马刀招的 HealthCostPercent 写 0
+--    （默认对象 + 现有实例；默认对象改了，对局里新给的实例也是 0）。蓝图自己判"> 0 才发事件" → 不进虚血。对局结束写回原值，单机照旧。
+--    补漏（事件触发）：交手中我放出斩马刀招时还没改（开局那一下没拿到角色）→ 补改；不在对局里还改着（没走 rulesEnd）→ 补写回；
+--    载入后第一次在单机放斩马刀招时核对一次默认对象（重载模组丢了原值、默认对象还是 0 → 按游戏数据写回）。
+ZMC = { PAT = "^GA_Hun_ZhanMa_", PROP = "HealthCostPercent", LOGS = 40, logs = 0, active = false, checked = false,
+        orig = {}, cdos = {},
+        -- 游戏数据（_tools/gasgraph/招式技能字段.jsonl，build 26266538）：读到的默认对象已经是 0（上次没写回 / 重载了模组）时按这个写回
+        DEF = { GA_Hun_ZhanMa_HeavyAttack_Base_C = 0.05, GA_Hun_ZhanMa_B_C = 0.1, GA_Hun_ZhanMa_BB_C = 0.15, GA_Hun_ZhanMa_AB_C = 0.2,
+                GA_Hun_ZhanMa_AAB_C = 0.225, GA_Hun_ZhanMa_AAAB_C = 0.25, GA_Hun_ZhanMa_B_Dash_C = 0.1, GA_Hun_ZhanMa_B_DashDraw_C = 0.1,
+                GA_Hun_ZhanMa_B_Draw_C = 0.1, GA_Hun_ZhanMa_B_Snap_C = 0.1, GA_Hun_ZhanMa_Air_B_C = 0.1, GA_Hun_ZhanMa_Air_B_Draw_C = 0.1 } }
+function ZMC.log(...)
+    if ZMC.logs < ZMC.LOGS then ZMC.logs = ZMC.logs + 1; out(...) end
+end
+function ZMC.inMatch()
+    return MATCH.role ~= nil or (BASEHOOK ~= nil and BASEHOOK.inMp ~= nil and BASEHOOK.inMp()) == true
+end
+-- 一个对象（默认对象 / 实例）的 HealthCostPercent 写成 v：返回 改了几个, 失败几个（本来就是 v 的不算）
+function ZMC.setOn(o, v)
+    local cur = rawProp(o, ZMC.PROP)
+    if type(cur) ~= "number" then return 0, 0 end
+    if math.abs(cur - v) < 1e-6 then return 0, 0 end
+    local ok = pcall(function() o[ZMC.PROP] = v end)
+    local now2 = rawProp(o, ZMC.PROP)
+    if ok and type(now2) == "number" and math.abs(now2 - v) < 1e-6 then return 1, 0 end
+    return 0, 1
+end
+function ZMC.shortName(n) return (n:gsub("^GA_Hun_ZhanMa_", ""):gsub("_C$", "")) end
+-- ① 对局开始（倒计时 / 开打都调，幂等：没有要改的就不记日志）
+function ZMC.apply(p1, why)
+    if not valid(p1) then p1 = getP1() end
+    if not valid(p1) then return nil end
+    ZMC.active = true
+    UICH.matched = true
+    local specs = LO.costSpecs and LO.costSpecs(p1, ZMC.PAT, ZMC.PROP)
+    if not specs then ZMC.log("!! §372 斩马刀重击自伤：读不到我的技能格（%s）", tostring(why)); return nil end
+    local ch, bad, names = 0, 0, {}
+    for _, s in ipairs(specs) do
+        if ZMC.orig[s.name] == nil then
+            local o = s.cdoV
+            if not (o and o > 0) then o = ZMC.DEF[s.name] end
+            ZMC.orig[s.name] = o
+        end
+        ZMC.cdos[s.name] = s.cdo
+        local c, b = ZMC.setOn(s.cdo, 0)
+        for _, inst in ipairs(s.insts) do
+            local c2, b2 = ZMC.setOn(inst, 0)
+            c, b = c + c2, b + b2
+        end
+        ch, bad = ch + c, bad + b
+        if c > 0 or b > 0 then names[#names + 1] = string.format("%s %s→0%s", ZMC.shortName(s.name), tostring(ZMC.orig[s.name]),
+            b > 0 and "（失败 " .. b .. "）" or "") end
+    end
+    if ch > 0 or bad > 0 then
+        local vd = UICH.vd(p1)
+        ZMC.log("§372 交手中斩马刀重击不扣自己血（%s）：HealthCostPercent 改了 %d 处%s：%s%s", tostring(why), ch,
+            bad > 0 and ("，!! 失败 " .. bad .. " 处") or "", table.concat(names, "，"),
+            vd and string.format("；开局时身上虚血 %.0f%%", vd * 100) or "")
+    end
+    return ch, bad
+end
+-- ① 对局结束：写回原值（默认对象按记下的写；实例按现在技能格里的写）。没记过原值、现在又是 0 的按游戏数据（重载模组那种）
+function ZMC.restore(p1, why)
+    if not valid(p1) then p1 = getP1() end
+    ZMC.active = false
+    local ch, bad, names = 0, 0, {}
+    local function put(name, o, cur)
+        local want = ZMC.orig[name]
+        if want == nil and type(cur) == "number" and cur <= 0 then want = ZMC.DEF[name] end
+        if want == nil then return end
+        local c, b = ZMC.setOn(o, want)
+        ch, bad = ch + c, bad + b
+        if c > 0 or b > 0 then names[name] = want end
+    end
+    for name, cdo in pairs(ZMC.cdos) do
+        if valid(cdo) then put(name, cdo, rawProp(cdo, ZMC.PROP)) end
+    end
+    local specs = valid(p1) and LO.costSpecs and LO.costSpecs(p1, ZMC.PAT, ZMC.PROP) or {}
+    for _, s in ipairs(specs) do
+        put(s.name, s.cdo, s.cdoV)
+        for _, inst in ipairs(s.insts) do put(s.name, inst, rawProp(inst, ZMC.PROP)) end
+    end
+    if ch > 0 or bad > 0 then
+        local list = {}
+        for name, v in pairs(names) do list[#list + 1] = ZMC.shortName(name) .. " " .. tostring(v) end
+        table.sort(list)
+        ZMC.log("§372 斩马刀重击自伤写回（%s）：%d 处%s：%s", tostring(why), ch, bad > 0 and ("，!! 失败 " .. bad .. " 处") or "",
+            table.concat(list, "，"))
+    end
+    return ch, bad
+end
+-- 事件：我新放出一个技能（主循环看到"+技能"那一下，单机也走）
+function ZMC.onAbility(n, tn)
+    if type(n) ~= "string" or not n:find(ZMC.PAT) then return end
+    local inM = ZMC.inMatch()
+    if ZMC.active and not inM then
+        ZMC.restore(nil, "不在对局里了，补写回")
+    elseif not ZMC.active and inM and NET.fighting and NET.fighting() then
+        ZMC.apply(nil, "交手中放了 " .. ZMC.shortName(n) .. "，开局没改上，补改")
+    end
+    if not inM and ZMC.DEF[n] then
+        if not ZMC.checked then ZMC.checked = true; ZMC.restore(nil, "载入后第一次放斩马刀重击，核对") end
+        if UICH.want(tn) then UICH.rebind(nil, "单机放斩马刀重击 " .. ZMC.shortName(n), tn) end
+    end
+end
+
+-- ② 显示：重击后的虚血在界面上是充能对象 ZhanMa_VirtualDamage 驱动的（buff 栏 DT_BuffStatus 行 T_BuffUI_33 的图标 + 量条，
+--    血条脚本 playerhpbar.js 的"虚损带"）。界面脚本订阅的是整个世界共用的 UIChargeSubsystem，值变化走充能对象上的**单播**委托：
+--    · 替身是玩家同类角色（SpawnActor 玩家的类），身上有自己的 GA_Player_BuffTracker（ga_player_bufftracker.js），一生成就把子系统里
+--      已注册的充能对象（包括玩家自己的）全过一遍、Bind 值委托 → 玩家自己 buff 栏的绑定被顶掉；替身那份后来清掉条目
+--      （它被动重激活 / 同一行的对象注销）以后闭包不再干活但还绑着 → 玩家的虚血图标 / 量条不再更新，直到读档 / 回标题整套重建
+--    · 血条脚本只接管"第一个注册的 ZhanMa_VirtualDamage"、注销时不核对是不是自己接管的那个，替身有斩马刀时也会抢
+--    做法：把**我的**充能对象在子系统上注销再注册一次 → 订阅它的脚本先清掉旧绑定 / 条目，再按"注册"重新 Bind，最后绑上的是活的。
+--    时机：对局结束（rulesEnd 最后）；单机放斩马刀重击时（出现过替身 / 打过对局，最少隔 GAP 秒；重击先激活、虚血后到，赶得上）
+UICH = { GAP = 20.0, at = -100, LOGS = 40, logs = 0, matched = false, VD = "ZhanMa_VirtualDamage" }
+function UICH.log(...)
+    if UICH.logs < UICH.LOGS then UICH.logs = UICH.logs + 1; out(...) end
+end
+function UICH.want(tn)
+    if tn - UICH.at < UICH.GAP then return false end
+    return UICH.matched or valid(puppet()) or valid(ST.npcStore)
+end
+-- 我身上的虚血占比（0..1）；读不到 nil（日志用）
+function UICH.vd(p1)
+    local sub = LO.chargeSub and valid(p1) and LO.chargeSub(p1)
+    if not valid(sub) then return nil end
+    for _, c in ipairs(LO.chargeObjs(sub, p1) or {}) do
+        if c.mine and c.row == UICH.VD then return c.pct end
+    end
+    return nil
+end
+function UICH.desc(c)
+    return string.format("%s %s", c.row, c.pct and string.format("%.0f%%", c.pct * 100) or "?")
+end
+-- 返回重新注册成功的个数；找不到子系统 nil
+function UICH.rebind(p1, why, tn)
+    if not valid(p1) then p1 = getP1() end
+    if not valid(p1) then return nil end
+    UICH.at = tn or now()
+    local sub = LO.chargeSub and LO.chargeSub(p1)
+    if not valid(sub) then UICH.log("§372 充能重绑（%s）：没找到 UIChargeSubsystem", tostring(why)); return nil end
+    local list = LO.chargeObjs(sub, p1)
+    if not list then UICH.log("§372 充能重绑（%s）：GetChargeObjects 调不了", tostring(why)); return nil end
+    local mine, others, ok, bad = {}, {}, 0, 0
+    for _, c in ipairs(list) do
+        if c.mine then
+            local okU, okR = LO.chargeReReg(sub, c.obj)
+            if okU and okR then ok = ok + 1 else bad = bad + 1 end
+            mine[#mine + 1] = UICH.desc(c) .. ((okU and okR) and "" or "（!! 失败）")
+        else
+            others[#others + 1] = UICH.desc(c) .. " <" .. tostring(c.chain)
+        end
+    end
+    UICH.log("§372 充能重绑（%s）：我的 %d 个重新注册 %d 个 [%s]；不是我的 %d 个 [%s]", tostring(why), #mine, ok,
+        table.concat(mine, "，"), #others, table.concat(others, "，"))
+    return ok
+end
+
 return {
     GCD = GCD,
     GDMG = GDMG,
@@ -957,5 +1374,7 @@ return {
     HLFX = HLFX,
     DCD = DCD,
     SWK = SWK,
+    ZMC = ZMC,
+    UICH = UICH,
 }
 end

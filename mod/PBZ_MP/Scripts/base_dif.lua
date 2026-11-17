@@ -403,7 +403,7 @@ function CFG.refresh(tn)
     CFG.srvAt = w
     local sig = CFG.peek()
     if sig == CFG.srvSig then CFG.srvPend = nil; return end
-    if MATCH.state ~= "idle" then
+    if (MATCH.state ~= "idle" or (BASEHOOK.mp and BASEHOOK.mp.inMatch and BASEHOOK.mp.inMatch())) then     -- 11-17 新版房间对局中也先不换表
         if CFG.srvPend ~= sig then
             CFG.srvPend = sig
             out("数值表：srvcfg.txt 变了（%s → %s），对局中先不换，回到自由活动再换", tostring(CFG.srvSig), sig)

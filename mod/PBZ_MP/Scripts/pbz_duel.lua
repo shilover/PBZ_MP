@@ -15,7 +15,7 @@ local HP_TIE_EPS = 1e-4
 
 local DUEL = {
     -- 配置选项档位（由 pbz_multi cfgLoad/cfgSave 持久化到 net/mp.txt）
-    ROTS = { "loser", "both" },
+    ROTS = { "loser", "both", "fixed" },      -- 11-17 fixed = 只有前两位上场、其他人一直观战（旧版"只观战不排队"）
 
     state = "idle",      -- idle | ready | cd | fight | rend | end
     loop = false,        -- 房主按 F1 开启轮换后保持为 true，直到手动停或人数 < 2
@@ -112,7 +112,13 @@ local function moveToTail(pid)
     DUEL.order[#DUEL.order + 1] = pid
 end
 
-local function activeQueue()
+-- 11-17 用户"旧版有房主设置，其他人只能观战，从 3 号开始永远不下场"：轮换规则 fixed。
+-- 房主算：自己没开只看不上场的人里排在前两位的上场，其余的人当只看不上场（不出现、一直观战）；
+-- 发给客机的 mdq= 里只看不上场那一位就是这个结果，客机不用知道规则
+local function fixedPair()
+    return mp.isHost() and mp.cfg() and mp.cfg().duelRot == "fixed"
+end
+local function personalQueue()
     local q = {}
     for i = 1, #DUEL.order do
         local pid = DUEL.order[i]
@@ -120,6 +126,18 @@ local function activeQueue()
             q[#q + 1] = pid
         end
     end
+    return q
+end
+function DUEL.isWatch(pid)
+    if not pid or pid <= 0 then return false end
+    if DUEL.watch[pid] then return true end
+    if not fixedPair() then return false end
+    local q = personalQueue()
+    return pid ~= q[1] and pid ~= q[2]
+end
+local function activeQueue()
+    local q = personalQueue()
+    if fixedPair() then q = { q[1], q[2] } end
     return q
 end
 
@@ -281,7 +299,7 @@ local function placeFighterRound(tn)
     local me = mp.myPid()
     if me ~= DUEL.fa and me ~= DUEL.fb then return false end
     if not sameArenaMap() then
-        mp.notice(T("你不在对决的地图，去房主所在地图后再按 F1", "YOU ARE NOT ON THE DUEL MAP - GO TO THE HOST'S MAP, THEN PRESS F1"), "", 4.0)
+        mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
         return false
     end
     local rad = math.rad(a.yaw or 0.0)
@@ -304,7 +322,7 @@ local function placeSpectatorRound(tn)
     if me == DUEL.fa or me == DUEL.fb then return end
     local myMap = mp.mapName()
     if a.map and myMap and a.map ~= myMap then
-        mp.notice(T("对决在另一张地图（去房主所在地图）", "THE DUEL IS ON ANOTHER MAP (GO TO THE HOST'S MAP)"), "", 4.0)
+        mp.notice(T("对决在另一张地图（连按两次 F1 前往）", "THE DUEL IS ON ANOTHER MAP (PRESS F1 TWICE TO GO)"), "", 4.0)
         return
     end
     local x, y = mp.selfPos()
@@ -392,8 +410,29 @@ local function mapWarnReady()
     if me ~= DUEL.fa and me ~= DUEL.fb then return end
     local ref = mp.isHost() and oppOf(me) or mp.hostPid()
     if ref and ref > 0 and not mp.sameMapAs(ref) then
-        mp.notice(T("你不在对决的地图，去房主所在地图后再按 F1", "YOU ARE NOT ON THE DUEL MAP - GO TO THE HOST'S MAP, THEN PRESS F1"), "", 4.0)
+        if mp.isHost() then     -- 11-17：房主自己就在对决地图，以前也提示"去房主所在地图"
+            mp.notice(string.format(T("对手 %s 不在你这张地图，等对方过来", "OPPONENT %s IS NOT ON YOUR MAP - WAIT FOR THEM"), mp.nameOf(ref)), "", 4.0)
+        else
+            mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
+        end
     end
+end
+
+-- 11-17：不交手的阶段（待机 / 即将对决 / 一场结束）大家都在场上；只看不上场的人一直观战
+local freePhaseView
+-- 只看不上场的结果变了（房主改轮换规则 / 有人进出改变了前两位）：不交手的阶段马上进 / 出观战
+local function recheckView()
+    if not (DUEL.state == "idle" or DUEL.state == "ready" or DUEL.state == "end") then return end
+    local me = mp.myPid()
+    if not me or me <= 0 then return end
+    local w = DUEL.myWatch or DUEL.isWatch(me) or false
+    if w ~= (DUEL.viewWatch or false) then freePhaseView("只看不上场变了") end
+end
+function freePhaseView(why)
+    local me = mp.myPid()
+    local w = DUEL.myWatch or (me and me > 0 and DUEL.isWatch(me)) or false
+    DUEL.viewWatch = w
+    if w then mp.specStart() else mp.specStop(why) end
 end
 
 local function cleanupFighter(why)
@@ -420,6 +459,7 @@ local function applyLocalPhase(tn)
     local key = string.format("%d:%d:%s:%d:%d", mid, rd, st, fa, fb)
     if DUEL.appliedKey == key then return end
     DUEL.appliedKey = key
+    if mp.arnRefresh then mp.arnRefresh("对决 " .. tostring(st)) end     -- 11-17 开战点光柱跟着阶段放 / 收
 
     local myPid = mp.myPid()
     local fighter = myPid > 0 and (myPid == fa or myPid == fb)
@@ -428,15 +468,17 @@ local function applyLocalPhase(tn)
         fireMatchEnd(DUEL.lastEndWhy ~= "" and DUEL.lastEndWhy or "回到待机")
         standBoth()
         cleanupFighter("回到待机")
-        mp.specStop("回到待机")
+        freePhaseView("回到待机")
         DUEL.fellA, DUEL.fellB, DUEL.fellKey = nil, nil, nil
         return
     end
 
     if st == "ready" then
+        -- 11-17 用户定（贴近旧版）：叫号（即将对决）时所有人都还在场上、可见；两人都按 F1 开打（倒计时）起其他人才进观战；
+        -- 只看不上场的人全程观战
         standBoth()
         cleanupFighter("等待准备")
-        mp.specStop("等待准备")
+        freePhaseView("等待准备")
         mapWarnReady()                    -- §307 D1：不在房主那张图 → 提示（F1 准备会拒绝）
         DUEL.fellA, DUEL.fellB, DUEL.fellKey = nil, nil, nil
         return
@@ -445,7 +487,7 @@ local function applyLocalPhase(tn)
     if st == "end" then
         fireMatchEnd(DUEL.lastEndWhy ~= "" and DUEL.lastEndWhy or "对局结束")
         cleanupFighter("对局结束")
-        mp.specStop("对局结束")
+        freePhaseView("对局结束")      -- 11-17：一场打完所有人再出现（只看不上场的除外）
         -- §307 D7：一场结束（选手看胜负，观众看谁赢）
         if DUEL.lastWinPid and DUEL.lastWinPid > 0 then
             local nm = mp.nameOf(DUEL.lastWinPid)
@@ -580,7 +622,7 @@ local function formatMdq()
         local st = ensureStats(pid)
         parts[#parts + 1] = string.format("%d:%d:%d:%d:%d",
             pid,
-            DUEL.watch[pid] and 1 or 0,
+            DUEL.isWatch(pid) and 1 or 0,
             st and st.w or 0,
             st and st.l or 0,
             DUEL.readySet[pid] and 1 or 0)
@@ -609,6 +651,21 @@ local function parseMdq(str)
         DUEL.order = ord
         DUEL.watch = watch
         DUEL.readySet = rdy
+        -- 11-17 实测：客机切"只看不上场"的那条消息房主没收到，房主一直按旧的算。房主名单里我的标记和本机对不上就补发（最多 3 次、隔 3 秒）
+        local me = mp.myPid()
+        if me and me > 0 and not mp.isHost() and listHas(ord, me) then
+            local hostW = watch[me] and true or false
+            local mine = DUEL.myWatch and true or false
+            if hostW ~= mine and (DUEL.watchResendN or 0) < 3 then
+                local t = nowFn()
+                if not DUEL.watchResendAt or t - DUEL.watchResendAt >= 3.0 then
+                    DUEL.watchResendAt = t
+                    DUEL.watchResendN = (DUEL.watchResendN or 0) + 1
+                    mp.relChat(string.format("w|%d|%d", me, mine and 1 or 0))
+                end
+            end
+            if mine then DUEL.watch[me] = true end
+        end
     end
 end
 
@@ -649,6 +706,8 @@ local function applyNetState(mduStr, mdqStr, tn, mdaStr, mdmStr)
     end
     applyLocalPhase(tn)
     if arenaChanged then placeIfNeeded(tn) end
+    if mp.renameBars then mp.renameBars() end      -- 11-17 头顶"（即将对决）"
+    recheckView()
     return true
 end
 
@@ -666,6 +725,8 @@ local function broadcastHostState(tn, force)
             mp.relChat(string.format("a|%d|%s|%s", DUEL.mid or 0, DUEL.arenaKv, tostring(DUEL.arenaMap or "")))
         end
         mp.relChat("s|" .. mdu .. "|" .. mdq)
+        if mp.renameBars then mp.renameBars() end
+        recheckView()
     end
     if force or (tn - DUEL.lastRuAt) >= RULES_BC_SEC then
         local rkv = mp.hostRulesKv()
@@ -700,13 +761,15 @@ local function startReadyPair(fa, fb, tn)
     DUEL.readySet = {}
     DUEL.state = "ready"
     DUEL.stateAt = tn
-    DUEL.stateTill = tn + mp.rdyTimeout()
+    DUEL.stateTill = nil          -- 11-17：叫号后没有期限，一直等两人按 F1
     DUEL.lastEndWhy = ""
     DUEL.lastWinPid, DUEL.lastLoserPid = 0, 0
     -- §307 D1：新一场由房主在第 1 回合 cd 重新选场地（上一场的作废）
     DUEL.arena, DUEL.arenaKv, DUEL.arenaMap, DUEL.arenaMid = nil, nil, nil, nil
     DUEL.lastArenaBc, DUEL.placedKey = nil, nil
     DUEL.fellKey, DUEL.peerDtk = nil, {}
+    -- 11-17 排查补齐：叫号时就定场地（以前第 1 回合倒计时才定），即将对决时两边就能看到蓝 / 橙开战点光柱（同旧版 1v1）
+    if mp.isHost() then pickArenaHost(tn) end
     sendDuelCmd(fa, fb, false)
     mp.notifyTag("idle")
     applyLocalPhase(tn)
@@ -719,7 +782,9 @@ local function startRoundCd(rd, tn)
     DUEL.stateAt = tn
     DUEL.stateTill = tn + CD_SEC
     DUEL.tlSec = mp.tlLimit()
-    if rd == 1 and mp.isHost() then pickArenaHost(tn) end      -- §307 D1：房主第 1 回合定场地
+    if rd == 1 and mp.isHost() and not (DUEL.arena and DUEL.arenaMid == DUEL.mid) then pickArenaHost(tn) end      -- §307 D1：房主第 1 回合定场地（11-17 起叫号时已定，这里兜底）
+    -- 11-17：倒计时起就算开打（联机程序 live=1 → 只有两位选手发包、其他人看不到也不发），以前到交手才 live
+    if mp.isHost() then sendDuelCmd(DUEL.fa, DUEL.fb, true) end
     mp.notifyTag("cd")
     applyLocalPhase(tn)
     broadcastHostState(tn, true)
@@ -744,8 +809,10 @@ local function finishMatch(winnerPid, loserPid, why, tn)
         if sw then sw.w = sw.w + 1 end
         if sl then sl.l = sl.l + 1 end
         local rot = (mp.cfg() and mp.cfg().duelRot) or "loser"
-        moveToTail(loserPid)
-        if rot == "both" then moveToTail(winnerPid) end
+        if rot ~= "fixed" then         -- fixed：前两位一直是这两位，不轮换
+            moveToTail(loserPid)
+            if rot == "both" then moveToTail(winnerPid) end
+        end
         applyRoundFall(winnerPid, mid, rd)       -- §307 D8：最后这一回合也按输家播倒地
     end
     DUEL.lastEndWhy = why or "对局结束"
@@ -894,23 +961,8 @@ local function tickHost(tn)
         if DUEL.readySet[DUEL.fa] and DUEL.readySet[DUEL.fb] then
             if tryStartCd(tn) then return end      -- §307 D2：进 cd 前房主再复核禁用武器 / 影之武装
         end
-        if DUEL.stateTill and tn >= DUEL.stateTill then
-            local prevA, prevB = DUEL.fa, DUEL.fb
-            local rA, rB = DUEL.readySet[prevA], DUEL.readySet[prevB]
-            if not rA then moveToTail(prevA) end
-            if not rB then moveToTail(prevB) end
-            local q = activeQueue()
-            if #q < 2 or (q[1] == prevA and q[2] == prevB) or (q[1] == prevB and q[2] == prevA) then
-                -- 没有别的可替补对象：停在 idle 避免无限刷点名
-                resetToIdle("准备超时", tn)
-                mp.toast("准备超时且无人可替补，已暂停轮换", "READY TIMEOUT WITH NO SUBSTITUTE; PAUSED")
-            else
-                out("对决：准备超时（rdy=%s/%s），顺延呼叫下一组 %d vs %d",
-                    tostring(rA or false), tostring(rB or false), q[1], q[2])
-                startReadyPair(q[1], q[2], tn)
-            end
-            return
-        end
+        -- 11-17 用户："30 秒自动轮换机制去掉，人不在房主可以给他换下去"：叫号后一直等两人按 F1，不再准备超时换人
+        -- （房主在成员页调顺序换人；对决不再用房间设置"轮到的人不准备多久算放弃"）
     elseif DUEL.state == "cd" then
         if DUEL.stateTill and tn >= DUEL.stateTill then
             startFight(tn)
@@ -994,6 +1046,12 @@ local function tickHost(tn)
             return
         end
     end
+    -- 11-17 用户定（贴近旧版）：没有"开启对决轮换"这一步。房里能上场的够 2 人就自动叫先进来的两位进"即将对决"，各自按 F1 开打
+    if (DUEL.state == "idle" or (DUEL.state == "end" and not DUEL.stateTill)) and #activeQueue() >= 2 then
+        DUEL.loop = true
+        callNextMatch(tn, "自动叫号")
+        return
+    end
 
     broadcastHostState(tn, false)
 end
@@ -1021,6 +1079,12 @@ function DUEL.fighting()
     return DUEL.isDuel() and DUEL.state == "fight"
 end
 
+-- 11-17 真正在打（倒计时 / 交手 / 回合之间）；叫号"即将对决"不算，那时还能传送去房主那里
+function DUEL.liveMatch()
+    if not DUEL.isDuel() then return false end
+    return DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend"
+end
+
 function DUEL.inMatch()
     if not DUEL.isDuel() then return false end
     return DUEL.state == "ready" or DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend"
@@ -1038,10 +1102,26 @@ function DUEL.shouldLockSelf()
     return DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend"
 end
 
+-- 11-17 排查补齐：开战点光柱（main.lua ARN 那套：蓝 = fa、橙 = fb）。即将对决 / 倒计时时标两位选手站的位置，交手中收起
+function DUEL.markers(myMap)
+    if not DUEL.isDuel() then return nil end
+    if not (DUEL.state == "ready" or DUEL.state == "cd") then return nil end
+    local a = DUEL.arena
+    if not (a and DUEL.fa > 0 and DUEL.fb > 0) then return nil end
+    if a.map and myMap and a.map ~= myMap then return nil end
+    local rad, r = math.rad(a.yaw or 0.0), a.radius or 400.0
+    -- 11-17 修：补齐 Z / d / yaw（ARN.encode 要这几个，缺了 F2 存场地和叫号时都报 format nil）
+    return { host = { X = a.cx - math.cos(rad) * r, Y = a.cy - math.sin(rad) * r, Z = a.cz, fz = a.cz },
+             cli  = { X = a.cx + math.cos(rad) * r, Y = a.cy + math.sin(rad) * r, Z = a.cz, fz = a.cz },
+             d = r, yaw = a.yaw or 0.0 }
+end
+
 function DUEL.allowSpawn(pid)
     if not DUEL.isDuel() then return true end
-    if DUEL.state == "idle" then return false end
-    -- §307 D1：叫号（ready）阶段两位选手的替身也互相生成，能看到对方
+    -- 11-17 用户定（贴近旧版）：只看不上场的人全程不出现；待机 / 即将对决 / 一场结束时其他人都可见；
+    -- 两人按 F1 开打（倒计时 / 交手 / 回合之间）才只留两位选手
+    if pid and DUEL.isWatch(pid) then return false end
+    if DUEL.state == "idle" or DUEL.state == "ready" or DUEL.state == "end" then return true end
     return pid ~= nil and pid > 0 and (pid == DUEL.fa or pid == DUEL.fb)
 end
 
@@ -1078,7 +1158,12 @@ function DUEL.getQueueNext()
 end
 
 function DUEL.setWatchOnly(on)
+    -- 11-17 实测：一次点击被处理了两次（关了又马上开回去），0.5 秒内重复切换不认
+    local tnow = nowFn()
+    if DUEL.watchToggleAt and tnow - DUEL.watchToggleAt < 0.5 then return end
+    DUEL.watchToggleAt = tnow
     DUEL.myWatch = on and true or false
+    DUEL.watchResendN = 0
     local me = mp.myPid()
     if me and me > 0 then
         if mp.isHost() then
@@ -1092,6 +1177,12 @@ function DUEL.setWatchOnly(on)
             DUEL.watch[me] = DUEL.myWatch or nil
             mp.relChat(string.format("w|%d|%d", me, DUEL.myWatch and 1 or 0))
         end
+    end
+    -- 11-17 用户"开了仅观战，场上就一直看不到这个人，全流程都是观战"：不交手的阶段马上进 / 出观战
+    -- （交手阶段本来就在观战，选手切只看不上场由房主重新叫号）
+    -- 11-17 实测：被点名的选手关掉只看不上场后还卡在观战视角（以前选手不处理），现在不交手的阶段谁都马上切
+    if DUEL.isDuel() and (DUEL.state == "idle" or DUEL.state == "ready" or DUEL.state == "end") then
+        freePhaseView("只看不上场切换")
     end
 end
 
@@ -1139,22 +1230,28 @@ function DUEL.f1()
     if mp.isHost() then
         DUEL.syncModeCmd(tn)
         syncRoster(mp.roster())
+        -- 11-17 用户定：没有"开启 / 停止对决轮换"。够 2 人自动叫号（tickHost）；F1 只给被叫到的人准备、选手两下认输
         if DUEL.state == "idle" then
-            DUEL.loop = true
-            return callNextMatch(tn, "开始轮换")
+            local q = activeQueue()
+            if #q >= 2 then
+                DUEL.loop = true
+                callNextMatch(tn, "自动叫号")
+            else
+                mp.notice(T("能上场的不到 2 人，等人进来", "NEED AT LEAST 2 PLAYERS"), "", 2.5)
+            end
+            return true
         elseif DUEL.state == "ready" then
             if (me == DUEL.fa or me == DUEL.fb) and not DUEL.readySet[me] then
                 if wbanBlockSelf() then return false end                    -- §307 D2：自己装着禁用的不让准备
                 local ref = oppOf(me)
-                if ref > 0 and not mp.sameMapAs(ref) then                   -- §307 D1：不在房主那张图
-                    mp.notice(T("你不在对决的地图，去房主所在地图后再按 F1", "YOU ARE NOT ON THE DUEL MAP - GO TO THE HOST'S MAP, THEN PRESS F1"), "", 4.0)
+                if ref > 0 and not mp.sameMapAs(ref) then                   -- §307 D1：对手不在房主（我）这张图
+                    mp.notice(string.format(T("对手 %s 不在你这张地图，等对方过来再按 F1", "OPPONENT %s IS NOT ON YOUR MAP - WAIT, THEN PRESS F1"), mp.nameOf(ref)), "", 4.0)
                     return false
                 end
                 DUEL.readySet[me] = true
                 if not tryStartCd(tn) then broadcastHostState(tn, true) end
                 return true
             end
-            resetToIdle("房主按 F1 停止轮换", tn)
             return true
         elseif DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend" then
             if me == DUEL.fa or me == DUEL.fb then
@@ -1170,25 +1267,21 @@ function DUEL.f1()
                 end
                 return true
             end
-            -- §307 D3：房主不是选手：3 秒内按两次才停（这一场不计）
+            -- §307 D3：房主不是选手：3 秒内按两次取消这一场（不计胜负），之后照常叫下一组
             if f1ArmCheck("stop", tn) then
-                resetToIdle("房主按 F1 停止对决轮换（这一场不计）", tn)
-                mp.notice(T("已停止对决轮换", "DUEL ROTATION STOPPED"), "", 2.5)
+                finishMatch(0, 0, "房主取消了这一场（不计）", tn)
+                mp.notice(T("已取消这一场", "MATCH CANCELLED"), "", 2.5)
             else
-                mp.notice(T("再按一次 F1 停止对决轮换（这一场不计）", "PRESS F1 AGAIN TO STOP THE DUEL ROTATION (THIS MATCH DOES NOT COUNT)"), "", 3.0)
+                mp.notice(T("再按一次 F1 取消这一场（不计胜负）", "PRESS F1 AGAIN TO CANCEL THIS MATCH (NOT COUNTED)"), "", 3.0)
             end
             return true
         elseif DUEL.state == "end" then
-            -- 验收改：房主自己是选手时也要按两次（原来一按就停掉整个轮换）
-            if f1ArmCheck("stop", tn) then
-                resetToIdle("房主按 F1 停止对决轮换（这一场不计）", tn)
-                mp.notice(T("已停止对决轮换", "DUEL ROTATION STOPPED"), "", 2.5)
-            else
-                mp.notice(T("再按一次 F1 停止对决轮换（这一场不计）", "PRESS F1 AGAIN TO STOP THE DUEL ROTATION (THIS MATCH DOES NOT COUNT)"), "", 3.0)
-            end
+            -- 11-17：一场打完等下一组时，房主按 F1 不用等，直接叫下一组（人不够会提示并回待机）
+            syncRoster(mp.roster())
+            DUEL.loop = true
+            callNextMatch(tn, "房主按 F1 叫下一组")
             return true
         else
-            resetToIdle("房主按 F1 停止轮换", tn)
             return true
         end
     else
@@ -1207,16 +1300,20 @@ function DUEL.f1()
         end
         -- 客机只有当前被点名的选手在 ready 阶段按 F1 准备
         if DUEL.state == "ready" and (me == DUEL.fa or me == DUEL.fb) and me > 0 and not DUEL.readySet[me] then
+            -- 11-17 实测：离房主 120 米时第一下 F1 提示"再按一次传送"，第二下赶上叫号就成了准备。离得远（别的图 / 50 米外）F1 先管传送
+            if mp.travelF1 and mp.travelF1() then return true end
             if wbanBlockSelf() then return false end                        -- §307 D2
             local hp = mp.hostPid()
             if hp and hp > 0 and not mp.sameMapAs(hp) then                  -- §307 D1
-                mp.notice(T("你不在对决的地图，去房主所在地图后再按 F1", "YOU ARE NOT ON THE DUEL MAP - GO TO THE HOST'S MAP, THEN PRESS F1"), "", 4.0)
+                if mp.travelF1 and mp.travelF1() then return true end      -- 11-17 连按两次 F1 去房主那里
+                mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
                 return false
             end
             DUEL.readySet[me] = true
             mp.relChat(string.format("r|%d|%d", me, DUEL.mid))
             return true
         end
+        if mp.travelF1 and mp.travelF1() then return true end              -- 11-17 没在打时离房主太远 / 在别的图：连按两次 F1 传过去
         return false
     end
 end
@@ -1362,6 +1459,7 @@ function DUEL.onChat(rest)
         if tok and setArena(parseArena(tok), map) then
             DUEL.arenaMid = tonumber(midStr) or DUEL.mid
             placeIfNeeded(tn)
+            if mp.arnRefresh then mp.arnRefresh("对决场地到了") end
         end
     elseif kind == "e" and not mp.isHost() then
         -- §307 D1 / D2：房主点名（只处理发给我的）
@@ -1370,7 +1468,7 @@ function DUEL.onChat(rest)
         if pid and pid == mp.myPid() then
             DUEL.readySet[pid] = nil
             if code == "map" then
-                mp.notice(T("你不在对决的地图，去房主所在地图后再按 F1", "YOU ARE NOT ON THE DUEL MAP - GO TO THE HOST'S MAP, THEN PRESS F1"), "", 4.0)
+                mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
             elseif code == "wban" then
                 mp.notice(T("房主复核：你装着禁用武器 / 影之武装，换掉再准备", "HOST CHECK: YOU HAVE A BANNED WEAPON / PHANTOM EDGE - SWAP IT OUT, THEN READY"), "", 4.0)
             end
@@ -1491,7 +1589,7 @@ function DUEL.onHostChanged(newHost, isNowHost, tn, oldHost)
         if isNowHost then
             DUEL.loop = true
             DUEL.syncModeCmd(tn)
-            sendDuelCmd(DUEL.fa, DUEL.fb, DUEL.state == "fight")
+            sendDuelCmd(DUEL.fa, DUEL.fb, DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend")
             broadcastHostState(tn, true)
         end
     elseif DUEL.state == "ready" then
@@ -1523,7 +1621,7 @@ function DUEL.onHostChanged(newHost, isNowHost, tn, oldHost)
             sendDuelCmd(0, 0, false)
             mp.notifyTag("idle")
             broadcastHostState(tn, true)
-            local msg2 = T("你已成为新房主，按 F1 开始对决轮换", "YOU ARE NOW HOST; PRESS F1 TO START")
+            local msg2 = T("你已成为新房主", "YOU ARE NOW HOST")
             if ctx.notice then ctx.notice(msg2, "", 2.0) end
             out("对决：%s", msg2)
         end
@@ -1585,41 +1683,76 @@ function DUEL.hudRows(tn)
 
     if DUEL.state == "idle" then
         local q = activeQueue()
-        local roleTxt = mp.isHost() and T("按 F1 开始 1v1 轮换", "PRESS F1 TO START DUEL ROTATION")
-                        or T("等待房主按 F1 开始对决轮换", "WAITING FOR HOST TO START (F1)")
-        rows[#rows + 1] = { c = string.format(T("1v1 对决 · 可上场 %d 人", "1V1 DUEL · %d ELIGIBLE"), #q), col = colTitle }
+        local roleTxt = (#q < 2) and T("等人进来（够 2 人自动叫号）", "WAITING FOR PLAYERS")
+                        or T("马上叫号…", "CALLING THE NEXT PAIR...")
+        -- 11-17 用户："1v1 对决 · 可上场 4 人"读着像 4 个人上场：人数不写，只有不够 2 人开不了时提示
+        rows[#rows + 1] = { c = (#q < 2) and T("1v1 对决 · 还差人（能上场的不到 2 人）", "1V1 DUEL · NEED AT LEAST 2 PLAYERS")
+                                       or T("1v1 对决", "1V1 DUEL"), col = colTitle }
         rows[#rows + 1] = { c = roleTxt .. (DUEL.myWatch and T("  [只看不上场]", "  [WATCH ONLY]") or ""), col = colInfo }
         if nxt then
             rows[#rows + 1] = { c = T("下一位：", "NEXT: ") .. nxtName, col = colMute }
         end
     elseif DUEL.state == "ready" then
-        local rA = DUEL.readySet[DUEL.fa] and T("已准备", "RDY") or T("未准备", "WAIT")
-        local rB = DUEL.readySet[DUEL.fb] and T("已准备", "RDY") or T("未准备", "WAIT")
-        rows[#rows + 1] = { c = string.format(T("点名：%s(%s) vs %s(%s)  %s", "CALLED: %s(%s) vs %s(%s)  %s"),
-                                              nA, rA, nB, rB, remText(rem)), col = colTitle }
-        if isF and not DUEL.readySet[me] then
-            rows[#rows + 1] = { c = T("轮到你上场！请按 F1 准备", "YOUR TURN! PRESS F1 TO READY"), col = colWarn, center = true }
+        -- 11-17 用户"能换成以前的布局 / 颜色区分么，然后移到右边"：同旧版 1v1 的准备面板（main.lua idleRows）——
+        -- 每人一行"名字：已准备 / 未准备"，已准备绿、未准备红；都放右侧（mpHudRows 把非 center 的行放右边）
+        local colGreen = { R = 90, G = 230, B = 110, A = 255 }
+        local colRed   = { R = 255, G = 70, B = 70, A = 255 }
+        local function readyRow(pid, name)
+            local ok = DUEL.readySet[pid] and true or false
+            return { l = name .. T("：", ":"), v = ok and T("已准备", "READY") or T("未准备", "NOT READY"), col = ok and colGreen or colRed }
+        end
+        rows[#rows + 1] = { c = T("1v1 对决 · 即将对决", "1V1 DUEL · UP NEXT"), col = colTitle }
+        if isF then
+            local opp = oppOf(me)
+            rows[#rows + 1] = readyRow(me, T("我方", "YOU"))
+            rows[#rows + 1] = readyRow(opp, mp.nameOf(opp))
+            if not DUEL.readySet[me] then
+                rows[#rows + 1] = { c = T("按 F1 准备", "PRESS F1 TO READY"), col = colInfo, size = 0.75 }
+            end
         else
-            rows[#rows + 1] = { c = T("等待两位选手按 F1 准备…  下一位：", "WAITING FOR READY...  NEXT: ") .. nxtName, col = colMute }
+            rows[#rows + 1] = readyRow(DUEL.fa, nA)
+            rows[#rows + 1] = readyRow(DUEL.fb, nB)
+            rows[#rows + 1] = { c = T("等两人按 F1 开打  下一位：", "WAITING FOR F1  NEXT: ") .. nxtName, col = colMute, size = 0.75 }
+        end
+    elseif DUEL.state == "fight" and isF then
+        -- 11-17 用户："战斗过程中这么多文字有点碍眼，跟之前一样统一在结束后 / 未战斗期播报"：
+        -- 上场选手交手中只留剩余时间（同旧 1v1：小字，最后 10 秒红色放大）；比分 / 下一位在倒计时、回合结束、本场结束时显示
+        if rem > 0 then
+            rows[#rows + 1] = { c = remText(rem),
+                                col = rem <= 10 and { R = 255, G = 70, B = 60, A = 255 } or colInfo,
+                                size = rem <= 10 and 1.2 or 0.8, nolog = true }
         end
     else
+        -- 11-17 用户"新的提示也压缩在右边"：以前一行写满"第 N 回合（抢 K） A 0 : 0 B [时间]"再加一长行观看 / 下一位，
+        -- 现在拆成短行：回合 + 时间 / 每人一行比分（同旧版 1v1 面板的"名字：值"）/ 小字提示
         local bo = mp.bestOf()
-        local head = string.format(T("第 %d 回合（抢 %d）  %s %d : %d %s", "ROUND %d (FT%d)  %s %d : %d %s"),
-            math.max(1, DUEL.round), mp.toWin(bo), nA, DUEL.winsA, DUEL.winsB, nB)
+        local head = string.format(T("第 %d 回合（抢 %d）", "ROUND %d (FT%d)"), math.max(1, DUEL.round), mp.toWin(bo))
         if (DUEL.state == "cd" or DUEL.state == "fight") and rem > 0 then
             head = head .. "  " .. remText(rem)
         end
         rows[#rows + 1] = { c = head, col = colTitle }
+        local function scoreRow(pid, name, wins)
+            return { l = name .. T("：", ":"), v = tostring(wins or 0), col = colInfo }
+        end
+        if isF then
+            local meIsA = (me == DUEL.fa)
+            rows[#rows + 1] = scoreRow(me, T("我方", "YOU"), meIsA and DUEL.winsA or DUEL.winsB)
+            rows[#rows + 1] = scoreRow(oppOf(me), mp.nameOf(oppOf(me)), meIsA and DUEL.winsB or DUEL.winsA)
+        else
+            rows[#rows + 1] = scoreRow(DUEL.fa, nA, DUEL.winsA)
+            rows[#rows + 1] = scoreRow(DUEL.fb, nB, DUEL.winsB)
+        end
+        local small = 0.75
         if DUEL.state == "cd" then
-            rows[#rows + 1] = { c = isF and T("准备开打！", "GET READY!") or T("观众视角：小键盘 * 切换选手", "SPECTATING: NUM* SWITCH VIEW"), col = colWarn, center = isF or nil }
-        elseif DUEL.state == "fight" then
-            if not isF then
-                local cur = mp.specTargetPid()
-                local curName = cur and mp.nameOf(cur) or nA
-                rows[#rows + 1] = { c = T("正在观看：", "WATCHING: ") .. curName .. T("（小键盘 * 切换）  下一位：", " (NUM*)  NEXT: ") .. nxtName, col = colInfo }
+            if isF then
+                rows[#rows + 1] = { c = T("准备开打！", "GET READY!"), col = colWarn, center = true }
             else
-                rows[#rows + 1] = { c = T("交手中  下一位：", "FIGHTING  NEXT: ") .. nxtName, col = colMute }
+                rows[#rows + 1] = { c = T("PgUp / PgDn 换视角", "PGUP / PGDN: CAMERA"), col = colMute, size = small }
             end
+        elseif DUEL.state == "fight" then
+            -- 选手交手中走上面那个分支（只留时间）；这里是观众
+            rows[#rows + 1] = { c = T("PgUp / PgDn 换视角", "PGUP / PGDN: CAMERA"), col = colMute, size = small }
+            rows[#rows + 1] = { c = T("下一位：", "NEXT: ") .. nxtName, col = colMute, size = small }
         elseif DUEL.state == "rend" then
             local msg = (DUEL.lastWinPid == 0) and T("本回合平局，准备重打", "ROUND DRAW, REPLAY")
                         or string.format(T("%s 赢下本回合", "%s WINS THE ROUND"), mp.nameOf(DUEL.lastWinPid))
@@ -1631,28 +1764,94 @@ function DUEL.hudRows(tn)
                         and (string.format(T("胜者：%s", "WINNER: %s"), mp.nameOf(DUEL.lastWinPid)) .. why)
                         or (DUEL.lastEndWhy ~= "" and DUEL.lastEndWhy or T("本场结束", "MATCH ENDED"))
             rows[#rows + 1] = { c = msg, col = colTitle }
-            rows[#rows + 1] = { c = (DUEL.stateTill or DUEL.remSync > 0)
-                                    and string.format(T("%d 秒后下一场  下一位：%s", "NEXT MATCH IN %ds  NEXT: %s"), rem, nxtName)
-                                    or T("等待房主按 F1 开始下一场", "WAITING FOR HOST (F1)"), col = colMute }
+            if DUEL.stateTill or DUEL.remSync > 0 then
+                rows[#rows + 1] = { c = string.format(T("%d 秒后下一场", "NEXT MATCH IN %ds"), rem), col = colMute, size = small }
+                rows[#rows + 1] = { c = T("下一位：", "NEXT: ") .. nxtName, col = colMute, size = small }
+            else
+                rows[#rows + 1] = { c = T("等人进来（够 2 人自动叫号）", "WAITING FOR PLAYERS"), col = colMute, size = small }
+            end
         end
     end
     return rows
+end
+
+-- 11-17 用户"上场顺序可以在房间里调整么"：房主在成员页点一个人选中，再点"往前 / 往后 / 设为下一位"。
+-- 叫号 / 交手中两位选手的位置锁住（不和他们换，免得打完轮换把赢家挤下去）；空闲时谁都能挪。改完立刻广播 mdq=
+-- 11-17 用户"开战前房主可以切换登场顺序和即将对决的 2 人"：只在开打后（倒计时 / 交手 / 回合之间）锁住两位选手
+local function fighterLocked(pid)
+    if not (DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend") then return false end
+    return pid == DUEL.fa or pid == DUEL.fb
+end
+function DUEL.moveInQueue(pid, how, tn)
+    if not mp.isHost() then return false end
+    local idx
+    for i = 1, #DUEL.order do if DUEL.order[i] == pid then idx = i end end
+    if not idx or fighterLocked(pid) then return false end
+    local o = DUEL.order
+    local function swapWith(step)
+        local j = idx + step
+        while j >= 1 and j <= #o and fighterLocked(o[j]) do j = j + step end
+        if j < 1 or j > #o then return false end
+        o[idx], o[j] = o[j], o[idx]
+        return true
+    end
+    local ok
+    if how == "up" then ok = swapWith(-1)
+    elseif how == "down" then ok = swapWith(1)
+    elseif how == "next" then
+        -- 挪到第一个不是在场选手的位置（= 下一位上场）
+        table.remove(o, idx)
+        local at = 1
+        while at <= #o and fighterLocked(o[at]) do at = at + 1 end
+        table.insert(o, at, pid)
+        ok = true
+    end
+    if ok then
+        out("对决：房主调整上场顺序 %d 号 %s → %s", pid, how, table.concat(o, ","))
+        local t = tn or nowFn()
+        -- 即将对决时换了排在最前的两位 → 重新叫号（两人的准备清掉）
+        if DUEL.state == "ready" then
+            local q = activeQueue()
+            if #q >= 2 and not ((q[1] == DUEL.fa and q[2] == DUEL.fb) or (q[1] == DUEL.fb and q[2] == DUEL.fa)) then
+                out("对决：房主换了即将对决的人 → %d vs %d", q[1], q[2])
+                startReadyPair(q[1], q[2], t)
+                return ok
+            end
+        end
+        broadcastHostState(t, true)
+    end
+    return ok
 end
 
 -- 排队次序与房间战绩（成员页列全；11-15 以前直接列在房间面板、最多 6 行）
 function DUEL.queueRows(items, pT)
     local T_ = pT or T
     local me = mp.myPid()
+    local isH = mp.isHost()
     syncRoster(mp.roster())
+    if isH and #DUEL.order > 1 then
+        items[#items + 1] = { label = T_("（房主：点一个人选中，再调上场顺序）", "(HOST: CLICK A PLAYER, THEN REORDER)") }
+    end
+    if DUEL.selPid and not listHas(DUEL.order, DUEL.selPid) then DUEL.selPid = nil end
     for i = 1, #DUEL.order do
         local pid = DUEL.order[i]
         local st = DUEL.stats[pid] or { w = 0, l = 0 }
         local tag
         if pid == DUEL.fa or pid == DUEL.fb then tag = T_("[在场]", "[IN]")
-        elseif DUEL.watch[pid] then tag = T_("[只看]", "[WATCH]")
+        elseif DUEL.isWatch(pid) then tag = T_("[只看]", "[WATCH]")
         else tag = "#" .. i end
         local meMark = (pid == me) and T_("（我）", " (ME)") or ""
-        items[#items + 1] = { label = string.format(T_("  %s %s%s  %d胜 %d负", "  %s %s%s  %dW %dL"), tag, mp.nameOf(pid), meMark, st.w, st.l) }
+        local sel = isH and DUEL.selPid == pid
+        local it = { label = string.format(T_("  %s%s %s%s  %d胜 %d负", "  %s%s %s%s  %dW %dL"), sel and "> " or "", tag, mp.nameOf(pid), meMark, st.w, st.l) }
+        if isH and not fighterLocked(pid) then
+            it.act = function() DUEL.selPid = (DUEL.selPid ~= pid) and pid or nil end
+        end
+        items[#items + 1] = it
+        if sel and not fighterLocked(pid) then
+            items[#items + 1] = { label = T_("      ↑ 往前一位", "      ↑ MOVE UP"), act = function() DUEL.moveInQueue(pid, "up") end }
+            items[#items + 1] = { label = T_("      ↓ 往后一位", "      ↓ MOVE DOWN"), act = function() DUEL.moveInQueue(pid, "down") end }
+            items[#items + 1] = { label = T_("      设为下一位上场", "      MAKE NEXT UP"), act = function() DUEL.moveInQueue(pid, "next") end }
+        end
     end
 end
 
@@ -1666,7 +1865,9 @@ function DUEL.panel(items, pT, part, entry)
     local c = mp.cfg() or {}
 
     if part == "settings" then     -- 房间人数是三个玩法共用的一行（MP.rulesRows），这里只有轮换规则
-        local rotName = (c.duelRot == "both") and T_("两人都下场", "BOTH ROTATE") or T_("败者下场（胜者守擂）", "LOSER ROTATES")
+        local rotName = (c.duelRot == "both") and T_("两人都下场", "BOTH ROTATE")
+                        or (c.duelRot == "fixed") and T_("只有前两位上场（其他人只观战）", "FIRST TWO ONLY (OTHERS WATCH)")
+                        or T_("败者下场（胜者守擂）", "LOSER ROTATES")
         items[#items + 1] = {
             label = string.format(T_("轮换规则：< %s >", "ROTATION: < %s >"), rotName),
             act = isH and function() mp.stepCfg("duelRot", DUEL.ROTS) end or nil
@@ -1685,20 +1886,8 @@ function DUEL.panel(items, pT, part, entry)
     end
     if entry then entry(items, T_) end      -- 房间成员（排队次序 / 战绩）…，pbz_multi 传进来（MP.membersEntry）
 
-    if isH then
-        local btnLbl = (DUEL.state == "idle") and T_("开始对决轮换（F1）", "START DUEL ROTATION (F1)")
-                       or T_("停止对决轮换（F1）", "STOP DUEL ROTATION (F1)")
-        items[#items + 1] = {
-            label = btnLbl,
-            act = function()
-                if DUEL.state == "idle" then
-                    DUEL.f1()
-                else
-                    DUEL.stopRotation("房主从面板停止轮换")
-                end
-            end
-        }
-    elseif DUEL.state == "ready" and (me == DUEL.fa or me == DUEL.fb) and not DUEL.readySet[me] then
+    -- 11-17 用户"多了一层开启对决轮换的操作，感觉没必要"：去掉"开始 / 停止对决轮换"按钮，够 2 人自动叫号
+    if DUEL.state == "ready" and (me == DUEL.fa or me == DUEL.fb) and not DUEL.readySet[me] then
         items[#items + 1] = {
             label = T_("准备上场（F1）", "READY TO FIGHT (F1)"),
             act = function() DUEL.f1() end

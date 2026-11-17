@@ -647,7 +647,8 @@ end
 -- 对局中每 2 秒（跟着 STD.tick 的调用点）：触发出来的饰品增益也按设置换
 ACC.at = -100
 function ACC.tick(tn)
-    if not ACC.mine or MATCH.state == "idle" or tn - ACC.at < 2.0 then return end
+    -- 11-17 排查补齐：新版房间（多人 / 对决）对局中也补（以前只认旧版 1v1 的 MATCH.state）
+    if not ACC.mine or not (MATCH.state ~= "idle" or (BASEHOOK.mp and BASEHOOK.mp.inMatch and BASEHOOK.mp.inMatch())) or tn - ACC.at < 2.0 then return end
     ACC.at = tn
     ACC.apply(getP1())
 end
@@ -715,7 +716,7 @@ function STD.apply(p1, why)
 end
 -- 对局中每 2 秒查一次（游戏重新聚合属性会把值改回去，同 LO.apply 每 2 秒重写替身）
 function STD.tick(tn)
-    if not (STD.saved and MATCH.state ~= "idle") then return end
+    if not (STD.saved and (MATCH.state ~= "idle" or (BASEHOOK.mp and BASEHOOK.mp.inMatch and BASEHOOK.mp.inMatch()))) then return end     -- 11-17 新版房间对局中也补
     if tn - STD.forceAt >= STD.FORCE_EVERY then        -- 对局中换了武器：还原上一把、套这一把（用户"能在玩家切换武器的时候换成切换生成么"）
         STD.forceAt = tn
         STD.lastTn = tn

@@ -12,6 +12,11 @@ It is also an **example for [4net](https://github.com/shilover/fornet)**: how a 
 
 See [INSTALL.txt](INSTALL.txt) (中文：[安装说明.txt](安装说明.txt)). Ready-made packages are on the releases page; no need to build.
 
+## Test server
+
+The mod comes with no lobby server filled in. For testing you can use `pbzol.duckdns.org`: in the panel (Home), System settings →
+Network... → Lobby server. It is a test server and may be down or reset at any time; you can also run your own (`server/`).
+
 ## Build from source
 
 ```bat

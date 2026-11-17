@@ -1497,6 +1497,36 @@ SP._pkt = { load = loadPkt, apply = pktApply, step = pktStep, world = pktWorld }
 SP._live = { apply = pktApply, dress = dressPkt, steer = steer, turn = turn }     -- §251.2 跟随搬进 pbz_multi 本地
 SP._cam = { place = placeCam }                       -- 给 tests/test_spec_cam.py 用
 
+-- 11-17 用户："观战功能不对吧，原有的第三视角和自由视角，PgUp / PgDn 切换都没了"：多人房 / 新版对决的观战借这套镜头。
+-- 镜头和两位选手由调用方给（多人房的 NETP 替身：只用 .pup / .idle），这里临时换上 SP.camActor / SP.side / SP.cam 跑一遍 placeCam。
+-- 旧版 1v1 观战（SP.on）开着时不借，免得两边抢一个状态。
+SP.extCam = { names = CAM_NAMES, FREE = FREE }
+function SP.extCam.place(cam, a, b, mode)
+    if SP.on then return false end
+    local oc, oa, ob, om = SP.camActor, SP.side[1], SP.side[2], SP.cam
+    SP.camActor, SP.side[1], SP.side[2], SP.cam = cam, a, b, mode
+    local ok, err = pcall(placeCam)
+    SP.camActor, SP.side[1], SP.side[2], SP.cam = oc, oa, ob, om
+    if not ok and not SP.extErr then SP.extErr = true; out("!! 多人观战借镜头出错：%s", tostring(err)) end
+    return ok
+end
+-- 进 / 出自由视角（鼠标转视角要恢复视角输入）；cam = 当前镜头，进自由视角时控制器朝向对齐它
+function SP.extCam.free(cam, on)
+    local pc = getP1PC()
+    if not valid(pc) then return end
+    local oc = SP.camActor
+    SP.camActor = cam
+    pcall(freeMode, pc, on)
+    SP.camActor = oc
+end
+-- 观战结束：藏掉的场景物件显示回来、平滑 / 转角状态清掉
+function SP.extCam.reset()
+    if SP.on then return end
+    pcall(SP.unhideAll)
+    SP.camOff, SP.camOffT, SP.clipK, SP.blockedAt, SP.turnedAt = 0.0, 0.0, 1.0, nil, nil
+    SP.eyeS, SP.lookS, SP.clipS, SP.smAt, SP.turnAt = nil, nil, nil, nil, nil
+end
+
 -- 小键盘 .：换动作来源（AI 对打 ↔ 录像包）；开着时立刻重开
 SP.src = "ai"
 function SP.nextSrc()

@@ -1257,6 +1257,84 @@ function LO.cdoNums(path, names)
     return t
 end
 
+-- §372 角色技能格里类名匹配 pat、默认对象上有数字属性 prop 的技能（斩马刀重击的 HealthCostPercent 是蓝图变量，
+-- 父类 GA_Hun_ZhanMa_HeavyAttack_Base）。返回 { { name, cdo = 默认对象, cdoV = 默认对象上的值, insts = { 实例… } }, … }；没 ASC 返回 nil
+-- 【适配】ASC.ActivatableAbilities.Items[i].Ability（= 技能的默认对象）、NonReplicatedInstances / ReplicatedInstances
+function LO.costSpecs(actor, pat, prop)
+    local asc = ascOf(actor)
+    local items = asc and rawProp(rawProp(asc, "ActivatableAbilities"), "Items")
+    if not items then return nil end
+    local list = {}
+    eachArr(items, function(_, spec)
+        local ab = rawProp(spec, "Ability")
+        if not valid(ab) then return end
+        local okC, cls = pcall(function() return ab:GetClass() end)
+        local name = okC and valid(cls) and shortName(full(cls)) or nil
+        if not (name and name:find(pat)) then return end
+        local v = rawProp(ab, prop)
+        if type(v) ~= "number" then return end
+        local s = { name = name, cdo = ab, cdoV = v, insts = {} }
+        for _, key in ipairs({ "NonReplicatedInstances", "ReplicatedInstances" }) do
+            eachArr(rawProp(spec, key), function(_, inst) if valid(inst) then s.insts[#s.insts + 1] = inst end end)
+        end
+        list[#list + 1] = s
+    end)
+    return list
+end
+
+-- §372 这个世界的充能子系统（UIChargeSubsystem，世界子系统：玩家和替身的充能对象都注册在同一个里，游戏界面的
+-- 血条 / buff 栏脚本（playerhpbar.js / ga_player_bufftracker.js）订阅它的注册 / 注销事件）。按 Outer = 角色所在世界挑
+-- 【适配】FindAllOf("UIChargeSubsystem")、UObject:GetOuter()、Actor:GetWorld()
+function LO.chargeSub(actor)
+    local list = FindAllOf("UIChargeSubsystem") or {}
+    local okW, w = pcall(function() return actor:GetWorld() end)
+    for _, s in ipairs(list) do
+        if valid(s) and okW and valid(w) then
+            local okO, o = pcall(function() return s:GetOuter() end)
+            if okO and sameObj(o, w) then return s end
+        end
+    end
+    if #list == 1 and valid(list[1]) then return list[1] end
+    return nil
+end
+
+-- §372 子系统里已注册的充能对象：{ { obj, row = TableRow, pct = 0..1, mine = 外层链上有 me（技能实例 → 角色）, chain = 外层短名 }, … }
+-- 【适配】UIChargeSubsystem:GetChargeObjects()（TArray）、UIChargeObject:GetTableRow() / GetPercentage()、UObject:GetOuter()、
+--        外层是技能实例时再问 GameplayAbility:GetAvatarActorFromActorInfo()
+function LO.chargeObjs(sub, me)
+    local okG, arr = pcall(function() return sub:GetChargeObjects() end)
+    if not okG then return nil end
+    local list = {}
+    eachArr(arr, function(_, o)
+        if not valid(o) then return end
+        local okR, row = pcall(function() return o:GetTableRow() end)
+        local okP, pct = pcall(function() return o:GetPercentage() end)
+        local c = { obj = o, row = okR and fnameStr(row) or "?", pct = okP and tonumber(pct) or nil, mine = false }
+        local cur, names = o, {}
+        for _ = 1, 5 do
+            local okO, up = pcall(function() return cur:GetOuter() end)
+            if not (okO and valid(up)) then break end
+            names[#names + 1] = shortName(full(up)) or "?"
+            if sameObj(up, me) then c.mine = true; break end
+            local okA, av = pcall(function() return up:GetAvatarActorFromActorInfo() end)
+            if okA and valid(av) and sameObj(av, me) then c.mine = true; break end
+            cur = up
+        end
+        c.chain = table.concat(names, "<")
+        list[#list + 1] = c
+    end)
+    return list
+end
+
+-- §372 把一个充能对象在子系统上注销再注册：订阅它的界面脚本先收到"注销"（解绑、清条目），再收到"注册"（重新绑值委托）。
+-- 返回 注销成没成, 注册成没成
+-- 【适配】UIChargeSubsystem:UnregisterChargeObject(obj) / RegisterChargeObject(obj)（exe 反射名，11-17 查）
+function LO.chargeReReg(sub, obj)
+    local okU = pcall(function() sub:UnregisterChargeObject(obj) end)
+    local okR = pcall(function() sub:RegisterChargeObject(obj) end)
+    return okU, okR
+end
+
 -- 【适配】武器效果的短名（"BaiYing/UpgradeData/GE_X"）→ GE 类路径（"/PBZCombatAsset/…/GE_X.GE_X_C"）
 function LO.wgePath(id)
     local name = id:match("([%w_]+)$")
@@ -2010,6 +2088,54 @@ end
 function E.findObj(path)
     local ok, o = pcall(function() return StaticFindObject(path) end)
     return ok and valid(o) and o or nil
+end
+
+-- §371 这一帧打到 victim 的伤害来源（认黑魔伤魔剑的额外剑气，base_loadout.lua HQX）。两路：
+-- ① 伤害载荷对象 DamageTakenPayload / DamagePreTakePayload（usmap：DamageSource 接口、TargetActor、HitLocation…）：
+--    TargetActor = victim、上一次（seen）没见过的 → DamageSource（子弹）的 BulletData 资产名（读不到 BulletData 就用来源的类名）
+-- ② owner 名下的子弹（BulletObjectBase：刀的扫掠判定 / 剑气重叠判定；BulletActorBase：剑气波 / 发射器）→ { bd = BulletData 资产名, st = BulletStatus }
+--    （EBulletStatus：0 没初始化、1 就绪、2 在跑、3 已停用）。payOnly = 只要 ①（记底用）
+-- 返回 { pay = { 资产名… }, live = { … }, seen = 这次看到的全部载荷（下次传回来） }
+-- 游戏里没验证过载荷对象能不能找到、接口属性读出来是不是对象（HANDOVER §371 待实测）
+-- 【适配】FindAllOf("DamageTakenPayload"/"DamagePreTakePayload"/"BulletObjectBase"/"BulletActorBase")；载荷.TargetActor / .DamageSource；子弹.BulletOwnerAvatar / .BulletStatus / .BulletData
+function E.hitSources(victim, owner, seen, payOnly)
+    local r = { pay = {}, live = {}, seen = {} }
+    local function bdName(o)
+        local bd = rawProp(o, "BulletData")
+        if valid(bd) then return shortName(pathOf(bd)) end
+        return nil
+    end
+    for _, cls in ipairs({ "DamageTakenPayload", "DamagePreTakePayload" }) do
+        local ok, l = pcall(function() return FindAllOf(cls) end)
+        for _, p in ipairs(ok and l or {}) do
+            if valid(p) then
+                local key = full(p)
+                r.seen[key] = true
+                if not (seen and seen[key]) and sameObj(rawProp(p, "TargetActor"), victim) then
+                    local src = rawProp(p, "DamageSource")
+                    if src ~= nil and not valid(src) then
+                        local okO, o = pcall(function() return src:GetObject() end)     -- 接口属性万一包了一层
+                        if okO and valid(o) then src = o end
+                    end
+                    local n = valid(src) and (bdName(src) or ("?" .. (shortName(full(src):match("^(%S+)")) or "?"))) or "?来源读不到"
+                    r.pay[#r.pay + 1] = n
+                end
+            end
+        end
+    end
+    if payOnly or not valid(owner) then return r end
+    for _, cls in ipairs({ "BulletObjectBase", "BulletActorBase" }) do
+        local ok, l = pcall(function() return FindAllOf(cls) end)
+        for _, b in ipairs(ok and l or {}) do
+            if valid(b) then
+                local st = rawProp(b, "BulletStatus")
+                if (st == 2 or st == 3) and sameObj(rawProp(b, "BulletOwnerAvatar"), owner) then
+                    r.live[#r.live + 1] = { bd = bdName(b), st = st }
+                end
+            end
+        end
+    end
+    return r
 end
 
 -- §139.3 角色控制器的朝向（替身 = 它的 AI 控制器；技能瞄准 / 光柱没锁定目标时看 GetControlRotation）。返回 是否成功
@@ -4870,7 +4996,7 @@ return {
     hudShow = E.hudShow,      -- §314 界面三态
     tagsMatching = tagsMatching, puppetDiag = puppetDiag, discardPuppet = discardPuppet, stashAway = stashAway,
     montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, flushInput = HOLDC.flushRun, gameInputBlock = E.gameInputBlock, inputFlushMsg = function() return E.flushMsg end, uiCtxStrip = E.uiCtxStrip, uiCtxRestore = E.uiCtxRestore, unpause = E.unpause, capsuleSize = E.capsuleSize, spawnFxAt = E.spawnFxAt, fxActive = E.fxActive, worldFx = E.worldFx, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = E.holdTaskProbe, inputEnsure = E.inputEnsure, worldTime = E.worldTime, linkAbilityInput = E.linkAbilityInput, inputHold = E.inputHold, inputHoldDump = E.inputHoldDump,
-    teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
+    teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, hitSources = E.hitSources, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
     laserEmitterSpawn = E.laserEmitterSpawn, emitterInfo = E.emitterInfo, moveEmitter = E.moveEmitter, destroyActor = E.destroyActor, stopBullets = E.stopBullets,
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,

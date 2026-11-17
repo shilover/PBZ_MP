@@ -30,6 +30,9 @@ namespace ForNet
         // §350 你的召唤（绝影分身 / 召唤类影之武装）：召出来的东西过一两秒才开打、断断续续打十几秒。召唤招最多等 SummonTouchWait 秒碰到，
         // 碰到过以后 SummonKeep 秒内还有 td= 就一直接着记（普通招 3 秒没动静就丢）
         const double SummonTouchWait = 8.0, SummonKeep = 20.0;
+        // §382 召唤招 8 秒没碰到先报落空，但不算完：之后 SummonKeep 秒内碰到照样改判中招（同 §351）。
+        // 放完分身我接着连砍，分身前几秒打的都记在我那几刀上（模组 TOUCH.srcId：我刚出的刀优先），分身这一招 8 秒里一下没碰到；
+        // 以前判了落空 3 秒就丢，我停手后分身再打的那些（记回分身这一招）找不到结果 = 没伤害（玩家日志 mp_probe (30).log 16:21:00–16:21:20）
         // §351 起手长的招（紫冥剑大招 C_C 放出后 2–4 秒才开始打到，用户 11-16"紫冥剑大招没伤害"）：TouchWait 一过先报落空，
         // 之后 LateTouch 秒内这招又碰到 / 报了伤害 → 同一个结果号改判（模组那边走"追加命中"，0.34.1 起的模组不用改）。以前判了落空就再也不看
         const double LateTouch = 6.0;
@@ -40,7 +43,6 @@ namespace ForNet
         // 不再自己每秒回 150、不再按格挡扣；杀气不到 SkillSh 不放技能（武器技 / 招式技能，影之武装花的是暗源不受影响）。
         // 包里带 sqp=1 告诉模组"交手中别再把替身杀气补满"，杀气打空了替身在你游戏里真的破防（AI 那段时间停手，§352 pst=）
         const double SkillSh = 120;
-        static readonly double[] DmSteps = { 10, 20, 30, 40, 50, 75, 100, 150, 200, 300 };   // §86 伤害倍率档位（同 main.lua NET.DM_STEPS）
         const double AiAir = 0.15, HopVz = 750, HopG = 1800, HopLead = 0.25;
 
         static readonly string[][] Combos = {
@@ -167,7 +169,7 @@ namespace ForNet
         }
 
         internal class Ev { public int Id; public double T; public string Name; }
-        class Ans { public int Rid; public double Seen; public string Kind; public double Dmg, Paid, Last = -1; public bool Summon, Late; }   // §115 Dmg 这招累计伤害，Paid 已扣的血，Last 最后一次在 td= 里
+        class Ans { public int Rid; public double Seen; public string Kind; public double Dmg, Paid, Last = -1; public bool Summon, Late, Linger; }   // §115 Dmg 这招累计伤害，Paid 已扣的血，Last 最后一次在 td= 里
 
         readonly string abilFile;
         readonly GamePipe mb;       // §84 和 AI 那个 Session 的内存交接（GamePipe.StartVirtual）
@@ -252,8 +254,14 @@ namespace ForNet
             return w < lv.Hit ? "hit" : w < lv.Hit + lv.Parry ? "parry" : "block";
         }
 
+        // §367 和 main.lua 的 §249 ATK_EXTRA 一样：资产上会打人、但被下面的排除词挡住的 5 招
+        static readonly HashSet<string> AttackExtra = new HashSet<string> {
+            "GA_Hun_ChiZheCanJian_C_ToZui_C", "GA_Hun_YanYueDao_Stance_C", "GA_TieKuangQuanTao_GuardPoint_C",
+            "GA_XieShan_LightningIce_PerfectDeflect_C", "GA_XieShan_LightningIce_PerfectDeflect_FullCharge_C" };
+
         public static bool IsAttack(string n)
         {
+            if (AttackExtra.Contains(n)) return true;
             var m = HunRe.Match(n);
             if (!m.Success)
             {
@@ -266,6 +274,9 @@ namespace ForNet
             string fam = m.Groups[1].Value, rest = m.Groups[2].Value;
             if (Array.IndexOf(NotAttackFam, fam) >= 0) return false;
             if (rest.Contains("PerfectDodge") || rest.Contains("SWT") || rest.Contains("Counter")) return true;
+            // §367 和 main.lua 的 §185 例外一样：L1+三角 里名字带 Switch / Buff 但真出刀的（混沌切形态斩 SwitchForm*、白影刀背敲击 BuffAtk、
+            // 乱莺鸣剑 / 残钢血刃 *Buff）。以前这里漏了 → 本地 AI 不登记这几招：碰到了也不判、不扣血，招式统计里也没有名字（内测 11-17 残钢血刃）
+            if (rest.StartsWith("SwitchForm") || rest == "BuffAtk" || ((fam == "LuanYing" || fam == "Iron") && rest.EndsWith("Buff"))) return true;
             var full = fam + "_" + rest;
             foreach (var k in NotAttackPart) if (full.Contains(k)) return false;
             return true;
@@ -281,6 +292,14 @@ namespace ForNet
             if (n.Contains("Clone") || n.Contains("Summon")) return true;
             foreach (var k in SummonEdge) if (n.Contains(k)) return true;
             return false;
+        }
+
+        // §378 红妆鬼斩的招：撒下的石蒜花（留场子弹）可能放完好几秒才引爆（带"手动引爆"升级时要按键），
+        // 模组把引爆那一下的 td= 记在最近那招红妆鬼斩上（main.lua TOUCH.srcId）。这些招的结果多留 SummonKeep 秒；
+        // 判了落空之后又碰到 = 花炸到了，改判中招（不再按难度掷，花不按难度防）。判了格挡 / 精防的那招，之后花的伤害还是不算（没做）
+        public static bool IsLingerCast(string n)
+        {
+            return !string.IsNullOrEmpty(n) && n.StartsWith("GA_Hun_GuiTouBlade_", StringComparison.Ordinal);
         }
 
         // 影之武装 folder 的招：pbz_abilities.lua 里路径在 ShachiAbility/<folder>/ 下的技能（去掉被动 / 处决 / 基类），
@@ -678,14 +697,14 @@ namespace ForNet
                 if (!summon && !IsAttack(evn)) continue;
                 // §350 召唤招：没有 tc= 的旧版模组照旧不掷（召唤招本身不出刀）；碰到了一律算中招（召出来的东西不按难度防）
                 if (summon && !touchInfo) continue;
-                answered[atk] = new Ans { Rid = ++resId, Seen = tnow, Kind = touchInfo ? null : Roll(lv, tnow), Summon = summon };
+                answered[atk] = new Ans { Rid = ++resId, Seen = tnow, Kind = touchInfo ? null : Roll(lv, tnow), Summon = summon, Linger = IsLingerCast(evn) };
             }
             foreach (var kv in answered)
             {
                 var a = kv.Value;
                 if (a.Kind == "miss" && a.Late && touched.Contains(kv.Key))     // §351 落空后又碰到：改判，结果号不变
                 {
-                    a.Late = false; a.Kind = a.Summon ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay;
+                    a.Late = false; a.Kind = a.Summon || a.Linger ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay;   // §378 石蒜花晚炸 = 中招
                     Log(L.T("AI：你的第 " + kv.Key + " 招先判落空、后来碰到了，改判 " + a.Kind, "AI: your move #" + kv.Key + " hit late, now " + a.Kind));
                     continue;
                 }
@@ -693,7 +712,7 @@ namespace ForNet
                 if (touched.Contains(kv.Key)) { a.Kind = a.Summon ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay; }
                 else if (a.Summon ? tnow - a.Seen >= SummonTouchWait
                          : actInfo ? (tnow - a.Seen >= TouchWait && !acting.Contains(kv.Key)) || tnow - a.Seen >= ActMax     // §352
-                         : tnow - a.Seen >= TouchWait) { a.Kind = "miss"; a.Seen = tnow - ResDelay; a.Late = touchInfo && !a.Summon; }
+                         : tnow - a.Seen >= TouchWait) { a.Kind = "miss"; a.Seen = tnow - ResDelay; a.Late = touchInfo; }      // §382 召唤招也能改判
             }
             // §115 模组发了 td=<招式号:累计伤害>（你这招在游戏里打在替身身上的真实伤害，已乘伤害倍率 / 武器平衡）：中招按它扣，
             // 多段招后几段累计变大 → 同一条结果的数变大（模组报"追加命中"）、AI 补扣差值。旧版模组没有 td= → 照旧每招 400
@@ -711,11 +730,12 @@ namespace ForNet
             // §363 判完了、招还在 act= 里放（偃月刀大招：第一下拉人判中招 400，被拉开 3–4 秒后才砍下那一刀）别丢：
             // 以前判完 3 秒就丢，后面那刀的 td= 找不到这条结果、整招只剩 400（用户 11-16"第一下打到，第二下砍刀没伤害"）
             foreach (var kv in answered)
-                if (tnow - Math.Max(kv.Value.Seen, kv.Value.Last) >= (kv.Value.Kind == null ? ActMax + 1.0 : kv.Value.Summon && kv.Value.Kind != "miss" ? SummonKeep : kv.Value.Late ? LateTouch : 3.0)
+                if (tnow - Math.Max(kv.Value.Seen, kv.Value.Last) >= (kv.Value.Kind == null ? ActMax + 1.0 : kv.Value.Summon || kv.Value.Linger ? SummonKeep : kv.Value.Late ? LateTouch : 3.0)   // §378 Linger
                     && !(kv.Value.Kind != null && actInfo && acting.Contains(kv.Key) && tnow - kv.Value.Seen < ActMax + 1.0)) old.Add(kv.Key);   // §350 / §351 / §352 还没判的（act= 里还在放）别先丢了
             foreach (var k in old) answered.Remove(k);
             // §86 伤害倍率：游戏是主机，按它包里的 dm= 缩放你砍中 AI 的那 400（旧版 / 坏值 = 100%）
-            double dm = Num(me, "dm", 100), dmg = ResDmg * (Array.IndexOf(DmSteps, dm) >= 0 ? dm : 100) / 100;
+            // §366 按范围认（同 main.lua §213 / 武林盟主 10–1000），不按档位表：盟主 dm=35 以前不在表里 → 退回值按 100% 扣 400
+            double dm = Num(me, "dm", 100), dmg = ResDmg * (dm >= 10 && dm <= 1000 ? dm : 100) / 100;
             var res = new StringBuilder();
             foreach (var kv in answered)
             {

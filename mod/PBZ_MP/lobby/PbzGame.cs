@@ -18,7 +18,7 @@ namespace ForNet
             ModName = "PBZ_MP";
             TitleZh = "影之刃零 联机"; TitleEn = "Phantom Blade Zero - LAN Battle";
             GameZh = "影之刃零"; GameEn = "Phantom Blade Zero";
-            AppVersion = "0.34.3";     // §360.12 和 main.lua 的 VERSION 一致（以前写在 4net 的 Reliable.cs 里；make_release 会核对）
+            AppVersion = "0.34.8";     // §360.12 和 main.lua 的 VERSION 一致（以前写在 4net 的 Reliable.cs 里；make_release 会核对）
             ProcessName = "PBZ";
             // 4net 0.4.0：备份存档的代码搬进基底（SaveBackup，和以前这里的 PbzBackup 一样：账号子目录、-mp.zip、和上一个一样就跳过、20 个 / 14 天）
             BackupSave = () => SaveBackup.Run(SaveBackup.Resolve(Program.BaseDir, @"..\..\..\..\..\ProjectPBZ\Saved\SaveGames\Steam"),

@@ -213,14 +213,19 @@ do
     end
 end
 
--- 一招的系数（纯函数），返回 系数, 依据
-function BAL.moveScale(name)
+-- 一招的系数（纯函数），返回 系数, 依据。wc = 攻击方手上的武器配置（§371；不传 = 不分武器）
+function BAL.moveScale(name, wc)
+    local f, why
     local sp = CAP and CAP.SPREAD and name and CAP.SPREAD[name]          -- §359 按段摊开（见 CAP.SPREAD）
     if sp then
-        local f, why = BAL.moveScale0(name)
-        return f * sp, (why or "系数") .. string.format(" × 摊开 %.3f", sp)
+        f, why = BAL.moveScale0(name)
+        f, why = f * sp, (why or "系数") .. string.format(" × 摊开 %.3f", sp)
+    else
+        f, why = BAL.moveScale0(name)
     end
-    return BAL.moveScale0(name)
+    local wm, wwhy = BAL.wpnMul(name, wc)
+    if wwhy then f, why = f * wm, (why or "系数") .. string.format(" × %s ×%.2f（§371）", wwhy, wm) end
+    return f, why
 end
 function BAL.moveScale0(name)
     local o = BAL.MOVE[name]
@@ -231,6 +236,30 @@ function BAL.moveScale0(name)
     return f, f ~= 1.0 and ("族 " .. fam) or nil
 end
 
+-- §371 同一招按攻击方当时手上的武器再乘（系数表一招一个数：L1+圈 是同类武器共用的一招，单给一把武器调只能在这里分）。
+-- wc = 攻击方手上武器配置路径（替身侧 = 对方的 NET.rwc，放招时记进 BAL.lastWc；本地 AI 我打替身 = 我发这招时的 NET.wcStr，记进 NET.evWc）。
+-- 认法看配置资产名（游戏包 /Hun/Weapon/Double/ 下 Weapon_Hun_Double = 黑伤双刃、Weapon_Hun_JueYing = 淬炼后的绝影，两把放的都是 GA_Hun_Double_*，
+-- 平衡反馈的"绝影（黑伤双刃）"规则也按 GA_Hun_Double_ 落表，所以两把都算；黑魔伤 = /Hun/Weapon/HeiMoShang/Weapon_Hun_HeiMoShang，
+-- 没淬炼的黑伤 Weapon_Hun_Tang 放的是 GA_Hun_Tang_*，不算）。各轮倍数**叠乘**（和系数表每轮在现行值上继续乘同一口径）：
+--   绝影 L1+圈 影杀 YingSha（双持共用）：第四轮 +10%（§358 没做）× 第五轮"幻影三连斩（防御+处决）"+50% = ×1.65
+--   黑魔伤 L1+圈 瞬杀 ShunSha（单手共用）：第三轮 +25%（§346 没做）× 第六轮"瞬杀（防御+处决）"+50%（§379）= ×1.875
+-- _C_C 和接着出的 _CB_C 都乘（一招里的几段）。旧版客户端（0.33 等）没有这段，同一份下发表照原样（不乘）
+BAL.WPN = {
+    { pat = "^GA_GlobalActionAbilit%a*_YingSha_", wc = { Weapon_Hun_Double = true, Weapon_Hun_JueYing = true },
+      mult = 1.10 * 1.50, why = "绝影 L1+圈 第四轮 +10% × 第五轮 +50%" },
+    { pat = "^GA_GlobalActionAbilit%a*_ShunSha_", wc = { Weapon_Hun_HeiMoShang = true },
+      mult = 1.25 * 1.50, why = "黑魔伤 L1+圈 第三轮 +25% × 第六轮 +50%" },
+}
+function BAL.wcName(wc) return type(wc) == "string" and (wc:match("([%w_]+)$")) or nil end
+-- 返回 倍数, 依据（不管 = 1, nil）
+function BAL.wpnMul(name, wc)
+    local w = name and BAL.wcName(wc)
+    if not w then return 1.0, nil end
+    for _, r in ipairs(BAL.WPN) do
+        if r.wc[w] and name:find(r.pat) then return r.mult, r.why end
+    end
+    return 1.0, nil
+end
 -- §186.3 架势里的同名招：偃月刀先放架势 Stance_C 再按 B，发出来的招名还是 B_C，伤害却是强化版（采集 B_C 1091 / B_Reinforced_C 1771；
 -- 11-09 实战 B_C 每点攻击 3.5，采集 1.4）。STANCE_WIN 秒内同族放过架势 → 系数按 <招>_Reinforced_C 算（表里有这一行才换）。
 -- 两边各记各的：收到的对方事件记 BAL.rStance（替身放招乘系数），自己发的记 BAL.myStance（TOUCH.scale 回报），规则一样所以对称。
@@ -256,6 +285,7 @@ function BAL.onFire(name, tn)
     if not BAL.active() then return false end
     local before = BAL.now(tn)
     BAL.prev, BAL.prevAt, BAL.last, BAL.lastAt = BAL.last, BAL.lastAt, name, tn
+    BAL.prevWc, BAL.lastWc = BAL.lastWc, NET.rwc            -- §371 放招时对方手上的武器（同一招按武器分开的系数）
     BAL.noteSummon(name, tn)
     return BAL.now(tn) ~= before
 end
@@ -280,10 +310,10 @@ function BAL.now(tn)
     if not BAL.active() then return nil end
     local f, why, name
     if BAL.last and tn - BAL.lastAt < BAL.HOLD then
-        f, why = BAL.moveScale(BAL.last)
+        f, why = BAL.moveScale(BAL.last, BAL.lastWc)
         name = BAL.last
         if BAL.prev and tn - BAL.prevAt < BAL.TAIL then
-            local f2, why2 = BAL.moveScale(BAL.prev)
+            local f2, why2 = BAL.moveScale(BAL.prev, BAL.prevWc)
             if f2 < f then f, why, name = f2, why2, BAL.prev end
         end
     end
@@ -335,9 +365,25 @@ CAP = { SLACK = 1.25, REF_ATK = 200, n = 0,
 -- 只改代码、不动下发的数值表：旧版本（表一样、原版旧）照旧是"第一刀吃满"，同一份表新旧版本总伤害一致，不会因为版本不同差 4 倍
 -- §359.2 玉双环大招整招按实战改 17200（v0.34.3 玩家日志 11-16 21:16–21:17 三次打满约 13 段：不截时合计 1991 / 1852 / 1856，
 -- 伤害 35%、系数 0.66 × 3039/6365 → 1900 ÷ (0.315 × 0.35) ≈ 17200；6365 = move_game.csv 1632 × 3.9 只算了一部分环，第 7 段起照样被截）
-CAP.SPREAD_RAW = { GA_Hun_BronzeSword_C_C = { 1572, 6860 }, GA_Hun_Horizontal_C_C = { 1952, 8884 }, GA_Hun_Jade_C_Range_C = { 3039, 17200 } }
+-- §369 大招"前几下有伤害、后半段没伤害"（第五轮内测 11-17，v0.34.3 / v0.34.6 日志 mp_probe (24)(25)）：全是这里截的（本地 AI 侧 AIF.cap，
+-- 日志"!! 本地 AI 绕过平衡 … 改成 -0 … 又吃掉 N 跳"）。整招原版还是偏低：不截时合计 ÷ 应有 × 当时原版 = 整招（同口径），
+--   绝影 C_C   11367–14084（13 次；最后那下冲击波一下就 2527 / 2982 = 原版约 1 万）→ 原来没摊开，只有 2592（乌鸦一下）
+--   青铜剑     12637（4 次 6 段打满）、10550、8248 → 6860 只到 1.84 倍的一半
+--   荡寇       9275 / 10442（v0.34.3 4 段，没截但离 8884 × 1.25 只差 6%）
+--   玉双环     14540–18052（17200 × 1.25 内，不动）
+-- 原则：整招原版取**见过的最大**（不是中位），1.25 倍门槛留给没见过的情况——宁可整招总伤害偏低一点（比旧版上限少，最低约 65%，
+-- 下一轮平衡调系数补），也不能后几段被吃掉。绝影空中版没有实战数据，按 §339 总表 11372 × (14084 / 13065) ≈ 12300。
+-- 超出 1.25 倍还是会截（只剩防异常：乌鸦一帧结算好几下这类），截到摊开的招时日志带"§369 整招原版偏低"，看到就照这里的算法再调
+CAP.SPREAD_RAW = { GA_Hun_BronzeSword_C_C = { 1572, 12700 }, GA_Hun_Horizontal_C_C = { 1952, 10500 }, GA_Hun_Jade_C_Range_C = { 3039, 17200 },
+                   GA_Hun_Double_JueYing_C_C = { 2592, 14100 }, GA_Hun_Double_JueYing_C_Air_C = { 2592, 12300 } }
 CAP.SPREAD = {}
 for n, p in pairs(CAP.SPREAD_RAW) do CAP.RAW[n] = p[2]; CAP.SPREAD[n] = p[1] / p[2] end
+-- §369 截到摊开过的招时日志尾巴（CAP.fix / AIF.cap 共用）
+function CAP.lowNote(name)
+    local p = name and CAP.SPREAD_RAW[name]
+    if not p then return "" end
+    return string.format("【§369 整招原版 %d 偏低：摊开的招被截 = 后几段又没伤害了，按这次不截合计重算整招原版】", p[2])
+end
 -- 这一招按表应有的一招总伤害（纯函数）：原版 × 系数 × 伤害倍率 × 对方攻击 / 200 × 等级倍率 / 30 级倍率。
 -- 返回 数, 说明, 门槛倍数（超过 数 × 门槛倍数 才改）；不管的招 nil
 -- §217 本地 AI（攻击方是我）：atkIn / lmIn = 我的攻击力 / 我这一下的等级倍率（不传 = 挨打方口径，读对方的）
@@ -404,13 +450,13 @@ do
     if has("cap_all_off.txt") then CAP.ALL_MODE = "off" elseif has("cap_all.on") then CAP.ALL_MODE = "on" end
     if not CAP.ALL and BASEPARTS then out("!! §339 全招上限数据 base_capdata.lua 没载入（%s），只用手写的几招", tostring(D)) end
 end
-function CAP.allExpected(name, atkIn, lmIn)
+function CAP.allExpected(name, atkIn, lmIn, wc)          -- wc = 攻击方手上的武器（§371 按武器分开的系数；不传 = 不分）
     local A = CAP.ALL
     if not (A and name) or CAP.ALL_MODE == "off" or not BAL.active() then return nil end
     local base, src
     local raw = A.RAW[name]
     if raw then
-        local f = BAL.moveScale(name)
+        local f = BAL.moveScale(name, wc)
         local draw = A.DOT[name]
         base = raw * f + (draw and draw * (BAL.dotScale(name) or 0) or 0)
         src = draw and string.format("原版 %d × 系数 %.2f + 持续 %d", raw, f, draw) or string.format("原版 %d × 系数 %.2f", raw, f)
@@ -418,7 +464,7 @@ function CAP.allExpected(name, atkIn, lmIn)
         local r = A.REF[name]
         local rr = r and A.RAW[r[1]]
         if not rr then return nil end
-        local f = BAL.moveScale(r[1])
+        local f = BAL.moveScale(r[1], wc)
         local draw = A.DOT[r[1]]
         base = (rr * f + (draw and draw * (BAL.dotScale(r[1]) or 0) or 0)) * r[2]
         src = string.format("参照 %s 原版 %d × 系数 %.2f × %g", r[1], rr, f, r[2])
@@ -432,10 +478,10 @@ end
 -- 以前改完只把这一跳压到"应有"以内，累计还停在 1.25 倍门槛下面，后面的跳伤每跳都超门槛、每跳记一行"改成 -0"（07:25 那 40 多行），
 -- 而且累计一直卡在约 1.25 倍。现在：超过以后整跳吃掉、只记第一次那行，合计在这招结束时（CAP.flush）记一行
 function CAP.fix(p1, name, step, total, hpBefore, tn, rec)
-    if MATCH.state ~= "fight" or not hpBefore or hpBefore <= 0 then return nil end
+    if not NET.fighting() or not hpBefore or hpBefore <= 0 then return nil end     -- 11-17 新版房间交手中也封顶（以前只认 1v1）
     local exp, why, slack = CAP.expected(name)
     local all = false
-    if not exp then exp, why, slack = CAP.allExpected(name); all = exp ~= nil end
+    if not exp then exp, why, slack = CAP.allExpected(name, nil, nil, BAL.lastWc or NET.rwc); all = exp ~= nil end
     local capped = rec and rec.capped
     if not exp or total <= exp * (capped and 1.0 or slack or CAP.SLACK) then return nil end
     if all and CAP.ALL_MODE ~= "on" then            -- §339 试算：只记日志，同一招 1.5 秒内只记第一次超的那下
@@ -454,8 +500,8 @@ function CAP.fix(p1, name, step, total, hpBefore, tn, rec)
         return allow
     end
     CAP.n = CAP.n + 1
-    out("!! 绕过平衡的一下：招 %s / 原扣 -%.0f（这招累计 -%.0f）/ 改成 -%.0f（累计 -%.0f；%s，超过 ×%.2f 才改；之后这招再超出的整跳吃掉、结束时记合计；§197 兜底，第 %d 次）",
-        name, step, total, allow, total - step + allow, why, slack or CAP.SLACK, CAP.n)
+    out("!! 绕过平衡的一下：招 %s / 原扣 -%.0f（这招累计 -%.0f）/ 改成 -%.0f（累计 -%.0f；%s，超过 ×%.2f 才改；之后这招再超出的整跳吃掉、结束时记合计；§197 兜底，第 %d 次）%s",
+        name, step, total, allow, total - step + allow, why, slack or CAP.SLACK, CAP.n, CAP.lowNote and CAP.lowNote(name) or "")
     if rec then rec.capped, rec.capName = true, name end      -- 第一段（rec 还没建）由 netJudge 建好结果后标上
     return allow
 end
@@ -483,7 +529,7 @@ function CAP.hitLimit(p1)
 end
 -- 掉血那一帧调（在 CAP.fix 之前）：step 超过上限 → on 时改写血量、返回改后这一帧该掉的；dry 只记；不管 → nil
 function CAP.hitFix(p1, name, step, hpBefore, tn)
-    if MATCH.state ~= "fight" or not hpBefore or hpBefore <= 0 or not step or step <= 0 then return nil end
+    if not NET.fighting() or not hpBefore or hpBefore <= 0 or not step or step <= 0 then return nil end     -- 11-17 同上
     if name and (CAP.RAW[name] or (CAP.TOTAL and CAP.TOTAL[name])) then return nil end
     local lim, hm = CAP.hitLimit(p1)
     if not lim or step <= lim then return nil end
@@ -501,53 +547,269 @@ function CAP.hitFix(p1, name, step, hpBefore, tn)
 end
 
 -- §361 妖锯妖气爆发 −95%（第四轮平衡反馈，用户 11-16"现在做"）。爆发不是一招：妖锯连砍给挨打方挂妖气 GE_YaoJu_Erosion，
--- 它把 GA_YaoJu_MonsterErosion_BP 给到挨打方身上；引爆时这个技能在挨打方身上同时挂 GE_YaoJu_Explode_CanNotDeflect（带标签
--- CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect，约 3 秒）和伤害 GE_YaoJu_Explode_Damage_Lv1/Lv2（资源图 _tools/gasgraph/yaoju.json）。
--- 伤害记在替身当时那一招头上，平衡表分不出来 → 挨打方本机认：掉血那一帧身上**刚出现**这个标签（上一次问的时候还没有，
+-- 它把 GA_YaoJu_MonsterErosion_BP 给到挨打方身上；引爆时这个技能在挨打方身上挂伤害 GE_YaoJu_Explode_Damage_Lv1/Lv2（资源图 _tools/gasgraph/yaoju.json）。
+-- 伤害记在替身当时那一招头上，平衡表分不出来 → 挨打方本机认：掉血那一帧身上**刚出现**爆发标签（上一次问的时候还没有，
 -- 或上一次问已经是 YQX.GAP 秒前）= 爆发那一下，补回 (1 − MULT)。游戏先扣血、下一帧才挂标签时：掉血先记着，YQX.LATE 秒内
 -- 标签出现（那一帧没再掉血）再补。爆发状态里其余的刀照常（标签一直在 = 不是刚出现）。
 -- 只在交手中 + 武器平衡开着（和系数表同一个开关）。每帧只读血量；掉血那一帧 / 等标签的 LATE 秒内才问一次标签。
-YQX = { MULT = 0.05, TAG = "CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect", GAP = 3.0, LATE = 0.25,
-        hp = nil, had = false, askAt = -100, pend = nil, n = 0 }
-function YQX.has(p1)
-    local t = G.tagsMatching(p1, { YQX.TAG })
-    return t ~= nil and #t > 0
+-- §371（第五轮"所有形式的妖气爆发都要调整"）：§361 只认 GE_YaoJu_Explode_CanNotDeflect 的标签 YuuBlade.ExplodeCannotDeflect，
+-- 可这个 GE 只有攻击方带"妖气爆发破绽"升级（GE_YaoJu_Upgrade_YaoQiExplodeDebuff，标签 WeaponUpgrade.YuuBlade.YaoQiExplodeDebuff）
+-- 才挂——MonsterErosion_BP 的名字表里按 GetSourcePlayerASC + HasMatchingGameplayTag 查 YaoQiExplode.V1/V2/V3 / YaoQiExplodeDebuff，
+-- 分 Lv1 / Lv2 两档伤害。内测日志里 485 份状态包带 V1、只有 309 份带 Debuff：没这个升级的人引爆没有这个标签，§361 认不出。
+-- 每种爆发都会在挨打方身上挂的是冷却 GE_YaoJu_Cooldown（标签 CharacterState.AbilityState.YaoJu.Cooldown，时长 SetByCaller，
+-- 冷却期间不会再爆）：mp_probe (5).log 15:32:44 只有 V1 的妖锯 B 命中后"追加 -388"（Hit_Heavy）、对方马上带上 GE_YaoJu_Cooldown，
+-- 前后没有 CanNotDeflect。所以两个标签**任何一个刚出现**都算爆发那一下；同一次爆发两个标签前后脚到，YQX.ONCE 秒内只认一次。
+-- 主动引爆（升级 TriggerYaoQiExplode：攻击方 GA_YaoJu_PlayerPassive_BP 按处决键发 GameplayEvent.Ability.YaoJu.TriggerAllExplode）
+-- 也是挨打方身上同一个 MonsterErosion_BP 结算，同样挂冷却。
+-- §371 本地 AI 方向（我的妖锯打 AI 替身、td= 报数）：同一套认法看替身身上的标签（YQX.mine / YQX.minePend）
+-- §384 离线核查（资产 GA_YaoJu_MonsterErosion_BP 默认对象 / 两个 GE，bp_decode）：
+--   · 没升级也会爆：DefaultExplodeAttackData 物理 2.0 倍，V1 / V2 / V3 只是改成 2.33 / 2.66 / 3.0 → 本地 AI 方向不能只看 wge= 里有没有 GE_YaoJu_
+--     （没升级的妖锯身上一个 GE_YaoJu_ 都没有，整个跳过），改成手上是妖锯（wc= 路径带 /YuuBlade/）也算（YQX.mineOn）
+--   · 爆发破绽 GE_YaoJu_Explode_CanNotDeflect 时长 3.0 秒（DurationMagnitude 3.0）；冷却 GE_YaoJu_Cooldown 按 SetByCaller，
+--     BP 里 PostExplodeCooldown = 1.0、ExplodeDelay = 0.15。GAP 以前正好 3.0 = 破绽标签的时长，隔 3 秒再砍一刀、标签还没掉那一帧
+--     会被当成"刚出现"→ 普通刀只报 5%；改 3.5
+--   · 伤害 / 冷却 / 延迟在原生父类里（蓝图只在 GameplayEvent.Ability.YuuBlade.YaoQiExplodeDebuff 事件里挂破绽 GE），
+--     标签和掉血谁先到离线定不了：同一帧 / 标签晚到都处理；标签早到的话 YQX.diag 会记"爆发后又掉"
+--   · 本地 AI 标签晚到（pend）：以前先把整下记进 td=、下一帧再扣 95%。td= 是累计数、本地 AI 那边取最大值（LocalAi.cs a.Dmg = Max），
+--     两帧之间发出去的包（约 30 包 / 秒）已经带了整下 → 扣不回来，后面几刀还被吞掉。现在这一下先不进 td=，LATE_AI 秒内定了再记
+YQX = { MULT = 0.05, TAG = "CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect",
+        TAGS = { "CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect", "CharacterState.AbilityState.YaoJu.Cooldown" },
+        TAG_NAME = { ["CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect"] = "爆发破绽标签",
+                     ["CharacterState.AbilityState.YaoJu.Cooldown"] = "爆发冷却标签" },
+        GAP = 3.5, LATE = 0.25, LATE_AI = 0.1, ONCE = 1.0, n = 0, nAi = 0,
+        -- §384 同一次爆发的另一个标签晚到不再算：窗口按那个标签自己的时长（破绽 3.0 秒）。以前一律 ONCE 1 秒：破绽标签比爆发晚一帧挂上、
+        -- 中间没再砍，1–3 秒后再砍一刀时它"头一回看到" → 普通刀当成爆发只报 5%。冷却标签 1 秒就掉，过了 1 秒再出现一定是下一次
+        ONCE_TAG = { ["CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect"] = 3.0 },
+        DIAG_WIN = 0.5, diagTags = 0, diagAfter = 0, DIAG_MAX = 12 }
+function YQX.newSt() return { hp = nil, had = {}, askAt = -100, pend = nil, lastAt = -100 } end
+YQX.me, YQX.ai = YQX.newSt(), YQX.newSt()
+-- 问一次标签：返回 刚出现的那个标签（没有 = nil）, 身上有没有任何一个
+function YQX.ask(st, actor, tn)
+    local t = G.tagsMatching(actor, YQX.TAGS) or {}
+    local set, has, new = {}, false, nil
+    local stale = tn - st.askAt > YQX.GAP
+    for _, x in ipairs(t) do
+        set[x], has = true, true
+        -- 同一次爆发的另一个标签晚到（上次认出爆发后还在这个标签的窗口里）：不再算
+        if not new and (stale or not st.had[x]) and tn - st.lastAt >= (YQX.ONCE_TAG[x] or YQX.ONCE) then new = x end
+    end
+    st.had, st.askAt = set, tn
+    if new then st.lastAt = tn end
+    return new, has
 end
-function YQX.refund(p1, hpNow, drop, tn, late)
+function YQX.refund(p1, hpNow, drop, tn, late, tag)
     local back = drop * (1 - YQX.MULT)
     if not setAttr(p1, "Health", hpNow + back) then return hpNow end
     YQX.n = YQX.n + 1
-    out("!! 妖锯妖气爆发：这一下 -%.0f 只留 -%.0f（×%.0f%%%s；§361，第 %d 次）", drop, drop - back, YQX.MULT * 100,
-        late and "，标签晚一帧到" or "", YQX.n)
+    out("!! 妖锯妖气爆发：这一下 -%.0f 只留 -%.0f（×%.0f%%，%s%s；§361 / §371，第 %d 次）", drop, drop - back, YQX.MULT * 100,
+        YQX.TAG_NAME[tag] or tostring(tag), late and "，标签晚一帧到" or "", YQX.n)
     return hpNow + back
+end
+-- 一个挨打方的一帧（netJudge 用 YQX.me）：hp = 现在的血。返回 要补的那下, 是不是上一帧那下, 刚出现的标签；不是爆发 = nil
+function YQX.step(st, actor, hp, tn)
+    local prev = st.hp
+    st.hp = hp
+    if hp > (prev or hp) + 0.5 then st.pend = nil end              -- 回过血（喝药 / 补满）：等着的那下作废
+    local p = st.pend
+    if p and tn - p.at > YQX.LATE then st.pend, p = nil, nil end
+    local drop = (prev and hp < prev - 0.5) and (prev - hp) or nil
+    if not drop and not p then return nil end
+    local new, has = YQX.ask(st, actor, tn)
+    if not has then
+        if drop then st.pend = { drop = drop, at = tn } end          -- 标签可能下一帧才到
+        return nil
+    end
+    st.pend = nil
+    if not new then return nil end                                   -- 爆发状态里的后续刀：照常
+    -- 这一帧掉了血 → 标签和伤害同一帧到，就是这一下（上一帧记着的那下是普通刀）；这一帧没掉血 → 是上一帧那下
+    if drop then return drop, false, new end
+    return p.drop, true, new
 end
 -- netJudge 开头每帧调（在它的早返回之前）：返回补过血之后的血量（没动 = nil）
 function YQX.fix(p1, tn)
-    if not (NET.fighting() and BAL.active()) then YQX.hp, YQX.pend = nil, nil; return nil end
+    local st = YQX.me
+    if not (NET.fighting() and BAL.active()) then st.hp, st.pend = nil, nil; return nil end
     local hp = attrOf(p1, "Health")
     if type(hp) ~= "number" then return nil end
-    local prev = YQX.hp
-    YQX.hp = hp
-    if hp > (prev or hp) + 0.5 then YQX.pend = nil end              -- 回过血（喝药 / 补满）：等着的那下作废
-    local p = YQX.pend
-    if p and tn - p.at > YQX.LATE then YQX.pend, p = nil, nil end
-    local drop = (prev and hp < prev - 0.5) and (prev - hp) or nil
-    if not drop and not p then return nil end
-    local has = YQX.has(p1)
-    local fresh = has and (not YQX.had or tn - YQX.askAt > YQX.GAP)   -- 标签刚出现
-    YQX.had, YQX.askAt = has, tn
-    if not has then
-        if drop then YQX.pend = { drop = drop, at = tn } end          -- 标签可能下一帧才到
+    local amount, late, tag = YQX.step(st, p1, hp, tn)
+    if not amount then return nil end
+    local hp2 = YQX.refund(p1, hp, amount, tn, late, tag)
+    st.hp = hp2
+    return hp2
+end
+-- §384 本地 AI 方向要不要问标签：武器平衡开着（和系数表同一个开关；交手 / 对局外木桩由调用方 TOUCH.counts 管，
+-- 以前还要 NET.fighting()，对局外打木桩系数表照乘、爆发却不管），而且手上是妖锯或身上有妖锯的 GE（别的武器每刀不多问）
+function YQX.mineOn()
+    if not BAL.active() then return false end
+    local wc, wge = NET.wcStr, NET.wgeStr
+    return (type(wc) == "string" and wc:find("/YuuBlade/", 1, true) ~= nil)
+        or (type(wge) == "string" and wge:find("GE_YaoJu_", 1, true) ~= nil)
+end
+function YQX.tagStr(set)
+    local l = {}
+    for x in pairs(set or {}) do l[#l + 1] = YQX.TAG_NAME[x] or x end
+    table.sort(l)
+    return #l > 0 and table.concat(l, "+") or "无"
+end
+-- §384 等着的那一下记进 td=（TOUCH.addDmg 在 main.lua；离线测试没有就直接加）
+function YQX.minePay(p, amt)
+    if TOUCH.addDmg then TOUCH.addDmg(p.id, amt) else TOUCH.dmg[p.id] = (TOUCH.dmg[p.id] or 0) + amt end
+end
+-- §384 诊断（前 DIAG_MAX 次）：替身身上这两个标签的变化、认出爆发后 DIAG_WIN 秒内又掉的血（标签比伤害早到时这一下才是爆发）
+function YQX.diag(st, tn, d, before)
+    local now_ = YQX.tagStr(st.had)
+    if now_ ~= before and YQX.diagTags < YQX.DIAG_MAX then
+        YQX.diagTags = YQX.diagTags + 1
+        out("§384 妖锯：替身身上的爆发标签 %s → %s（这一下 -%.0f）", before, now_, d)
+    end
+end
+-- §371 本地 AI：TOUCH.mark 记 td= 时调（d = 替身本机这一帧掉的血，NET.rai 时）。返回 要报的数, "pend"（标签还没到：调用方这一下先不记，
+-- 交给 YQX.minePendSet）。替身血量会被驱动按 AI 回报改写，所以不自己读血量，只在"碰到 + 掉血"那一下问替身身上的标签
+function YQX.mine(pup, tn, d)
+    local st = YQX.ai
+    if not (d and d > 0) then return d end
+    if st.pend then local p = st.pend; st.pend = nil; YQX.minePay(p, p.add) end   -- §384 又掉了一下：上一下没等到标签 = 普通刀，照报
+    if not YQX.mineOn() then return d end
+    if tn > st.lastAt and tn - st.lastAt <= YQX.DIAG_WIN and YQX.diagAfter < YQX.DIAG_MAX then
+        YQX.diagAfter = YQX.diagAfter + 1
+        out("§384 妖锯：认出爆发后 %.2f 秒替身又掉 -%.0f（照报；要是这一下才是爆发 = 标签比伤害早到，§384 要改）", tn - st.lastAt, d)
+    end
+    local before = YQX.tagStr(st.had)
+    local new, has = YQX.ask(st, pup, tn)
+    YQX.diag(st, tn, d, before)
+    if not has then return d, "pend" end
+    if not new then return d end
+    YQX.nAi = YQX.nAi + 1
+    out("!! 妖锯妖气爆发（本地 AI，我打替身）：这一下 -%.0f 只报 -%.0f（×%.0f%%，%s；§371 / §384，第 %d 次）", d, d * YQX.MULT, YQX.MULT * 100,
+        YQX.TAG_NAME[new] or tostring(new), YQX.nAi)
+    return d * YQX.MULT
+end
+-- TOUCH.mark 算完以后调（YQX.mine 回了 "pend"）：这一下先不进 td=，记着（id = 招式号，add = 这一下该报多少）
+function YQX.minePendSet(tn, id, add) YQX.ai.pend = { at = tn, id = id, add = add } end
+-- 每帧（TOUCH.watchHp）：等着的那一下 LATE_AI 秒内替身身上标签刚出现 → 只记 MULT；标签一直在（不是刚出现）/ 等过了 → 照记
+function YQX.minePend(pup, tn)
+    local st = YQX.ai
+    local p = st.pend
+    if not p then return end
+    if tn - p.at > YQX.LATE_AI or not YQX.mineOn() then st.pend = nil; YQX.minePay(p, p.add); return end
+    if tn <= p.at then return end                                       -- TOUCH.mark 同一帧刚问过
+    local before = YQX.tagStr(st.had)
+    local new, has = YQX.ask(st, pup, tn)
+    YQX.diag(st, tn, p.add, before)
+    if not has then return end
+    st.pend = nil
+    if not new then YQX.minePay(p, p.add); return end
+    YQX.minePay(p, p.add * YQX.MULT)
+    YQX.nAi = YQX.nAi + 1
+    out("!! 妖锯妖气爆发（本地 AI，我打替身，标签晚一帧到）：第 #%d 招那一下 -%.0f 只报 -%.0f（×%.0f%%，%s；§371 / §384，第 %d 次）",
+        p.id, p.add, p.add * YQX.MULT, YQX.MULT * 100, YQX.TAG_NAME[new] or tostring(new), YQX.nAi)
+end
+
+-- §371 黑魔伤魔剑（大招 C1 后的 BUFF，GE_Hun_HeiMoShang_Buff，标签 CharacterState.AbilityState.HeiMoShang.Buff）期间的额外剑气 −25%（第五轮）。
+-- 剑气不是一招：魔剑期间 45 处动作按标签多放一串子弹，伤害记在当时那一招上，系数表分不开。资产（_tools/gasgraph/heimoshang.json，
+-- 判定倍率.csv）：剑气全是名字带 Enhanced 的子弹数据——BD_Hun_HeiMoShang_Enhanced_<招>（重叠判定，0.2 / 0.25 / 0.3，由同名 _Spawner 发射器
+-- 飞过去生成，发射器自己没伤害）和 BD_Hun_HeiMoShang_Wave_<招>_Enhanced_NN（剑气波 BP_HeiMoShang_Wave，0.2 / 0.3）；本体刀是
+-- BD_Hun_HeiMoShang_<招>_NN（扫掠判定 SweepTrace）和不带 Enhanced 的 Wave_<招>_01（重击自带的波）。木桩实测（实测_木桩_1116）魔剑里
+-- 剑气每道单独一帧（AAAAAA 253 / 252 / 552 / 253 / 964 / 253），偶尔和刀同一帧。数值分不开（AAB 本体 0.2 / 0.3 和剑气一样），
+-- 只能按"这一下是哪个子弹打的"：挨打方掉血那一帧（攻击方带着魔剑才问）看 ① 游戏的伤害载荷对象 DamageTakenPayload / DamagePreTakePayload
+-- （TargetActor = 我、这次新出现的）的 DamageSource 子弹数据名；没有载荷再看 ② 攻击方名下的子弹：剑气子弹跑着 / 刚结束、本体刀没在跑。
+-- 只剩剑气 → 这一下补回 25%；刀和剑气同一帧到、认不出 → 不动（宁可这一下照原伤害，也不碰本体刀），记日志。
+-- 真人联机：对方魔剑（wge= 带 GE_Hun_HeiMoShang_Buff，§349 替身同步挂上同一个 GE）打我 → netJudge 开头 HQX.fix；
+-- 本地 AI：我魔剑打 AI 替身（我发的 wge= 带它）→ TOUCH.mark 里 HQX.mine 把这一下按 75% 报。net/hqx_off.txt 存在 = 整个不做（不用重新部署）
+HQX = { MULT = 0.75, BUFF = "GE_Hun_HeiMoShang_Buff", LOGS = 40, logs = 0, n = 0, nAi = 0, hp = nil, seen = nil, seenAi = nil, off = false }
+do
+    local f = NET_DIR and io.open(NET_DIR .. "/hqx_off.txt", "r")
+    if f then f:close(); HQX.off = true; out("§371 有 net/hqx_off.txt：黑魔伤魔剑额外剑气不减") end
+end
+function HQX.buffOn(wge) return type(wge) == "string" and wge:find(HQX.BUFF, 1, true) ~= nil end
+-- 子弹数据名 → "qi"（魔剑剑气）/ "body"（别的有伤害的）/ nil（发射器，不算）
+function HQX.kind(bd)
+    if not bd then return "body" end
+    if bd:find("Spawner", 1, true) then return nil end
+    if bd:find("HeiMoShang_Enhanced_", 1, true) or bd:find("^BD_Hun_HeiMoShang_Wave_[%w_]*_Enhanced") then return "qi" end
+    return "body"
+end
+-- G.hitSources 的结果 → "qi" / "body" / "mixed" / "none", 剑气数, 别的数, 认法
+function HQX.classify(src)
+    local q, b, how = 0, 0, "载荷"
+    if src and #src.pay > 0 then
+        for _, n in ipairs(src.pay) do
+            local k = HQX.kind(n)
+            if k == "qi" then q = q + 1 elseif k == "body" then b = b + 1 end
+        end
+    else
+        how = "子弹"
+        for _, x in ipairs(src and src.live or {}) do
+            local k = HQX.kind(x.bd)
+            if k == "qi" and (x.st == 2 or x.st == 3) then q = q + 1
+            elseif k == "body" and x.st == 2 then b = b + 1 end
+        end
+    end
+    if q > 0 and b == 0 then return "qi", q, b, how end
+    if q > 0 then return "mixed", q, b, how end
+    if b > 0 then return "body", q, b, how end
+    return "none", q, b, how
+end
+function HQX.brief(src)
+    local p = {}
+    for i, n in ipairs(src and src.pay or {}) do if i <= 4 then p[#p + 1] = n end end
+    local l = {}
+    for _, x in ipairs(src and src.live or {}) do if #l < 6 and (x.st == 2 or x.st == 3) then l[#l + 1] = tostring(x.bd) .. "/" .. tostring(x.st) end end
+    return string.format("载荷 %d 个 [%s]，子弹 [%s]", src and #src.pay or 0, table.concat(p, " "), table.concat(l, " "))
+end
+-- 挨打方（netJudge 开头每帧，YQX.fix 之后）：对方带着魔剑才读血量 / 问来源。返回补过血之后的血量（没动 = nil）
+function HQX.fix(p1, pup, tn)
+    if HQX.off or not (NET.fighting() and BAL.active()) or not HQX.buffOn(NET.rwge) then HQX.hp, HQX.seen = nil, nil; return nil end
+    local hp = attrOf(p1, "Health")
+    if type(hp) ~= "number" then return nil end
+    local prev = HQX.hp
+    HQX.hp = hp
+    if prev == nil then HQX.seen = (G.hitSources(p1, pup, nil, true) or {}).seen; return nil end    -- 魔剑刚开：已有的载荷当底
+    if not (hp < prev - 0.5) then return nil end
+    local drop = prev - hp
+    local src = G.hitSources(p1, pup, HQX.seen) or { pay = {}, live = {} }
+    HQX.seen = src.seen
+    local k, q, b, how = HQX.classify(src)
+    if k ~= "qi" then
+        if HQX.logs < HQX.LOGS then
+            HQX.logs = HQX.logs + 1
+            out("§371 黑魔伤魔剑：对方魔剑中我掉血 -%.0f，%s（剑气 %d、别的 %d，按%s）→ 不动；%s", drop,
+                k == "mixed" and "刀和剑气同一帧" or (k == "body" and "本体刀" or "认不出来源"), q, b, how, HQX.brief(src))
+        end
         return nil
     end
-    YQX.pend = nil
-    if not fresh then return nil end                                 -- 爆发状态里的后续刀：照常
-    -- 这一帧掉了血 → 标签和伤害同一帧到，就是这一下（上一帧记着的那下是普通刀）；这一帧没掉血 → 是上一帧那下
-    local amount, late = drop, false
-    if not amount then amount, late = p.drop, true end
-    local hp2 = YQX.refund(p1, hp, amount, tn, late)
-    YQX.hp = hp2
-    return hp2
+    local back = drop * (1 - HQX.MULT)
+    if not setAttr(p1, "Health", hp + back) then return nil end
+    HQX.n = HQX.n + 1
+    out("!! 黑魔伤魔剑额外剑气：这一下 -%.0f 只留 -%.0f（×%.0f%%，按%s认出剑气 %d 个；§371，第 %d 次）%s", drop, drop - back, HQX.MULT * 100,
+        how, q, HQX.n, HQX.n <= 10 and ("；" .. HQX.brief(src)) or "")
+    HQX.hp = hp + back
+    return HQX.hp
+end
+-- §371 本地 AI 每帧（TOUCH.watchHp）：我的魔剑刚挂上 → 把场上已有的伤害载荷记成底（之后只看新出现的）；只看状态变化，平时只比一个字符串
+function HQX.minePrime(p1, pup)
+    local on = not HQX.off and NET.rai and HQX.buffOn(NET.wgeStr) and NET.fighting() and BAL.active() or false
+    if on and not HQX.aiOn then HQX.seenAi = (G.hitSources(pup, p1, nil, true) or {}).seen end
+    if not on then HQX.seenAi = nil end
+    HQX.aiOn = on
+end
+-- §371 本地 AI（TOUCH.mark，NET.rai 时）：我带着魔剑、我的刀 / 剑气让替身掉了 d → 返回要报的数
+function HQX.mine(p1, pup, tn, d)
+    if HQX.off or not (d and d > 0 and NET.fighting() and BAL.active()) or not HQX.buffOn(NET.wgeStr) then return d end
+    local src = G.hitSources(pup, p1, HQX.seenAi) or { pay = {}, live = {} }
+    HQX.seenAi = src.seen
+    local k, q, b, how = HQX.classify(src)
+    if k ~= "qi" then
+        if HQX.logs < HQX.LOGS then
+            HQX.logs = HQX.logs + 1
+            out("§371 黑魔伤魔剑（本地 AI）：替身掉血 -%.0f，%s（剑气 %d、别的 %d，按%s）→ 照报；%s", d,
+                k == "mixed" and "刀和剑气同一帧" or (k == "body" and "本体刀" or "认不出来源"), q, b, how, HQX.brief(src))
+        end
+        return d
+    end
+    HQX.nAi = HQX.nAi + 1
+    out("!! 黑魔伤魔剑额外剑气（本地 AI，我打替身）：这一下 -%.0f 只报 -%.0f（×%.0f%%，按%s；§371，第 %d 次）", d, d * HQX.MULT, HQX.MULT * 100, how, HQX.nAi)
+    return d * HQX.MULT
 end
 
 -- §199 持续伤害（点燃 / 流血 / 中毒 / 混沌）按"挂上它的那招"钉住系数（用户 11-10："点燃和本身伤害合在一起算，首先削点燃伤害，
@@ -634,7 +896,7 @@ function DOT.ratio(kind, tn)
     local cur = LO.atkScale or 1.0
     if s then return cur > 0 and s.pin / cur or nil end
     if BAL.last and tn - BAL.lastAt < BAL.HOLD then
-        local f = BAL.moveScale(BAL.last)
+        local f = BAL.moveScale(BAL.last, BAL.lastWc)       -- §371 和 BAL.now 同一口径
         local d = BAL.dotScale(BAL.last)
         if f and f > 0 and d then return d / f end
     end
@@ -736,11 +998,15 @@ function DOT.ctrlStep(p1, ty, s, tn)
     local cap = BAL.CTRL[ty.id]
     if not cap or cap <= 0 or s.lv == 0 or not s.onAt or s.cutN == s.n or not DOT.active() then return end
     if tn - s.onAt < cap then return end
-    s.cutN = s.n
+    -- §373 INF.strip 按标签读回：撤掉了才算这一次办完；撤不掉下回（3 帧后）接着撤，日志只记第一次
     local ok = INF.strip(p1, ty)
+    local first = s.cutTry ~= s.n
+    s.cutTry = s.n
+    if ok then s.cutN = s.n end
+    if not first and not ok then return end
     DOT.cuts = DOT.cuts + 1
     out("※ %s挂满 %.1f 秒（数值表 ctrl 上限 %.1f 秒，§199）→ 撤掉自己的 %s：%s（第 %d 次；对方替身跟着 inf= 解除）",
-        ty.name, tn - s.onAt, cap, ty.lv[1] and ty.lv[1][2] or "?", ok and "已撤" or "撤不掉", DOT.cuts)
+        ty.name, tn - s.onAt, cap, ty.lv[1] and ty.lv[1][2] or "?", ok and "已撤" or "撤不掉（标签还在，接着撤）", DOT.cuts)
 end
 
 -- §217 本地 AI / 假对手（状态包 ai=1）：td= 按挨打方同一套规则报（用户 11-10 15:02–15:05 炽刃打本地 AI，伤害 100%、武器平衡 + 标准数值：
@@ -833,7 +1099,7 @@ function AIF.cap(id, add, tn)
     if not fight or add <= 0 then return add end
     local name = AIF.name(id)
     local exp, why, slack = CAP.expected(name, AIF.myAtk(), AIF.myLm(name))
-    if not exp and CAP.ALL_MODE == "on" then exp, why, slack = CAP.allExpected(name, AIF.myAtk(), AIF.myLm(name)) end   -- §339 只在真开时
+    if not exp and CAP.ALL_MODE == "on" then exp, why, slack = CAP.allExpected(name, AIF.myAtk(), AIF.myLm(name), NET.evWc and NET.evWc[id]) end   -- §339 只在真开时
     if not exp then return add end
     local ck = (mp and mp.key) or id
     local prev = (mp and mp.prev ~= nil) and mp.prev or (TOUCH.dmg[id] or 0)
@@ -846,8 +1112,8 @@ function AIF.cap(id, add, tn)
     end
     AIF.capped[ck] = { name = name, n = 0, eat = 0 }
     AIF.capN = AIF.capN + 1
-    AIF.capSay("!! 本地 AI 绕过平衡的一下：我第 #%d 招 %s / 本机报 -%.0f（这招累计 -%.0f）/ 改成 -%.0f（累计 -%.0f；%s，超过 ×%.2f 才改；之后这招再超出的整跳吃掉；§197 挨打方同一套，§217，第 %d 次）",
-        id, name, add, prev + add, allow, prev + allow, why, slack or CAP.SLACK, AIF.capN)
+    AIF.capSay("!! 本地 AI 绕过平衡的一下：我第 #%d 招 %s / 本机报 -%.0f（这招累计 -%.0f）/ 改成 -%.0f（累计 -%.0f；%s，超过 ×%.2f 才改；之后这招再超出的整跳吃掉；§197 挨打方同一套，§217，第 %d 次）%s",
+        id, name, add, prev + add, allow, prev + allow, why, slack or CAP.SLACK, AIF.capN, CAP.lowNote and CAP.lowNote(name) or "")
     return allow
 end
 -- TOUCH.wire 把招式号过期时调：被吃过跳的那招记一行合计
