@@ -28,16 +28,16 @@
 --------
 1. 把压缩包里的 PBZ_MP 文件夹整个放到：
        <游戏目录>\platform\steam\ue4ss\Mods\
-   放好后应该是这样：
-       Mods\PBZ_MP\Scripts\main.lua
-       Mods\PBZ_MP\Scripts\pbz_game.lua
-       Mods\PBZ_MP\Scripts\pbz_abilities.lua
-       Mods\PBZ_MP\Scripts\pbz_places.lua
-       Mods\PBZ_MP\Scripts\pbz_balance.lua      （每招 PvP 伤害系数，可以手改）
-       Mods\PBZ_MP\enabled.txt
-       Mods\PBZ_MP\pbz_lobby.dll       （联机程序，在游戏里运行）
-       Mods\PBZ_MP\net\                （空文件夹）
-       Mods\PBZ_MP\rec\                （空文件夹）
+   放好后应该是这样（目录结构会随版本变，认准这几个）：
+       Mods\PBZ_MP\enabled.txt                 （有它 UE4SS 才会加载这个模组）
+       Mods\PBZ_MP\fornet_lobby.dll            （联机程序，在游戏里运行，5 MB 左右）
+       Mods\PBZ_MP\Scripts\                    （宿主 + 联机核：main.lua / fornet_*.lua）
+       Mods\PBZ_MP\games\pbz\                  （游戏适配层）
+       Mods\PBZ_MP\mods\base\                  （基础联机包：main.lua / 数值表 / 界面）
+       Mods\PBZ_MP\mods\multi\  mods\spec\  mods\ranked\    （玩法 / 观战 / 排位，有就有）
+       Mods\PBZ_MP\ext\steam\                  （Steam 联机扩展包，内测包有）
+       Mods\PBZ_MP\net\                        （空文件夹：联机设置和状态写在这里）
+       Mods\PBZ_MP\rec\                        （空文件夹：录制）
 2. 有 enabled.txt 时 UE4SS 就会加载这个模组。保险起见，也可以打开
    Mods\mods.txt，加一行：
        PBZ_MP : 1
@@ -45,18 +45,17 @@
 从旧版本升级：
 - 直接覆盖。net\、rec\ 里是你的联机设置和录制，不用删
 - 0.28.6 以前联机程序是单独的 PBZLobby.exe（更早叫"PBZ联机.exe"），现在用不到了，可以删掉
-- v0.23.0 起多了 Scripts\pbz_game.lua，一定要一起拷过去，否则模组加载不起来
+- 0.33.x 及以前的联机程序叫 pbz_lobby.dll，0.34 起改名 fornet_lobby.dll；旧的那份留着也不会被用，可以删
+- 0.34 起目录分了层（Scripts\ 宿主、games\pbz\ 适配、mods\ 各玩法、ext\ 扩展包），升级请整个 PBZ_MP 文件夹覆盖，别只拷单个 lua
 
 
 三、怎么联机
 ------------
 1. 双方都启动游戏、读档（不在同一张地图也行，见第 6 步）
 2. 在游戏里按 Home 打开联机面板，会出鼠标，按钮都能点
-   （联机程序 pbz_lobby.dll 由模组在游戏里载入，不用另开程序，也不用管）
+   （联机程序 fornet_lobby.dll 由模组在游戏里载入，不用另开程序，也不用管）
 3. 面板顶上选"连接方式"，两边要选同一种：
-et
-etcfg.txt 里把 bridge=1 改成 bridge=0（旧的 steam=0 也认），重开游戏）
-   - 服务器大厅：要先有人架一台大厅服务器（见第八节），双方在面板"设置…"里
+   - 服务器大厅：要先有人架一台大厅服务器（见第九节），双方在面板"设置…"里
      填同一个服务器地址（默认是空的）。主机建房，客机在房间列表里点，
      或者"输入地址加入…"填房间号。
      加入时先直连；直连不通时，服务器开了中转、并且双方都在"设置…"里把
@@ -110,15 +109,41 @@ etcfg.txt 里把 bridge=1 改成 bridge=0（旧的 steam=0 也认），重开游
 - 中文提示要用游戏自带字体，加载不到时会显示英文
 
 
-七、反馈问题
+七、联机程序起不来（面板顶上红字 HELPER FAILED / 联机程序启动失败）
+--------------------------------------------------------------------
+0.34 起联机程序是游戏进程里的 fornet_lobby.dll，包里已经不带 PBZLobby.exe 了。
+面板会直接写没起来的原因（被系统的应用控制策略拦住 / 缺少 fornet_lobby.dll /
+这个 UE4SS 载入不了 DLL / 拉起 2 次都没响应）。0.34.8 及以前这里一律显示
+"HELPER FAILED: no PBZLobby.exe"，那只是"连退路 exe 也不在"，不是真正的原因 —— 真正的原因
+在 logs\<日期>\mp_probe.log 里带 "!!" 的那几行。
+弹红字时叫你"重启游戏"是认真的：那次游戏里已经不再尝试载入这个 DLL 了，光点面板上的
+"重新启动联机程序"不一定有用（新版会再试一次 DLL，但系统策略拦着还是失败），先重启游戏。
+
+按这个顺序试：
+1. 重启游戏。还这样再看下面。
+2. Windows 11 的"智能应用控制"（公司 / 学校电脑则是"应用控制策略"）会拦未签名的
+   DLL，日志里写的是"应用程序控制策略已阻止此文件"（错误 0x800711C7）。
+   关掉它：设置 → 隐私和安全性 → Windows 安全中心 → 应用和浏览器控制 →
+   智能应用控制 → 关闭（注意：关掉以后不能再打开，除非重装 / 重置 Windows）。
+   公司或学校的电脑自己关不掉，只能找 IT。
+3. 杀毒软件把 fornet_lobby.dll 删了 / 隔离了：确认 Mods\PBZ_MP 里有这个文件、
+   大小 5 MB 左右；少了就从压缩包重新解压一份，并在杀软里放行。
+4. 右键 fornet_lobby.dll → 属性 → 勾"解除锁定" → 确定，重启电脑再试。
+5. 都不行：按第八节把日志发来。最关键是两样：logs\<日期>\mp_probe.log 里带 "!!"
+   的行，和 net\lobby_errors.log（联机程序自己报的错，没有这个文件本身就是线索）。
+
+
+八、反馈问题
 ------------
-出问题时请记下大概时间和当时在做什么，然后把这几个文件发给作者：
-  <游戏目录>\platform\steam\ue4ss\Mods\PBZ_MP\mp_probe.log      （模组日志，最重要）
-  <游戏目录>\platform\steam\ue4ss\UE4SS.log                      （UE4SS 日志）
+出问题时请记下大概的时间和当时在做什么（系统是 Win10 还是 Win11 也写一句），然后把这些发给作者：
+  <游戏目录>\platform\steam\ue4ss\Mods\PBZ_MP\logs\<日期>\mp_probe.log   （模组日志，最重要；建不了 logs 文件夹时才会落在模组根目录）
+  <游戏目录>\platform\steam\ue4ss\Mods\PBZ_MP\net\                        （整个文件夹，都是几十字节到几 KB 的 txt）
+  <游戏目录>\platform\steam\ue4ss\UE4SS.log                               （UE4SS 日志）
+  <游戏目录>\platform\steam\ue4ss\Mods\PBZ_MP\net\lobby_errors.log        （有就发：联机程序自己报的错）
   游戏崩溃时：<游戏目录>\platform\steam\ue4ss\ 里最新的 crash_日期_时间.dmp
 
 
-八、自己架大厅服务器（可选，只有"服务器大厅"方式要用）
+九、自己架大厅服务器（可选，只有"服务器大厅"方式要用）
 --------------------------------------------------------
 压缩包里的 server\ 文件夹就是服务端，许可证 AGPL-3.0（见 server\LICENSE；模组其余部分是 GPL-3.0）。
 改过的服务端给别人用，要向连上来的玩家提供改过的源码（AGPL 第 13 条）。
@@ -134,8 +159,8 @@ etcfg.txt 里把 bridge=1 改成 bridge=0（旧的 steam=0 也认），重开游
 不想留日志就加 --quiet）。
 
 
-九、感谢
-------------
+十、感谢
+--------
 特别感谢 伊格尼斯：一直以来对数值平衡做出的贡献。
 
 参与测试并反馈了 bug 的玩家（B 站）：

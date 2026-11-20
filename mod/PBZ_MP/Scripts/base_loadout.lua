@@ -123,7 +123,9 @@ BAL.COOLDOWN = BAL.cleanCooldown(nil)
 -- SwitchKeepShachi = 1：切武器不回满杀气、保持切之前的值（原版切武器会把杀气回满）；0 = 按原版。
 -- 整行没有（旧表 / 旧版主机 / 服务器下发的表没有 co=）或行里没写某个键 = 默认（20 / 20 / 开）。只在武器平衡开着、对局交手中生效
 -- §228 StaggerHits / StaggerSec = 精防硬直触发次数 / 关输入秒数（STG.need / STG.sec，房间设置 stg 开着才用，不看武器平衡）
-BAL.COST_DEF, BAL.COST_CAP = { Dodge = 50, SnakeDodge = 50, SwitchKeepShachi = 1, StaggerHits = 3, StaggerSec = 1 }, 1000
+-- §406 PoJunDR = 破军冲锋（GA_Hun_PoJun_DB / DB_02）的减伤保留几成：1 = 原版不减，0.25 = 只留 25%（减伤 −75%），0 = 完全不免伤。
+-- main.lua PJ 段直接改挨打方自己的承伤倍率（Physical / Elemental / ImpactShachi），只在武器平衡开着、交手中生效。
+BAL.COST_DEF, BAL.COST_CAP = { Dodge = 50, SnakeDodge = 50, SwitchKeepShachi = 1, StaggerHits = 3, StaggerSec = 1, PoJunDR = 0.25 }, 1000
 function BAL.cleanCost(t)
     local o = {}
     for k, v in pairs(type(t) == "table" and t or {}) do
@@ -450,16 +452,22 @@ do
     if has("cap_all_off.txt") then CAP.ALL_MODE = "off" elseif has("cap_all.on") then CAP.ALL_MODE = "on" end
     if not CAP.ALL and BASEPARTS then out("!! §339 全招上限数据 base_capdata.lua 没载入（%s），只用手写的几招", tostring(D)) end
 end
+-- §389 多段招的整招原版覆盖（只管 §339 的 ALL 这一层，默认 dry 时不影响任何伤害）：
+-- 偃月刀 L1+三角（按住旋转）base_capdata 的 4746 只是采集到的一段；整招按住最多 12 段（v0.34.3 玩家日志 (24) 10:25:49
+-- #676：12 段 −91…−216 合计 1450，伤害 20%、当时系数 0.53 → 整招原版约 13680）。cap_all 真开（net\cap_all.on）时
+-- 原来前 3–4 段就把 4746 的预算吃满、后面每段都被截成 0；这里按整招给预算，每段都留着。表 / 数据文件没改。
+CAP.ALL_RAW = { GA_Hun_YanYueDao_SpecialSkill_C = 13700 }
 function CAP.allExpected(name, atkIn, lmIn, wc)          -- wc = 攻击方手上的武器（§371 按武器分开的系数；不传 = 不分）
     local A = CAP.ALL
     if not (A and name) or CAP.ALL_MODE == "off" or not BAL.active() then return nil end
     local base, src
-    local raw = A.RAW[name]
+    local raw = (CAP.ALL_RAW and CAP.ALL_RAW[name]) or A.RAW[name]
     if raw then
         local f = BAL.moveScale(name, wc)
         local draw = A.DOT[name]
         base = raw * f + (draw and draw * (BAL.dotScale(name) or 0) or 0)
         src = draw and string.format("原版 %d × 系数 %.2f + 持续 %d", raw, f, draw) or string.format("原版 %d × 系数 %.2f", raw, f)
+        if CAP.ALL_RAW and CAP.ALL_RAW[name] then src = src .. "（§389 整招多段）" end
     else
         local r = A.REF[name]
         local rr = r and A.RAW[r[1]]
@@ -1249,7 +1257,18 @@ function LO.rescale(pup, tn)
     -- §207.6 等级系数 ×1 也写进中招日志：本机装着同一把时游戏自己按本机等级乘（替身 Attack 200 / ×100% 实际也是 30 级），
     -- 以前这种情况日志里看不出标准数值 / 等级有没有算上
     LO.lvNote = (lf == 1.0 and lwhy) and string.format("%s %s ×1.00，游戏按本机装着的等级自己乘", lname, lwhy) or nil
-    if lwhy and lwhy ~= LO.stdWhy then LO.stdWhy = lwhy; out("%s：替身等级系数 ×%.2f（%s）", lname, lf, lwhy) end
+    -- §性能（11-19）：以前靠一个全局 LO.stdWhy 去重，多替身武器不同时会来回跳（日志 11-19 一天刷 2370 行同样的字）。
+    -- 改成按"名字|说明|系数"记，每种只写一次
+    if lwhy then
+        LO.stdWhy = LO.stdWhy or {}
+        local sk = string.format("%s|%s|%.2f", lname, lwhy, lf)
+        if not LO.stdWhy[sk] then
+            LO.stdWhy[sk] = true
+            local cnt = 0
+            for _ in pairs(LO.stdWhy) do cnt = cnt + 1 end
+            if cnt <= 30 then out("%s：替身等级系数 ×%.2f（%s）", lname, lf, lwhy) end
+        end
+    end
     STD.tick(tn)
     ACC.tick(tn)                 -- §170.1
     DOT.tn = tn                  -- §199 LO.apply 里按这个时刻算持续伤害的增伤

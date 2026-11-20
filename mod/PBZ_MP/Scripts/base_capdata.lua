@@ -959,7 +959,7 @@ DOT = {
 },
 REF = {
   GA_BrutalAxe_Sprint_C = { "GA_BrutalAxe_Combo_C", 1 },  -- 同族最高
-  GA_Hun_Chaos_SwitchFormIce_SWT_C = { "GA_Hun_Chaos_B_Hold_Fire_C", 1 },  -- 同族最高
+  GA_Hun_Chaos_SwitchFormIce_SWT_C = { "GA_Hun_Chaos_SwitchFormFire_C", 1 },  -- 同族最高
   GA_Hun_ChiZheCanJian_PerfectDodge_C = { "GA_Hun_ChiZheCanJian_C_Zui_C", 1 },  -- 同族最高
   GA_Hun_Double_SWT_Tutorial2_C = { "GA_Hun_Double_SWT_C", 1 },  -- 对应招
   GA_Hun_DualHook_PerfectDodge_GEx_C = { "GA_Hun_DualHook_DB_C", 1 },  -- 同族最高

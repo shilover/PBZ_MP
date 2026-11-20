@@ -498,17 +498,21 @@ function CFG.finish()
     CFG.srvAt = nil        -- §196 回自由活动马上查一次 srvcfg.txt（对局中变了的这时换上）
 end
 CFG.init()
--- §110 武林盟主（排位）固定规则：联机程序在 lobby.txt 里给 rk=1（当前连接方式是 ranked）和 rkrules=bo=3;dm=150;med=0;bal=1;ctr=1;ab=0
+-- §110 武林盟主（排位）固定规则：联机程序在 lobby.txt 里给 rk=1（当前连接方式是 ranked）和 rkrules=bo=3;dm=20;…
 -- （服务器下发）。这时上面的 NET.bestOf / dmgPct / allBlock / flag 一律按 rkrules 返回，主机、客机一样，不看本机 rules.txt / 主机状态包；
 -- 开局 / 跟随时定下 MATCH.* 的地方调的就是它们，不用改。规则还没拿到（rk=1 但 rkrules 空）时不拿本机设置冒充：主机不让开局
--- （F1 / startMatchNow），那时各取值函数照旧。rkrules 里缺的键按原版默认，坏值不认（也按默认）。
+-- （F1 / startMatchNow），那时各取值函数照旧。rkrules 里缺的键按 NET.RK_RULES 里的值（= 盟主默认），坏值不认。
 -- lobby.txt 在 NETUI 段才读得到（netuiRead），这里先放个空的，那边换掉
-NET.RK_DEF = { bo = 3, dm = 100, ab = 0, ctr = 1, bal = 0, med = 1, npos = 1, std = 0, ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 0, accn = 3 }   -- §176 accn 生效饰品数量：服务器 rkrules 的 accn=（moecn 写明 3，§169.5），不发也按 3（武林盟主默认只生效前 3 件）；禁用名单走 rkrules 的 accban=（§179.4，pbz_ranked.lua RK.accBan / NET.accBanOf）；§170.1 acc 饰品等级：服务器不发就是原样；§169 std 标准数值：服务器发 std=1 就开，不发就关（以前不在表里，排位写死关）；§113 ult0 / sp0 / resm：服务器不发就是 0 / 3 / 每场（§113.3）；§113.4 ultx 获取倍率 100%；§138 npos 对手位置严格跟随（以前不在表里：排位跟主机自己的设置，固定规则页还误显示"关"）
-NET.RK_DEF.tl = 180      -- §173 武林盟主回合时限：服务器不发 tl= 就是 180 秒
-NET.RK_DEF.gcd, NET.RK_DEF.dgc, NET.RK_DEF.sycd = 1, 1, 1     -- §216 武林盟主：火枪冷却 / 闪避扣杀气 / 瞬影冷却服务器不发就开（和以前跟着 bal=1 一样）
-NET.RK_DEF.swk = 1      -- 11-16 武林盟主：切武器保持杀气服务器不发就开（以前跟着 bal=1）
-NET.RK_DEF.stg = 1      -- §228 武林盟主：精防硬直服务器不发就开（以前一直生效）
-NET.RK_DEF.dif = 3      -- §266 武林盟主：对局难度服务器不发就是逆天者
+-- §408 单一真源：盟主默认规则只写下面 NET.RK_RULES 这一份，客户端三处默认都从它派生——
+--   NET.RK_DEF（rkrules 缺键兜底）、NET.SV_DEF（服务器大厅房间默认）、NET.RK_PRESET（一键套用）。
+-- 改盟主规则时同步这几份副本（值必须一致，tests/test_ranked_defaults.py 会核对）：
+--   排位服务端（不公开）的 RULES；fornet/lobby/Program.cs 的 FormatRoomRules 兜底；
+--   fornet/server/fornet-lobby-server.mjs 的 ROOM_RULES。
+NET.RK_RULES = "bo=3;dm=20;med=0;bal=1;ctr=1;ab=0;npos=1;ultx=200;std=1;ult0=0;sp0=3;resm=0;acc=2;accn=3;tl=180;gcd=1;dgc=0;sycd=1;stg=1;swk=0;dif=3;accban=AnimMovement,BreakRegen,HealthResistance,MagicWeapon,SwitchEndure;wpnban=-;edgeban=-"
+-- rkParse 认的 0/1 键（其余数字键按 bo / dm / RES_MAX 的范围认；accban / wpnban / edgeban / cfgh 原串保留）
+NET.RK_FLAG_KEYS = { med = true, bal = true, ctr = true, ab = true, npos = true, std = true,
+                     gcd = true, dgc = true, sycd = true, stg = true, swk = true }
+NET.RK_DEF = {}     -- rkParse 定义好之后由 NET.RK_RULES 填（见下面）；起算也用它
 NET.rkCache = {}
 function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }；空 / 一个认识的键都没有 → nil
     if not s or s == "" then return nil end
@@ -523,7 +527,7 @@ function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }�
             if k == "bo" then ok = n and n >= 1 and n <= 99 and n % 2 == 1
             elseif k == "dm" then ok = n and n >= 10 and n <= 1000
             elseif NET.RES_MAX[k] then ok = n and NET.resValid(k, n)          -- §113
-            elseif NET.RK_DEF[k] ~= nil then ok = n and (n == 0 or n == 1) end
+            elseif NET.RK_FLAG_KEYS[k] then ok = n and (n == 0 or n == 1) end   -- §408：不再看 RK_DEF（那是解析结果）
             if ok then r[k], any = n, true end
         end
     end
@@ -532,6 +536,8 @@ function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }�
     NET.rkCache = { s = s, r = r }
     return r
 end
+-- §408：RK_DEF = 盟主默认串解析结果（rkParse 起算 / 缺键兜底的唯一来源）
+NET.RK_DEF = NET.rkParse(NET.RK_RULES) or {}
 function NET.roomRules()
     local ms = MATCH.session
     -- §309（11-14 实测）：联机程序给每个主机都写 roomrules=（把主机自己的设置格式化一遍），那不是"别人定的房间规则"。

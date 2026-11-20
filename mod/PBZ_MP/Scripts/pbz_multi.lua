@@ -78,8 +78,19 @@ end
 -- cands 每项：{ pid, atkAt, atkMontage(bool), hitMeAt, aimMe(bool), dist, valid(bool) }
 -- 返回 pid, how：window（只有一个窗口）/ window+tie（多个窗口按回报→朝向→距离）/ carry（沿用上一个打中我的）/
 --                report（2 秒内的出招方实测回报）/ guess（4 秒 30 米位置猜测）/ nil
-function MP.pickHitter(cands, tn, lastBy, lastAt)
+function MP.pickHitter(cands, tn, lastBy, lastAt, victim)
     tn = tonumber(tn) or 0.0
+    -- §386 有真实出手者（钩子读到的）就用它，不再按窗口猜；自己打自己（自伤 / 自己召唤物）不算，
+    -- 队友打的也不算"打中我的人"（和候选表排除队友同一个规矩）
+    if victim then
+        local srcPid, srcHow = MP.hitsrcFor(victim, tn)
+        if not srcPid then srcPid, srcHow = MP.hitsrcPayload(victim, tn) end
+        if srcPid and srcPid ~= myPid() then
+            local myTm = (MP.teamsOn(RULE.teams) and RULE.teamOf and RULE.teamOf[myPid()]) or 0
+            local sTm = (MP.teamsOn(RULE.teams) and RULE.teamOf and RULE.teamOf[srcPid]) or 0
+            if not (myTm ~= 0 and myTm == sTm) then return srcPid, srcHow or "src" end
+        end
+    end
     local list = {}
     for _, c in ipairs(cands or {}) do
         if c.valid ~= false and c.pid then list[#list + 1] = c end
@@ -737,6 +748,288 @@ local NETP = { side = {}, list = {}, on = false, gen = 0, IDLE = 3.0, DROP = 15.
 local tagDrop        -- 头顶血条界面（M3）；先声明，netIdle / netDrop 里要用
 MP.netp = NETP
 
+-- ============================================================ §386 伤害"真实出手者"：钩子读数 → 玩家编号
+-- pbz_game.lua 的钩子（默认关：net/hitsrc_probe.on 存在才挂；net/hitsrc_off.txt 强制关）在掉血那一刻把
+-- 出手 actor（InstigatorCharacter / DamageSource / 子弹主人 / 召唤物主人）交到这里；这里映射成玩家编号，
+-- 按"挨打者 + 时间"暂存，供 AI 掉血归属（shouldAttributeAiDrop）和我挨打（pickHitter）优先使用。
+-- 映射不上 / 钩子没挂上 / 记录过期 → MP.hitsrcFor 返回 nil，调用方照旧走原来的猜测，行为不变。
+local HSRC = { on = false, now = nil, byVic = {}, n = 0, logs = 0, miss = 0, why = nil,
+               WIN = 1.5, KEEP = 20.0, lastDiag = {} }
+MP.hsrc = HSRC
+
+-- 钩子回调在游戏线程里跑：不给它调 now()（那会走 GameplayStatics），时间由 ruleTick 每秒 30 次写进来。
+-- §386 返工：回调里也不调 GetOwner / GetInstigator / GetOuter；钩子把 self / 挨打者 / 出手者记下来，
+-- ruleTick 里 G.hitsrcDrain() 再把记录交给 MP.hitsrcSink（下一帧、正常逻辑）去映射。
+function MP.hitsrcSetNow(tn)
+    HSRC.now = tonumber(tn) or HSRC.now
+end
+function MP.hitsrcSetOn(on)
+    HSRC.on = on == true
+end
+function MP.hitsrcNow()
+    return HSRC.now or now()
+end
+
+local function hsrcUnwrap(v)
+    if v == nil then return nil end
+    local ok, g = pcall(function() return v:get() end)
+    if ok and g ~= nil then return g end
+    return v
+end
+-- 同一个对象：优先用适配层导出的 G.sameObj（main.lua 里 sameObj 是 local，测试里也不一定有全局）
+local function hsrcSame(a, b)
+    if G.sameObj then return G.sameObj(a, b) == true end
+    if type(sameObj) == "function" then return sameObj(a, b) == true end
+    return a == b
+end
+
+-- 出手 actor → 玩家编号：我自己 / 我的替身（= 别人在本机的替身）/ 子弹主人 / 召唤物主人 / 控制器的主人。
+-- 返回 nil = 认不出（调用方退回旧猜测）。
+function MP.hitSourcePid(a)
+    if a == nil then return nil end
+    local ta = type(a)
+    if ta == "number" then return a end
+    if ta == "string" then return tonumber(a) end
+    local p1 = getP1()
+    local function known(x)
+        if not valid(x) then return nil end
+        if valid(p1) and hsrcSame(x, p1) then return myPid() end
+        for _, s in ipairs(NETP.list or {}) do
+            if valid(s.pup) and hsrcSame(x, s.pup) then return s.idx end
+        end
+        for id, s in pairs(NETP.side or {}) do
+            if valid(s.pup) and hsrcSame(x, s.pup) then return id end
+        end
+        return nil
+    end
+    local seen = {}
+    for _ = 1, 5 do
+        local pid = known(a)
+        if pid then return pid end
+        local id = tostring(a)
+        if seen[id] then break end
+        seen[id] = true
+        -- 子弹（BulletOwnerAvatar）/ GE 来源（SourceAvatar）/ 子弹模块（LastOwnerAvatar）/
+        -- 伤害接口（DamageSource / AttackSource）/ 控制器（Pawn）
+        local nxt = hsrcUnwrap(rawProp(a, "InstigatorCharacter")) or hsrcUnwrap(rawProp(a, "BulletOwnerAvatar"))
+            or hsrcUnwrap(rawProp(a, "SourceAvatar")) or hsrcUnwrap(rawProp(a, "LastOwnerAvatar"))
+            or hsrcUnwrap(rawProp(a, "DamageSource")) or hsrcUnwrap(rawProp(a, "AttackSource"))
+            or hsrcUnwrap(rawProp(a, "Pawn"))
+        if nxt == nil and valid(a) then
+            local ok, o = pcall(function() return a:GetOwner() end)
+            if ok then nxt = hsrcUnwrap(o) end
+            if not valid(nxt) then
+                local ok2, i = pcall(function() return a:GetInstigator() end)
+                if ok2 then nxt = hsrcUnwrap(i) end
+            end
+        end
+        if nxt == nil or nxt == a then break end
+        a = nxt
+    end
+    return nil
+end
+
+-- 钩子转交：rec = { fn, victim, sources = { actor… }, dmg, tn = 可选（测试用） }；rec.off = 钩子那边发现 hitsrc_off.txt
+-- §386 返工：只在 ruleTick（下一帧）由 G.hitsrcDrain 调；这里的 GetOwner / GetInstigator 不在钩子回调里跑。
+function MP.hitsrcSink(rec)
+    if rec and rec.off then
+        HSRC.on = false
+        HSRC.why = "hitsrc_off.txt"
+        return
+    end
+    if not HSRC.on or rec == nil then return end
+    -- 钩子那边 self 是 AttributeComponent 时，挨打者是它的主人；取主人在下一帧做（回调里不做）
+    local victim = rec.victim
+    if rec.selfIsComponent and valid(rec.self) then
+        local ok, o = pcall(function() return rec.self:GetOwner() end)
+        if ok and valid(o) then victim = o end
+    end
+    if not valid(victim) then return end
+    local at = tonumber(rec.tn) or MP.hitsrcNow()
+    local vp = pathOf(victim)
+    if not vp or vp == "" or vp == "<nil>" or vp == "<invalid>" then return end
+    local src, srcPath
+    for _, s in ipairs(rec.sources or {}) do
+        local pid = MP.hitSourcePid(s)
+        if pid then
+            src, srcPath = pid, (valid(s) and pathOf(s) or "?")
+            break
+        end
+    end
+    if not src then
+        HSRC.miss = HSRC.miss + 1
+        return
+    end
+    local old = HSRC.byVic[vp]
+    HSRC.byVic[vp] = { pid = src, at = at, dmg = tonumber(rec.dmg), fn = rec.fn, srcPath = srcPath, how = "src" }
+    HSRC.n = HSRC.n + 1
+    -- 映射日志只在前 20 次 / 换了人时写，别每下都刷
+    if not old or old.pid ~= src or at - old.at > 1.0 then
+        if HSRC.logs < 20 then
+            HSRC.logs = HSRC.logs + 1
+            out("§386 命中来源：%s → %s（%s%s）", short(victim), tostring(nameOf and nameOf(src) or src),
+                tostring(rec.fn or "?"), rec.dmg and string.format("，%.0f 伤害", rec.dmg) or "")
+        end
+    end
+    -- 旧记录定期清（可破坏物 / 木桩也会进来，别一直涨）
+    if HSRC.n % 200 == 0 then
+        for k, r in pairs(HSRC.byVic) do
+            if at - (r.at or 0) > HSRC.KEEP then HSRC.byVic[k] = nil end
+        end
+    end
+end
+
+-- 挨打者 + 时间 → 真实出手者编号, 依据, 记录。没有 / 过期返回 nil
+function MP.hitsrcFor(victim, tn)
+    if not HSRC.on or not valid(victim) then return nil end
+    local vp = pathOf(victim)
+    local r = vp and HSRC.byVic[vp]
+    if not r or not r.pid then return nil end
+    local at = tonumber(tn) or MP.hitsrcNow()
+    if at - (r.at or 0) > HSRC.WIN or at < (r.at or 0) - 1.0 then return nil end
+    return r.pid, r.how or "src", r
+end
+
+-- §386 无钩子路径（默认）：挨打者掉血那一拍，从游戏的伤害载荷读 LastOwnerAvatar（pbz_game 的 G.hitOwnerOf）。
+-- 实测（11-18）：挂钩子后多人房同时生成替身会在 BP_ApplyGameplayEffectToSelf 崩，这个路径不挂钩子。
+-- 2026-11-18 第二版（用户实测"击杀还算 AI 头上"）：不再 0.25 秒复用可能过期的结果；
+-- 这一拍载荷读不到 / 已经被下一刀覆盖时，退回 1.5 秒内该挨打者最后一条载荷记录，最后才让调用方去猜。
+local HPAY = { n = 0, logs = 0 }
+MP.hpay = HPAY
+function MP.hitsrcPayload(victim, tn)
+    if not valid(victim) then return nil end
+    local vp = pathOf(victim)
+    if not vp then return nil end
+    local at = tonumber(tn) or MP.hitsrcNow()
+    local rec = HSRC.byVic[vp]
+    if type(G.hitOwnerOf) == "function" then
+        local ok, owner, srcPath = pcall(G.hitOwnerOf, victim)
+        if ok and valid(owner) then
+            local pid = MP.hitSourcePid(owner)
+            if pid then
+                rec = { pid = pid, at = at, fn = "payload", srcPath = srcPath, how = "pay" }
+                HSRC.byVic[vp] = rec
+                HPAY.n = HPAY.n + 1
+                if HPAY.logs < 20 then
+                    HPAY.logs = HPAY.logs + 1
+                    out("§386 命中来源（载荷）：%s → %s（%s）", short(victim), tostring(nameOf and nameOf(pid) or pid), tostring(srcPath or "?"))
+                end
+                return pid, "pay", rec
+            end
+        end
+    end
+    -- 这一拍没读到：用 1.5 秒内该挨打者最后一条载荷记录（多半就是打死它的那一下）。
+    -- 不要退回"附近哪个 AI 刚出过招"——11-18 实测那会把玩家的击杀记到 AI 头上。
+    if rec and rec.pid and at - (rec.at or 0) <= HSRC.WIN then return rec.pid, rec.how or "pay", rec end
+    return nil
+end
+
+-- 装钩子（只装一次；之后 5 秒最多重试一次开关）。返回是否生效
+function MP.installHitsrc()
+    if HSRC.on then return true end
+    local t = os.time()
+    if HSRC.tryAt and t - HSRC.tryAt < 5 then return false end
+    HSRC.tryAt = t
+    if type(G.hitsrcInstall) ~= "function" then
+        HSRC.why = "适配层没有 hitsrcInstall"
+        return false
+    end
+    local ok, on, why = pcall(function() return G.hitsrcInstall({ sink = MP.hitsrcSink }) end)
+    if not ok then
+        HSRC.why = tostring(on)
+        return false
+    end
+    HSRC.why = why
+    HSRC.on = on == true
+    if HSRC.on then
+        if not HSRC.said then
+            HSRC.said = true
+            out("§386 伤害出手者：就用游戏报的出手者（%s）", tostring(why or ""))
+        end
+    elseif not HSRC.warned then
+        HSRC.warned = true
+        out("§386 伤害出手者：没就绪（%s），继续用原来的猜测", tostring(why or HSRC.why))
+    end
+    return HSRC.on
+end
+
+-- 倒下诊断：最后一段伤害记给谁 / 依据 / 我离挨打者多远 / 最近友方替身多远 / 我最近一招多久前
+-- kind = "ai" / "me"；killer / how 只在 kind = "me" 时给（ruleTick 已经算好的凶手）
+function MP.hitsrcDiag(kind, victim, tn, killer, how)
+    if not valid(victim) then return end     -- §386 载荷路径不挂钩子，HSRC.on 关着也要写诊断
+    local at = tonumber(tn) or MP.hitsrcNow()
+    local vp = pathOf(victim)
+    if not vp then return end
+    -- 同一个挨打者 1 秒内只写一行（AI 可能同一帧被多段打死）
+    if HSRC.lastDiag[vp] and at - HSRC.lastDiag[vp] < 1.0 then return end
+    HSRC.lastDiag[vp] = at
+    local idx = nil
+    for _, s in ipairs(NETP.list or {}) do
+        if valid(s.pup) and hsrcSame(s.pup, victim) then idx = s.idx; break end
+    end
+    local who, why, dmg = killer, how, nil
+    local bestAt = 0
+    if kind == "ai" and idx then
+        -- 取 mtd / mta 里最新的那一段（不能只看 mtd：可能我 5 秒前打过一下，最后是别的 AI 打死的）
+        local best, bestHow
+        local pre = tostring(idx) .. ":"
+        for k, e in pairs(RULE.mtd or {}) do
+            if type(k) == "string" and k:sub(1, #pre) == pre and (not best or (e.at or 0) > (best.at or 0)) then
+                best, bestHow = e, "mtd"
+            end
+        end
+        for _, e in pairs(RULE.mta or {}) do
+            if e.vic == idx and (not best or (e.at or 0) > (best.at or 0)) then
+                best, bestHow = e, "mta"
+            end
+        end
+        if best then
+            bestAt = best.at or 0
+            if bestHow == "mtd" then
+                who, why, dmg = myPid(), best.how or "window", best.dmg          -- mtd 只由本机自己造成：记给"你"
+            else
+                who, why, dmg = best.atk, best.how or "mta", best.dmg
+            end
+        end
+    end
+    local rec = HSRC.byVic[vp]
+    if rec and at - (rec.at or 0) > 5.0 then rec = nil end     -- 太老的记录不写进诊断（窗口只有 1.5 秒）
+    -- 钩子记录比 mtd / mta 还新：最后一段就是它（我挨打时 killer 也是按 src 选的，这里再兜一次）
+    if rec and rec.pid and (rec.at or 0) >= bestAt and ((kind == "me" and rec.pid ~= myPid()) or idx) then
+        who, why, dmg = rec.pid, "src", rec.dmg
+    end
+    local p1 = getP1()
+    local vl = loc(victim)
+    local pl = valid(p1) and loc(p1) or nil
+    local myD = (pl and vl) and d2(pl, vl) or nil
+    local nearName, nearD
+    for _, o in ipairs(NETP.list or {}) do
+        if o.idx ~= idx and valid(o.pup) and factionFor and factionFor(o) == FRIEND then
+            local ol = loc(o.pup)
+            local d = (ol and vl) and d2(ol, vl) or nil
+            if d and (not nearD or d < nearD) then nearName, nearD = nameOf(o.idx), d end
+        end
+    end
+    local atkAt
+    if ctx.myAtkInfo then local _, a = ctx.myAtkInfo(); atkAt = a end
+    local age = atkAt and (at - atkAt) or nil
+    local parts = {}
+    parts[#parts + 1] = string.format("%s 倒下", kind == "me" and "我" or (idx and nameOf(idx) or "挨打者"))
+    parts[#parts + 1] = string.format("最后一段记给 %s（依据 %s%s）", who and nameOf(who) or "无",
+        tostring(why or "无"), dmg and string.format("，%.0f", dmg) or "")
+    if rec then
+        parts[#parts + 1] = string.format("钩子记录 %s（%s，%.1f 秒前%s）",
+            rec.pid and nameOf(rec.pid) or "读不到", tostring(rec.fn or "?"), at - (rec.at or at),
+            rec.dmg and string.format("，%.0f 伤害", rec.dmg) or "")
+    else
+        parts[#parts + 1] = "钩子记录 无"
+    end
+    parts[#parts + 1] = string.format("我离挨打者 %s", myD and string.format("%.0f", myD) or "?")
+    parts[#parts + 1] = string.format("最近友方替身 %s 离 %s", nearName or "无", nearD and string.format("%.0f", nearD) or "?")
+    parts[#parts + 1] = string.format("我最近一招 %s", age and string.format("%.1f 秒前", age) or "无")
+    out("§386 受击归属：%s", table.concat(parts, "；"))
+end
+
 function MP.aiSet()
     local s = ctx.session and ctx.session() or {}
     local map, list = {}, {}
@@ -885,6 +1178,7 @@ function MP.netStop(why)
     if MP.rule then
         MP.rule.mtd, MP.rule.aiState, MP.rule.aiAutoSynced = {}, {}, nil
     end
+    if MP.hsrc then MP.hsrc.byVic, MP.hsrc.now, MP.hsrc.lastDiag = {}, nil, {} end     -- §386 旧世界的出手记录作废
     if restoreSpeed then restoreSpeed() end
     if clearAllBuffFx then clearAllBuffFx() end
     if MP.specStopX then MP.specStopX() end
@@ -1134,7 +1428,20 @@ function MP.otherAttackerNear(s, sLoc, tn)
 end
 
 -- 本地 AI 受击归因（两队/三队队友替身也能本地打伤敌方 AI；收紧时间+距离+排除近处正在出招的友方替身）
+-- §386：先看钩子读到的真实出手者；读到了就按它记（我 → 算我；别的 AI / 队友 → 返回 srcPid 让上层走 mta 或不算），
+-- 读不到才走原来的时间窗 + 距离猜测。返回值多了 依据 / 真实出手者编号。
 local function shouldAttributeAiDrop(s, tn)
+    local srcPid, srcHow = MP.hitsrcFor(s.pup, tn)
+    if srcPid == nil then srcPid, srcHow = MP.hitsrcPayload(s.pup, tn) end
+    if srcPid ~= nil then
+        if srcPid == myPid() then
+            if RULE.my ~= 0 then return false, nil, srcHow, srcPid end     -- §336 我倒地 / 出局时打出的不算我的
+            local atkId = 0
+            if ctx.myAtkInfo then atkId = ctx.myAtkInfo() or 0 end
+            return true, tonumber(atkId) or 0, srcHow
+        end
+        return false, nil, srcHow, srcPid
+    end
     if RULE.my ~= 0 then return false, nil end      -- §336 我倒地 / 出局时打出的不算我的
     local atkId, atkAt, atkName = nil, nil, nil
     if ctx.myAtkInfo then atkId, atkAt, atkName = ctx.myAtkInfo() end
@@ -1152,6 +1459,7 @@ local function shouldAttributeAiDrop(s, tn)
     local win = ranged and MP.AI_RANGED_WIN or MP.AI_ATK_WIN
     local recentAtk = atkId and atkAt and (tn - atkAt <= win)
     local recentContact = s.aiContactAt and (tn - s.aiContactAt <= MP.AI_ATK_WIN) and atkId and atkAt and (tn - atkAt <= 1.2)
+    local liveUsed = false
     -- §357 起手慢 / 后段才打到的招（重武器连段末段、蓄力、大招）：掉血时这招还挂在我身上就算我的（最多 AI_LIVE_MAX 秒），
     -- 以前过了 0.6 秒（有受击 1.2 秒）一律不算，AI 一点血不掉。放宽的这条另外要求附近没有别的替身在出招（不管哪队），免得把别人的刀算我头上
     if not recentAtk and not recentContact and atkId and atkAt and tn - atkAt <= MP.AI_LIVE_MAX
@@ -1161,6 +1469,7 @@ local function shouldAttributeAiDrop(s, tn)
             out(string.format("§357 多人 AI #%d 掉血：我的招 %s 放出 %.1f 秒、还在放 → 算我的（第 %d 次）", s.idx, tostring(atkName), tn - atkAt, MP.liveAttr))
         end
         recentAtk = true
+        liveUsed = true
     end
     if not recentAtk and not recentContact then
         return false, nil
@@ -1179,7 +1488,7 @@ local function shouldAttributeAiDrop(s, tn)
             end
         end
     end
-    return true, tonumber(atkId) or 0
+    return true, tonumber(atkId) or 0, liveUsed and "live" or (recentContact and "contact" or "window")
 end
 
 -- §335 AI 打 AI：只有房主报（AI 在房主那边跑，每台都报会重复扣）。AI 替身本机掉血、又不是我打的 →
@@ -1204,7 +1513,7 @@ local function aiAttackerOf(s, tn)
 end
 MP._aiAttackerOf = aiAttackerOf
 
-local function noteAiVsAi(atk, vic, drop, tn)
+local function noteAiVsAi(atk, vic, drop, tn, how)
     RULE.mta = RULE.mta or {}
     local pk = atk .. ":" .. vic
     RULE.mtaSeg = RULE.mtaSeg or {}
@@ -1216,9 +1525,10 @@ local function noteAiVsAi(atk, vic, drop, tn)
     sg.at = tn
     local key = pk .. ":" .. sg.n
     local e = RULE.mta[key]
-    if not e then e = { atk = atk, vic = vic, seg = sg.n, dmg = 0.0, at = tn }; RULE.mta[key] = e end
+    if not e then e = { atk = atk, vic = vic, seg = sg.n, dmg = 0.0, at = tn, how = how or "mta" }; RULE.mta[key] = e end
     e.dmg = e.dmg + drop
     e.at = tn
+    if how then e.how = how end
 end
 MP._noteAiVsAi = noteAiVsAi
 
@@ -1234,8 +1544,8 @@ local peerStep = wrap("·多人替身驱动", function(s, tn)
         local curHp = G.hpOf and G.hpOf(s.pup) or nil
         if curHp and s.aiTrackedHp and curHp < s.aiTrackedHp - 0.5 then
             local drop = s.aiTrackedHp - curHp
-            local okAttr, atkId = false, nil
-            if part(myPid()) then okAttr, atkId = shouldAttributeAiDrop(s, tn) end
+            local okAttr, atkId, attrHow, srcPid = false, nil, nil, nil
+            if part(myPid()) then okAttr, atkId, attrHow, srcPid = shouldAttributeAiDrop(s, tn) end
             if okAttr then
                 local moveId = (atkId and atkId > 0) and atkId or 0
                 if moveId == 0 then
@@ -1260,9 +1570,19 @@ local peerStep = wrap("·多人替身驱动", function(s, tn)
                     end
                     entry.dmg = entry.dmg + scaled
                     entry.at = tn
+                    entry.how = attrHow or "window"      -- §386 诊断用：src / window / contact / live
+                end
+            elseif srcPid ~= nil then
+                -- §386 钩子读到了别的出手者：是我以外的人，就不算我的。是别的 AI（且不同队）→ 走 §335 的 mta 按它记；
+                -- 是队友 / 观众 / 认不出玩家的东西 → 不记（不再让"我最近出过招"把别人的伤害冒领成我的）。
+                local teams = MP.teamsOn(RULE.teams) and RULE.teamOf
+                local sameTm = teams and ((teams[srcPid] or 0) == (teams[s.idx] or -1))
+                if srcPid ~= myPid() and isHost() and MP.isAiPid(srcPid) and not sameTm then
+                    noteAiVsAi(srcPid, s.idx, drop, tn, "src")
                 end
             else
-                -- §335 不是我打的：房主看是不是别的 AI 打的（替身打替身的伤害已经按对方出招时的倍率算过，不再折算）
+                -- 钩子没读到（没挂上 / 没这条记录）：照旧 §335 由房主看是不是别的 AI 打的
+                -- （替身打替身的伤害已经按对方出招时的倍率算过，不再折算）
                 local atk = aiAttackerOf(s, tn)
                 if atk then noteAiVsAi(atk.idx, s.idx, drop, tn) end
             end
@@ -1508,24 +1828,60 @@ function MP.accSkip(tn)
     return NETP.on and not MP.on and tn - (NETP.spawnAt or -100) > MP.ACC_WIN
 end
 
-local function netFrame()
-    local L = live()
-    local tn = now()
+-- §性能 / 稳定性（11-19 用户"动不动突然卡住、不重进游戏就一直卡"）：这一拍以前只在外层 pcall 一次，
+-- 任何一处 nil / 字段缺失都会让后面整拍逻辑（替身驱动 / 对局规则 / 血条 / 头顶条）全部不跑，
+-- 循环却还在跑、还在吃包、还在每帧写一行 `!! 多人联机`（11-18 20:02 那次：fileOn 是 nil，90 秒刷 1939 行，
+-- 替身完全不动，只能重进游戏）。现在分块 pcall：一块坏只丢那一块，报错按内容去重限频；
+-- 同一条错连续 30 拍还在（≈1 秒）就当成坏状态 netStop，下一个包会重新建替身，不用重启游戏。
+local NFE = { n = 0, tick = 0, same = 0, msg = nil, at = 0 }
+local function nfErr(where, err)
+    local m = tostring(err)
+    local t = os.time()
+    NFE.n, NFE.tick = NFE.n + 1, NFE.tick + 1
+    if m ~= NFE.msg then NFE.msg, NFE.same, NFE.at = m, 0, 0 end
+    NFE.same = NFE.same + 1
+    if NFE.same <= 5 or t - (NFE.at or 0) >= 5 then
+        NFE.at = t
+        out("!! 多人联机 %s -> %s（第 %d 次）", tostring(where), m, NFE.same)
+    end
+    if NFE.same >= 30 and NETP.on then
+        NFE.same, NFE.msg = 0, nil
+        MP.netStop("连续报错：" .. tostring(where))
+    end
+end
+MP._nfErr = nfErr
+
+local function netFramePeers(L, tn)
     for _, s in ipairs(NETP.list) do
         if valid(s.pup) and not s.idle then
-            if s.peer then
-                if not s.fallen then peerFrame(s) end               -- §287 ②d 倒下的停在原地
-            else
-                local f = s.feed
-                if f and f.left > 0 then
-                    f.left = f.left - 1
-                    pcall(function() s.pup:AddMovementInput(f.dir, f.scale, true) end)
+            local ok, err = pcall(function()
+                if s.peer then
+                    if not s.fallen then peerFrame(s) end               -- §287 ②d 倒下的停在原地
+                else
+                    local f = s.feed
+                    if f and f.left > 0 then
+                        f.left = f.left - 1
+                        pcall(function() s.pup:AddMovementInput(f.dir, f.scale, true) end)
+                    end
+                    if L and not s.fallen then followOne(s, L, tn) end     -- ②d 倒下的停在原地
                 end
-                if L and not s.fallen then followOne(s, L, tn) end     -- ②d 倒下的停在原地
+            end)
+            if ok then
+                s.errN = 0
+            else
+                s.errN = (s.errN or 0) + 1
+                nfErr("替身 " .. tostring(s.tag), err)
+                if s.errN >= 30 then pcall(netDrop, s, "连续报错") end     -- 这一个替身坏了：收起来，别拖着整房
             end
         end
     end
-    if MP.specFrameP and MP.specView and MP.specView.on then MP.specFrameP() end     -- ②d 出局后的观战镜头
+    if MP.specFrameP and MP.specView and MP.specView.on then
+        local ok, err = pcall(MP.specFrameP)     -- ②d 出局后的观战镜头
+        if not ok then nfErr("观战镜头", err) end
+    end
+end
+
+local function netFrameLogic(L, tn)
     local c = os.clock()
     if c - NETP.lastLogic < MP.TICK then return end
     NETP.lastLogic = c
@@ -1533,7 +1889,10 @@ local function netFrame()
     if NETP.walkN % 3 == 0 then
         for _, s in ipairs(NETP.list) do if valid(s.pup) and not s.idle and not s.fallen and not s.peer then walkTurn(s, tn) end end
     end
-    if MP.ruleTickP then MP.ruleTickP(tn) end
+    if MP.ruleTickP then
+        local ok, err = pcall(MP.ruleTickP, tn)
+        if not ok then nfErr("对局规则", err) end     -- 规则拍坏了也要继续驱动替身 / 血条
+    end
     local sess = ctx.session and ctx.session() or {}
     if sess.mp ~= "1" then
         NETP.noMpAt = NETP.noMpAt or tn
@@ -1549,7 +1908,12 @@ local function netFrame()
             if tn - (s.lastAt or 0) > NETP.IDLE then netIdle(s, true) end
             if s.peer then
                 -- §287 换装 / 攻击属性 / 血量（按包写、GE_LockHealth 兜底）都在 NET.drive / recvOne 里
-                peerStep(s, tn)
+                local ok, err = pcall(peerStep, s, tn)
+                if not ok then
+                    s.errN = (s.errN or 0) + 1
+                    nfErr("驱动 " .. tostring(s.tag), err)
+                    if s.errN >= 30 then pcall(netDrop, s, "连续报错") end
+                end
             else
                 -- 换装：包里的武器变了马上换，没变每 2 秒核对一次（以前每 0.25 秒）
                 local wk = tostring(s.wantWc) .. "|" .. tostring(s.wantWcs)
@@ -1576,9 +1940,11 @@ local function netFrame()
     end
     if tn - (NETP.barAt or 0) > 0.25 then
         NETP.barAt = tn
-        barsStep(tn)
+        local ok, err = pcall(barsStep, tn)
+        if not ok then nfErr("血条", err) end
     end
-    MP.placeTags()
+    local okT, errT = pcall(MP.placeTags)
+    if not okT then nfErr("头顶条", errT) end
     if tn - (NETP.statAt or tn) > NETP.STAT_SEC then
         local parts = {}
         for _, s in ipairs(NETP.list) do
@@ -1601,6 +1967,18 @@ local function netFrame()
     end
     NETP.statAt = NETP.statAt or tn
 end
+
+-- 一拍只做两块（各自 pcall）。整拍都没报错才把"同一条错连续多少拍"清零
+local function netFrame()
+    local L = live()
+    local tn = now()
+    NFE.tick = 0
+    local ok, err = pcall(netFramePeers, L, tn)
+    if not ok then nfErr("每帧", err) end
+    ok, err = pcall(netFrameLogic, L, tn)
+    if not ok then nfErr("逻辑", err) end
+    if NFE.tick == 0 then NFE.same = 0 end
+end
 MP.netFrameP = ctx.prof and ctx.prof("多人联机", netFrame) or netFrame
 
 local function netEnsureLoop()
@@ -1617,7 +1995,7 @@ local function netEnsureLoop()
         LoopInGameThreadAfterFrames(1, function()
             if not NETP.on or NETP.gen ~= gen or ST.travel then return true end
             local ok, err = pcall(MP.netFrameP)
-            if not ok then out("!! 多人联机 -> %s", tostring(err)) end
+            if not ok then nfErr("整拍", err) end     -- 限频：以前每帧一行，刷日志也占帧
         end)
     else
         out("!! 多人联机：没有 LoopInGameThreadAfterFrames")
@@ -1829,7 +2207,9 @@ RULE = {
     mtd = {}, aiState = {}, aiGen = 0, aiAutoSynced = nil,
 }
 MP.rule = RULE
-MP.cfg = { size = 4, lives = 1, tl = 300, mode = "duel", teams = 0, buffs = 1, siege = 1, duelRot = "fixed", ai = 0 }     -- §295 观众上限不在这里：用房间设置"观战 / 排队人数上限"（联机程序的 maxspec）
+-- 11-18 用户"我在其他人的房间里无法上场"：默认轮换改回"败者下场（胜者守擂）"，
+-- "只有前两位上场（其他人只观战）"保留为观战房专用档（房主在玩法设置里自己选）
+MP.cfg = { size = 4, lives = 1, tl = 300, mode = "duel", teams = 0, buffs = 1, siege = 1, duelRot = "loser", rotv = 2, ai = 0 }     -- §295 观众上限不在这里：用房间设置"观战 / 排队人数上限"（联机程序的 maxspec）
 MP.SIZES, MP.LIVES, MP.TLS = { 3, 4, 5, 6, 8, 10, 12 }, { 1, 2, 3, 5 }, { 120, 180, 300, 600 }
 local ST_NAME = { idle = "没开打", cd = "倒计时", fight = "交手中", ["end"] = "打完了" }
 
@@ -1851,6 +2231,23 @@ isHost = function()
 end
 inMatch = function() return RULE.st ~= "idle" end
 part = function(pid) return RULE.parts[pid] ~= nil end
+
+-- §260（11-19 用户："旧版战斗中不能开游戏界面，新版没同步"）：新版房间不写旧版 1v1 的 MATCH.ready / MATCH.role，
+-- 所以 §260 在多人房 / 对决里从来没触发过。这里给出"现在该不该摘掉开界面的输入映射"：
+--   多人房（淘汰 / 积分）= 在多人会话里 + 对局进行中（cd / fight / end）+ 我在 parts 里（观战 / 只看不上场不屏蔽）；
+--   对决 = pbz_duel 的 DUEL.uiWant（只屏蔽当前上场的两位，ready 从我按 F1 起）。
+-- 出局（RULE.my == 2）后仍是 parts，继续屏蔽到整场结束（贴近旧版：回合内倒下 MATCH.role 还在）。
+function MP.uiWant()
+    if not MP.inMp() then return false end
+    if DUEL and DUEL.isDuel and DUEL.isDuel() then
+        return (DUEL.uiWant and DUEL.uiWant()) and true or false
+    end
+    return (RULE.st ~= "idle" and part(myPid())) and true or false
+end
+local function mpUiSync(why)
+    if MATCH and MATCH.uiSync then pcall(MATCH.uiSync, why, MP.uiWant()) end
+end
+MP.uiSync = mpUiSync
 
 factionFor = function(s)
     -- 11-17：对决里只有交手中的对手是敌对（pbz_duel 在开打 / 回合结束时用 setPeerFaction 切）；空闲时现在大家都显示，
@@ -1923,7 +2320,14 @@ function MP.cfgLoad()
     MP.cfg.lives = pick(kv.lives, MP.LIVES, 1)
     MP.cfg.tl = pick(kv.tl, MP.TLS, 300)
     MP.cfg.mode = (kv.mode == "score" or kv.mode == "elim" or kv.mode == "duel") and kv.mode or "duel"
-    MP.cfg.duelRot = (kv.duelRot == "both" or kv.duelRot == "loser" or kv.duelRot == "fixed") and kv.duelRot or "fixed"
+    MP.cfg.duelRot = (kv.duelRot == "both" or kv.duelRot == "loser" or kv.duelRot == "fixed") and kv.duelRot or "loser"
+    -- 11-18 旧版的默认值是 fixed（只有前两位上场），很多人没动过这一项，进别人的房就当一辈子观众：
+    -- 文件里没有 rotv（这次改动前存的）且还是 fixed → 按新默认改成 loser；自己又选回 fixed 会写 rotv，下次不再动
+    if kv.rotv == nil and MP.cfg.duelRot == "fixed" then
+        MP.cfg.duelRot = "loser"
+        out("多人房间设置：旧默认轮换规则（只有前两位上场）改为败者下场；要观战房请在玩法设置里改回")
+    end
+    MP.cfg.rotv = 2
     MP.cfg.teams = (tonumber(kv.teams) == 1 and 1) or (tonumber(kv.teams) == 3 and 3) or 0     -- §317 三队 = 3
     MP.cfg.buffs = (kv.buffs == "0" or tonumber(kv.buffs) == 0) and 0 or 1
     MP.cfg.siege = (kv.siege == "0" or tonumber(kv.siege) == 0) and 0 or 1
@@ -1932,7 +2336,7 @@ function MP.cfgLoad()
 end
 
 -- §303 只改这一项：换房主后 MP.cfg 里其余各项是沿用旧房主的（只在内存），整份写会把它们存进新房主自己的 mp.txt
-local CFG_KEYS = { "size", "lives", "tl", "mode", "teams", "buffs", "siege", "duelRot", "ai" }
+local CFG_KEYS = { "size", "lives", "tl", "mode", "teams", "buffs", "siege", "duelRot", "rotv", "ai" }
 local function cfgSave(key)
     if not (ctx.writeFile and ctx.mpFile) then return end
     local disk = ctx.readKV and ctx.readKV(ctx.mpFile)
@@ -2102,7 +2506,7 @@ local function specStart(kind)
     if ctx.notice then
         if DUEL and DUEL.isDuel() then
             ctx.notice(T("观战 1v1 对决", "SPECTATING 1V1 DUEL"),
-                       MP.specCam and T("PgUp / PgDn（或小键盘 *）换视角：侧面 / 跟 A / 跟 B / 自由", "PGUP / PGDN (OR NUM*): SIDE / FOLLOW A / FOLLOW B / FREE")
+                       MP.specCam and T("PgUp / PgDn 换视角（或小键盘 *）", "PGUP / PGDN (OR NUM*): CHANGE VIEW")
                        or T("小键盘 * 切换视角", "NUMPAD * SWITCH TARGET"), 3.0)
         elseif kind == "late" then      -- §322 对局中进房
             ctx.notice(T("对局进行中：这局先观战", "MATCH IN PROGRESS: SPECTATING"), T("打完自动参加下一局 · 小键盘 * 换人看", "YOU JOIN THE NEXT MATCH · NUMPAD * SWITCH TARGET"), 4.0)
@@ -2576,6 +2980,7 @@ end
 enter = function(st, tn, why)
     local was = RULE.st
     RULE.st, RULE.at = st, tn
+    mpUiSync("多人 " .. tostring(st))          -- §260 只在状态迁移上同步（uiSync 自己幂等）
     if st == "cd" then
         MP.cancelAllMoves("多人倒计时")       -- §364
         if ctx.onMatchEnd and RULE.matchStarted then
@@ -2921,7 +3326,7 @@ function MP.f1()
                 ctx.notice(string.format(T("上场的不到 2 人（现在 %d 人）", "FEWER THAN 2 PLAYERS (%d)"), n),
                            string.format(T("只看不上场：%s", "WATCH ONLY: %s"), table.concat(watchers, "、")), 3.0)
             else
-                ctx.notice(T("房间里还没有别人", "NO ONE ELSE IN ROOM"), T("等别的玩家连进来、出现在你这张图上再开始", "WAIT FOR OTHERS TO JOIN"), 2.5)
+                ctx.notice(T("房间里还没有别人", "NO ONE ELSE IN ROOM"), T("等别人连进来、到你这张图再开始", "WAIT FOR OTHERS TO JOIN"), 2.5)
             end
         end
         return
@@ -2988,7 +3393,7 @@ function MP.f1()
                 local msg = string.format(T("%d 队没人，不能开局", "TEAM %d IS EMPTY, CAN'T START"), t)
                 local strs = {}
                 for i = 1, k do strs[i] = tostring(cnt[i]) end
-                local sub = string.format(T("现在 %s；在\"房间成员\"里改队，或改回自动", "NOW %s; CHANGE TEAMS IN ROOM MEMBERS OR SET AUTO"), table.concat(strs, T(" 对 ", " VS ")))
+                local sub = string.format(T("现在 %s；在房间成员里改队，或改回自动", "NOW %s; CHANGE TEAMS IN ROOM MEMBERS OR SET AUTO"), table.concat(strs, T(" 对 ", " VS ")))
                 if ctx.notice then ctx.notice(msg, sub, 3.0) end
                 out("多人对局：%s（%s）", msg, table.concat(strs, " 对 "))
                 return
@@ -3310,6 +3715,7 @@ local function peerDead(s, t, tn)
             s.fallen, s.feed = true, nil
             if ctx.fallDown then ctx.fallDown(s.pup, s.tag .. " ") end
             out("多人对局：%s %s（死了 %d 次）", nameOf(s.idx), pst == 2 and "出局" or "倒下", d)
+            if MP.isAiPid(s.idx) then MP.hitsrcDiag("ai", s.pup, tn) end      -- §386 每次 AI 倒下记一行归因诊断
         elseif pst == 0 and s.fallen then
             s.fallen = false
             G.standUp(s.pup)
@@ -3358,6 +3764,9 @@ end
 
 -- 每次逻辑（30 次 / 秒）：自己的命；主机判结束
 local function ruleTick(tn)
+    MP.hitsrcSetNow(tn)          -- §386 钩子回调没有自己的时钟，用这里的时间戳
+    MP.installHitsrc()           -- §386 第一次进对局再试一次（开关文件 / 类没加载好）；已装好时立即返回
+    if G.hitsrcDrain then pcall(G.hitsrcDrain) end    -- §386 钩子记录下一帧才映射（回调里不调 GetOwner）
     if checkHostChange then checkHostChange(tn) end
     if DUEL and DUEL.isDuel() then
         DUEL.step(tn)
@@ -3396,7 +3805,7 @@ local function ruleTick(tn)
                     end
                 end
             end
-            local bestPid, hitMethod = MP.pickHitter(cands, tn, RULE.lastHitBy, RULE.lastHitAt)
+            local bestPid, hitMethod = MP.pickHitter(cands, tn, RULE.lastHitBy, RULE.lastHitAt, p1)
             local candStr = #candTxt > 0 and table.concat(candTxt, " ") or "无"
             if bestPid then
                 RULE.lastHitBy, RULE.lastHitAt, RULE.lastHitHow = bestPid, tn, hitMethod
@@ -3463,6 +3872,7 @@ local function ruleTick(tn)
                 local killer = (RULE.lastHitAt and tn - RULE.lastHitAt <= 8.0) and (RULE.lastHitBy or 0) or 0
                 RULE.killer = killer
                 RULE.killerHow = (killer ~= 0) and (RULE.lastHitHow or "?") or nil
+                MP.hitsrcDiag("me", p1, tn, killer, RULE.killerHow)
 
                 if isHost() then
                     RULE.stats = RULE.stats or {}
@@ -4278,7 +4688,7 @@ function MP.memberRows(items, T_)
     -- §306 T6：两队对局外，每个玩家都能选自己的队
     -- §318 只看不上场（对局外能改；对决有自己的那份）
     if MP.cfg.mode ~= "duel" and not (DUEL and DUEL.isDuel()) then
-        items[#items + 1] = { label = string.format(T_("只看不上场：< %s >", "WATCH ONLY: < %s >"), MP.myWatch and T_("开", "ON") or T_("关", "OFF")),
+        items[#items + 1] = { label = string.format(T_("只观战：< %s >", "WATCH ONLY: < %s >"), MP.myWatch and T_("开", "ON") or T_("关", "OFF")),
                               act = idle and function()
                                   MP.myWatch = not MP.myWatch
                                   out("多人：只看不上场 %s", MP.myWatch and "开" or "关")
@@ -4342,6 +4752,28 @@ function MP.rulesRows(items, pT)
                           end) }
 
     if duelMode then
+        -- 11-18 用户"新版在这里也加一个几局几胜的设置，功能跟房间设置里的一样"：
+        -- 对决的局数在这里改；房间设置 → 旧版 1v1 里那项是同一份 NET.boCfg（两边都是入口）
+        local bo = (ctx.boCfg and tonumber(ctx.boCfg())) or (ctx.bestOf and tonumber(ctx.bestOf())) or 3
+        local win = (ctx.toWin and ctx.toWin(bo)) or (math.floor(bo / 2) + 1)
+        items[#items + 1] = { label = string.format(T_("局数：< %d 局 %d 胜 >", "MATCH: < BEST OF %d > (%d WINS)"), bo, win),
+                              act = actIfIdle(function()
+                                  if not (ctx.boSet and ctx.boNext) then return end
+                                  local n = ctx.boNext(bo)
+                                  ctx.boSet(n)
+                                  out("多人房间设置：局数设为 %d 局（先赢 %d 回合）", n, (ctx.toWin and ctx.toWin(n)) or (math.floor(n / 2) + 1))
+                              end) }
+        -- 11-18 用户"还有对局时间"：回合时限也放这里（和房间设置 → 旧版 1v1 里那项同一份 NET.resCfg.tl）
+        local tl = (ctx.tlCfg and tonumber(ctx.tlCfg())) or 0
+        local tx = (ctx.resText and ctx.resText("tl", tl)) or { tl .. " 秒", tl .. "s" }
+        items[#items + 1] = { label = string.format(T_("时限：< %s >", "TIME LIMIT: < %s >"), T_(tx[1], tx[2])),
+                              act = actIfIdle(function()
+                                  if not (ctx.tlSet and ctx.tlNext) then return end
+                                  local n = ctx.tlNext(tl)
+                                  ctx.tlSet(n)
+                                  local tx2 = (ctx.resText and ctx.resText("tl", n)) or { tostring(n) .. " 秒" }
+                                  out("多人房间设置：时限设为 %s", tx2[1])
+                              end) }
         if DUEL then DUEL.panel(items, T_, "settings") end     -- 对决：轮换规则
         return
     end
@@ -4368,6 +4800,10 @@ function MP.rulesRows(items, pT)
                           act = actIfIdle(function() MP.cfgStep("siege", MP.SIEGES) end) }
 
     if hasLocalAi() then
+        if not isHost() then
+            -- 11-18：AI 是房主那边的，客机改了只会写自己的 netcfg、房间里不生效——直接写明，别让它看起来能点
+            items[#items + 1] = { label = T_("AI 数量 / 难度：由房主设置", "AI BOTS / LEVEL: SET BY THE HOST") }
+        else
         local aiCap = math.max(0, (MP.cfg.size or 4) - 1)
         items[#items + 1] = { label = string.format(T_("AI 数量：< %d >", "AI BOTS: < %d >"), math.min(tonumber(MP.cfg.ai) or 0, aiCap)),
                               act = actIfIdle(function() MP.stepAi() end) }
@@ -4378,6 +4814,7 @@ function MP.rulesRows(items, pT)
                               act = actIfIdle(function()
                                   if ctx.cmd then ctx.cmd("ailevel", "level=" .. tostring((aiLv + 1) % 3) .. "\n") end
                               end) }
+        end
     end
 
 end
@@ -4409,7 +4846,10 @@ end
 MP.TRAVEL_NEAR, MP.TRAVEL_NAG = 50.0, 6.0     -- 11-17 实测：提示 3 秒、15 秒一次太短，改成离远期间一直挂着（每 6 秒续 6 秒）
 function MP.travelTarget()
     if not MP.inMp() or isHost() then return nil end
-    if inMatch() or (DUEL and DUEL.liveMatch and DUEL.liveMatch()) then return nil end
+    -- 11-18 用户："观众也传"：对局中进房的观众以前要等整场打完（回合之间只隔 3 秒）才传送 / 提示，人在别的图什么都看不到。
+    -- 只拦正在打的人：多人对局的参赛者、对决当前上场的两位选手；只看不上场 / 中途进房 / 排队的照常传
+    if inMatch() and part(myPid()) then return nil end
+    if DUEL and DUEL.liveMatch and DUEL.liveMatch() and DUEL.isFighter() then return nil end
     if ST.travel then return nil end
     local hp = hostPid()
     if not hp or hp <= 0 or hp == myPid() then return nil end
@@ -4481,7 +4921,8 @@ function MP.travelF1(tn)
     return true
 end
 
-function MP.panel(items, pT)
+-- 11-18 用户："房间：我是 X 号" 不该被划进第一根虚线里：这两行当房间头，显示在分隔线上面
+function MP.roomHead(items, pT)
     local T_ = pT or T
     if not MP.inMp() then return end
     local s = ses()
@@ -4506,6 +4947,13 @@ function MP.panel(items, pT)
         local extraAddr = lan and (" " .. a) or ""
         items[#items + 1] = { label = string.format(T_("对局主机：%s（%d号%s）", "MATCH HOST: %s (#%d%s)"), hostName(hp), hp, extraAddr) }
     end
+end
+
+function MP.panel(items, pT)
+    local T_ = pT or T
+    if not MP.inMp() then return end
+    local isD = DUEL and DUEL.isDuel()
+    local idle = (not inMatch()) and not (DUEL and DUEL.inMatch())
 
     -- 11-17 用户："进入房间时自动传送，离开过远提示按两下 F1 传送"。面板里也留一行手动的（房主在别的图 / 同图 50 米以外）
     local function addTeleport()
@@ -4516,7 +4964,7 @@ function MP.panel(items, pT)
             local where = ctx.mapLabel and ctx.mapLabel(tt.map, tt.pos) or tt.map
             label = T_("前往房主所在地图：", "GO TO THE HOST'S MAP: ") .. where .. T_("（会自动存档）", " (AUTO-SAVES)")
         else
-            label = string.format(T_("传送到房主身边（离 %.0f 米，会自动存档）", "TELEPORT TO HOST (%.0f M AWAY, AUTO-SAVES)"), tt.dist)
+            label = string.format(T_("传送到房主身边（%.0f 米，会存档）", "TELEPORT TO HOST (%.0f M, AUTO-SAVES)"), tt.dist)
         end
         items[#items + 1] = { label = label, act = function() MP.travelGo("面板") end }
     end
@@ -4524,8 +4972,8 @@ function MP.panel(items, pT)
     if not isHost() then
         -- §316 写明：多人对局不用每人准备 / 同意，房主按 F1 就开，当时在房里的人都参加（对决另有叫号准备，DUEL.panel 自己写）
         if not isD and idle then
-            items[#items + 1] = { label = T_("开局：房主按 F1 直接开，房里的人都参加，不用准备", "START: HOST PRESSES F1, EVERYONE IN THE ROOM PLAYS, NO READY CHECK") }
-            items[#items + 1] = { label = string.format(T_("只看不上场：< %s >", "WATCH ONLY: < %s >"), MP.myWatch and T_("开", "ON") or T_("关", "OFF")),
+            items[#items + 1] = { label = T_("房主按 F1 直接开，房里的人都参加", "HOST PRESSES F1; EVERYONE IN THE ROOM PLAYS") }
+            items[#items + 1] = { label = string.format(T_("只观战：< %s >", "WATCH ONLY: < %s >"), MP.myWatch and T_("开", "ON") or T_("关", "OFF")),
                                   act = function()      -- §318
                                       MP.myWatch = not MP.myWatch
                                       out("多人：只看不上场 %s", MP.myWatch and "开" or "关")
@@ -4799,6 +5247,8 @@ do
         onMatchStart = function(mid) if ctx.onMatchStart then ctx.onMatchStart(mid) end end,
         onMatchEnd = function(mid, why) if ctx.onMatchEnd then ctx.onMatchEnd(mid, why) end end,
         toast = function(zh, en) if ctx.notice then ctx.notice(T(zh, en), "", 2.5) end end,
+        uiSync = function(why) mpUiSync(why) end,      -- §260 对决 / 多人的状态事件调
+        uiWant = function() return MP.uiWant() end,
     }
     MP.base = mpBase
     local mkDuel = ctx.loadDuel
@@ -4824,6 +5274,7 @@ function MP.attach(opts)
     ask("base.wire", function(tn) return MP.wire(tn) end)                          -- ②d：mpd= / mpm=
     ask("base.chat", function(rest) return MP.onChat(rest) end)                   -- 对决控制消息先截走
     on("base.mpRows", function(items, pT) MP.panel(items, pT) end)               -- 状态 / 成员 / 开始
+    on("base.roomHead", function(items, pT) MP.roomHead(items, pT) end)          -- 11-18：房间号 / 对局主机显示在分隔线上面
     on("base.playBtns", function(items, pT)          -- 11-15 玩法设置…（和房间设置… / 系统设置…并排）
         if MP._rulesInPanel then MP._rulesInPanel = false; return end     -- §333 房主面板里已经放在成员上面了
         MP.rulesEntry(items, pT)
@@ -4835,6 +5286,7 @@ function MP.attach(opts)
         if SPEC.on and (what == "up" or what == "down") then return MP.stepView(what == "down" and 1 or -1) end
     end)
     pcall(MP.cfgLoad)
+    pcall(MP.installHitsrc)      -- §386 伤害真实出手者：钩子只装一次（没有适配层 / net\hitsrc_off.txt 时不生效）
     if opts.bind and Key then
         local open = opts.panelOpen or function() return false end
         opts.bind(Key.DIVIDE, function() if not open() then MP.toggle() end end, "混战原型 开 / 关")
@@ -4871,8 +5323,11 @@ function MP.onMapLoad()
         MP.rule.aiState = {}
         MP.rule.aiAutoSynced = nil
     end
+    if MP.hsrc then MP.hsrc.byVic, MP.hsrc.now, MP.hsrc.lastDiag = {}, nil, {} end     -- §386 换图：旧出手记录作废
     if MP.specView then MP.specView.on, MP.specView.cam = false, nil end
 end
 
 return MP
 end
+
+

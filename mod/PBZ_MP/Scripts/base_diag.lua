@@ -493,6 +493,7 @@ function PDX.start(pup, use)
                                     hp0 = valid(p1) and hpOf(p1) or nil, t0 = tn, n = i, total = #e.bul }
     end
     PDX.log("红光直接播（第 %d 次）%s：动作 %s %s，排了 %d 个子弹", PDX.n, use, monName, okP and "已播" or "播不出", #e.bul)
+    if CTRD then CTRD.onPdx(use, tn) end        -- §396 红反链：对方的红光反击是模组直接播的
     return okP
 end
 

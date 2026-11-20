@@ -116,6 +116,8 @@ end
 -- 房主算：自己没开只看不上场的人里排在前两位的上场，其余的人当只看不上场（不出现、一直观战）；
 -- 发给客机的 mdq= 里只看不上场那一位就是这个结果，客机不用知道规则
 local function fixedPair()
+    -- 11-18 客机也一直知道房主的轮换规则（状态包 mdr=），不靠房主发来的 mdq 里"被 fixed 排除"的标记
+    if not mp.isHost() and DUEL.remoteRot ~= nil then return DUEL.remoteRot == "fixed" end
     return mp.isHost() and mp.cfg() and mp.cfg().duelRot == "fixed"
 end
 local function personalQueue()
@@ -299,7 +301,7 @@ local function placeFighterRound(tn)
     local me = mp.myPid()
     if me ~= DUEL.fa and me ~= DUEL.fb then return false end
     if not sameArenaMap() then
-        mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
+        mp.notice(T("不在对决地图：连按两次 F1 去房主那，到了再按 F1", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
         return false
     end
     local rad = math.rad(a.yaw or 0.0)
@@ -411,9 +413,9 @@ local function mapWarnReady()
     local ref = mp.isHost() and oppOf(me) or mp.hostPid()
     if ref and ref > 0 and not mp.sameMapAs(ref) then
         if mp.isHost() then     -- 11-17：房主自己就在对决地图，以前也提示"去房主所在地图"
-            mp.notice(string.format(T("对手 %s 不在你这张地图，等对方过来", "OPPONENT %s IS NOT ON YOUR MAP - WAIT FOR THEM"), mp.nameOf(ref)), "", 4.0)
+            mp.notice(string.format(T("对手 %s 不在同图，等对方过来", "OPPONENT %s IS NOT ON YOUR MAP - WAIT FOR THEM"), mp.nameOf(ref)), "", 4.0)
         else
-            mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
+            mp.notice(T("不在对决地图：连按两次 F1 去房主那，到了再按 F1", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
         end
     end
 end
@@ -453,6 +455,21 @@ local function cleanupFighter(why)
     DUEL.fightHp = nil
 end
 
+-- §260：对局中不能开界面（只在事件上调，uiSync 自己幂等）。只屏蔽当前上场的两位；
+-- ready 阶段从我按了 F1 起算，被换下 / 准备被撤 / 离开房间就挂回。
+function DUEL.uiWant()
+    if not DUEL.isDuel() then return false end
+    local me = mp.myPid()
+    if not (me and me > 0 and (me == DUEL.fa or me == DUEL.fb)) then return false end
+    local st = DUEL.state
+    if st == "cd" or st == "fight" or st == "rend" then return true end
+    if st == "ready" then return DUEL.readySet[me] and true or false end
+    return false
+end
+local function duelUiSync(why)
+    if mp.uiSync then pcall(mp.uiSync, why) end
+end
+
 -- 本机进入对决阶段时统一执行规则 / 位置 / 观战镜头（房主与客机共用这一处逻辑）
 local function applyLocalPhase(tn)
     local st, mid, rd, fa, fb = DUEL.state, DUEL.mid, DUEL.round, DUEL.fa, DUEL.fb
@@ -463,6 +480,7 @@ local function applyLocalPhase(tn)
 
     local myPid = mp.myPid()
     local fighter = myPid > 0 and (myPid == fa or myPid == fb)
+    duelUiSync("对决 " .. tostring(st))     -- §260 进 / 出对局阶段
 
     if st == "idle" then
         fireMatchEnd(DUEL.lastEndWhy ~= "" and DUEL.lastEndWhy or "回到待机")
@@ -620,9 +638,11 @@ local function formatMdq()
     for i = 1, #DUEL.order do
         local pid = DUEL.order[i]
         local st = ensureStats(pid)
+        -- 11-18 只发"自己选的只看不上场"；fixed（只有前两位上场）由 mdr= 让客机自己算，
+        -- 不然客机关掉只看后，房主发回来的 mdq 还是 1，客机会以为房主没收到、一直补发
         parts[#parts + 1] = string.format("%d:%d:%d:%d:%d",
             pid,
-            DUEL.isWatch(pid) and 1 or 0,
+            DUEL.watch[pid] and 1 or 0,
             st and st.w or 0,
             st and st.l or 0,
             DUEL.readySet[pid] and 1 or 0)
@@ -651,17 +671,22 @@ local function parseMdq(str)
         DUEL.order = ord
         DUEL.watch = watch
         DUEL.readySet = rdy
-        -- 11-17 实测：客机切"只看不上场"的那条消息房主没收到，房主一直按旧的算。房主名单里我的标记和本机对不上就补发（最多 3 次、隔 3 秒）
+        -- 11-17 实测：客机切"只看不上场"的那条消息房主没收到，房主一直按旧的算。房主名单里我的标记和本机对不上就补发。
+        -- 11-18 用户"我在其他人的房间里无法上场，我只观战都关着"：补发不再只发 3 次（房主旧版 / 丢包就永远卡着），
+        -- 隔 3 秒一直补到对上为止；状态包也带 dwo=，房主认这个就不用等聊天。
         local me = mp.myPid()
         if me and me > 0 and not mp.isHost() and listHas(ord, me) then
             local hostW = watch[me] and true or false
             local mine = DUEL.myWatch and true or false
-            if hostW ~= mine and (DUEL.watchResendN or 0) < 3 then
+            if hostW ~= mine then
                 local t = nowFn()
                 if not DUEL.watchResendAt or t - DUEL.watchResendAt >= 3.0 then
                     DUEL.watchResendAt = t
                     DUEL.watchResendN = (DUEL.watchResendN or 0) + 1
                     mp.relChat(string.format("w|%d|%d", me, mine and 1 or 0))
+                    if DUEL.watchResendN == 3 then
+                        out("对决：房主还没收到我的只看不上场设置（继续每 3 秒补发，状态包也带着）")
+                    end
                 end
             end
             if mine then DUEL.watch[me] = true end
@@ -842,6 +867,7 @@ local function wbanGateBeforeCd(tn)
         local okSelf, msgSelf = mp.wbanGateMulti({})       -- 房主自己也是选手：先查自己
         if not okSelf then
             DUEL.readySet[me] = nil
+            duelUiSync("对决 准备被撤")
             mp.notice(msgSelf, msgSelf, 4.0)
             broadcastHostState(tn, true)
             return false
@@ -1245,10 +1271,11 @@ function DUEL.f1()
                 if wbanBlockSelf() then return false end                    -- §307 D2：自己装着禁用的不让准备
                 local ref = oppOf(me)
                 if ref > 0 and not mp.sameMapAs(ref) then                   -- §307 D1：对手不在房主（我）这张图
-                    mp.notice(string.format(T("对手 %s 不在你这张地图，等对方过来再按 F1", "OPPONENT %s IS NOT ON YOUR MAP - WAIT, THEN PRESS F1"), mp.nameOf(ref)), "", 4.0)
+                    mp.notice(string.format(T("对手 %s 不在同图，等他过来再按 F1", "OPPONENT %s IS NOT ON YOUR MAP - WAIT, THEN PRESS F1"), mp.nameOf(ref)), "", 4.0)
                     return false
                 end
                 DUEL.readySet[me] = true
+                duelUiSync("对决 准备")
                 if not tryStartCd(tn) then broadcastHostState(tn, true) end
                 return true
             end
@@ -1296,6 +1323,7 @@ function DUEL.f1()
                 end
                 return true
             end
+            if mp.travelF1 and mp.travelF1() then return true end          -- 11-18 观众：对局中离房主远也能连按两次 F1 传过去
             return false
         end
         -- 客机只有当前被点名的选手在 ready 阶段按 F1 准备
@@ -1306,10 +1334,11 @@ function DUEL.f1()
             local hp = mp.hostPid()
             if hp and hp > 0 and not mp.sameMapAs(hp) then                  -- §307 D1
                 if mp.travelF1 and mp.travelF1() then return true end      -- 11-17 连按两次 F1 去房主那里
-                mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
+                mp.notice(T("不在对决地图：连按两次 F1 去房主那，到了再按 F1", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
                 return false
             end
             DUEL.readySet[me] = true
+            duelUiSync("对决 准备")
             mp.relChat(string.format("r|%d|%d", me, DUEL.mid))
             return true
         end
@@ -1389,13 +1418,17 @@ function DUEL.wire(tn)
         s = s .. string.format("mpd=%d:%d\n", DUEL.mid, DUEL.round)
     end
     if mp.isHost() then
-        s = s .. "mdu=" .. formatMdu(tn or nowFn()) .. "\n"
+        s = s .. "mdr=" .. tostring(mp.cfg() and mp.cfg().duelRot or "loser") .. "\n"
+              .. "mdu=" .. formatMdu(tn or nowFn()) .. "\n"
               .. "mdq=" .. formatMdq() .. "\n"
               .. "mdw=" .. string.format("%d:%d", DUEL.lastWinPid or 0, DUEL.lastLoserPid or 0) .. "\n"
         if DUEL.arenaKv then
             s = s .. "mda=" .. DUEL.arenaKv .. "\n"
                   .. "mdm=" .. tostring(DUEL.arenaMap or "") .. "\n"
         end
+    else
+        -- 11-18：我选的只看不上场跟着每包状态走（房主认 dwo=；不靠可靠聊天那一条，丢了就永远卡在观众）
+        s = s .. "dwo=" .. (DUEL.myWatch and "1" or "0") .. "\n"
     end
     return s
 end
@@ -1420,6 +1453,23 @@ function DUEL.onPacket(t, tn)
             end
         elseif DUEL.peerDtk[src] then
             DUEL.peerDtk[src] = nil
+        end
+    end
+    if t.mdr and t.mdr ~= "" and not mp.isHost() and src == mp.hostPid() then
+        DUEL.remoteRot = t.mdr      -- 11-18 房主的轮换规则（fixed = 只有前两位上场），客机自己算谁被排除
+    end
+    -- 11-18 用户"我在其他人的房间里无法上场，我只观战都关着"：客机每包都带 dwo=（自己选的只看不上场），
+    -- 房主收到就照这个记；以前只靠可靠聊天 w|，那条没到（房主旧版 / 丢包）客机就永远当观众。
+    if mp.isHost() and DUEL.isDuel() and src and src > 0 and t.dwo ~= nil and t.dwo ~= "" then
+        local on = (t.dwo == "1")
+        if (DUEL.watch[src] and true or false) ~= on then
+            DUEL.watch[src] = on or nil
+            out("对决：%d 号只看不上场 %s（状态包）", src, on and "开" or "关")
+            if DUEL.state == "ready" and on and (src == DUEL.fa or src == DUEL.fb) then
+                callNextMatch(tn, "选手切为只看不上场")
+            else
+                broadcastHostState(tn, true)
+            end
         end
     end
     if t.mdu and not mp.isHost() and src == mp.hostPid() then      -- §293.1 只认当前房主（换房主后旧 1 号的不认）
@@ -1467,10 +1517,11 @@ function DUEL.onChat(rest)
         local pid = tonumber(pidStr)
         if pid and pid == mp.myPid() then
             DUEL.readySet[pid] = nil
+            duelUiSync("对决 准备被撤")
             if code == "map" then
-                mp.notice(T("你不在对决的地图：连按两次 F1 前往房主所在地图，到了再按 F1 准备", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
+                mp.notice(T("不在对决地图：连按两次 F1 去房主那，到了再按 F1", "NOT ON THE DUEL MAP: PRESS F1 TWICE TO GO TO THE HOST'S MAP, THEN F1 TO READY"), "", 4.0)
             elseif code == "wban" then
-                mp.notice(T("房主复核：你装着禁用武器 / 影之武装，换掉再准备", "HOST CHECK: YOU HAVE A BANNED WEAPON / PHANTOM EDGE - SWAP IT OUT, THEN READY"), "", 4.0)
+                mp.notice(T("房主复核：装着禁用武器，换掉再准备", "HOST CHECK: YOU HAVE A BANNED WEAPON / PHANTOM EDGE - SWAP IT OUT, THEN READY"), "", 4.0)
             end
         end
     elseif kind == "t" and not mp.isHost() then
@@ -1524,6 +1575,7 @@ function DUEL.onChat(rest)
                 broadcastHostState(tn, true)
             else
                 DUEL.readySet[pid] = true
+                if pid == mp.myPid() then duelUiSync("对决 准备") end
                 if not tryStartCd(tn) then broadcastHostState(tn, true) end
             end
         end
@@ -1647,6 +1699,8 @@ function DUEL.onLeave(why, tn)
     DUEL.lastSetFa, DUEL.lastSetFb = 0, 0
     DUEL.lastSentCap = nil
     DUEL.remoteDuel = false
+    DUEL.remoteRot = nil
+    DUEL.watchResendAt, DUEL.watchResendN = nil, 0
     DUEL.appliedKey = nil
     DUEL.peerPkts = {}
     -- §307：场地 / 受伤累计 / 倒地 / 双击确认 / 结果都清掉
@@ -1658,6 +1712,7 @@ function DUEL.onLeave(why, tn)
     -- §324 从观战进房时自动开的"只看不上场"随离开关掉（自己手动开的不动）
     if DUEL.joinWatchSetDuel then DUEL.myWatch = false end
     DUEL.joinWatchDone, DUEL.joinWatchSetDuel = nil, nil
+    duelUiSync("对决离开房间")     -- §260 离开 / 换图 / 掉线：把开界面挂回去
 end
 
 function DUEL.onMapLoad()
@@ -1838,7 +1893,8 @@ function DUEL.queueRows(items, pT)
         local st = DUEL.stats[pid] or { w = 0, l = 0 }
         local tag
         if pid == DUEL.fa or pid == DUEL.fb then tag = T_("[在场]", "[IN]")
-        elseif DUEL.isWatch(pid) then tag = T_("[只看]", "[WATCH]")
+        elseif DUEL.watch[pid] then tag = T_("[只看]", "[WATCH]")          -- 11-18 mdq 里是"自己选的只看"（fixed 排除的不算）
+        elseif DUEL.isWatch(pid) then tag = T_("[轮换外]", "[PARKED]")     -- 房主设了"只有前两位上场"，排在前两位之外
         else tag = "#" .. i end
         local meMark = (pid == me) and T_("（我）", " (ME)") or ""
         local sel = isH and DUEL.selPid == pid
@@ -1877,9 +1933,21 @@ function DUEL.panel(items, pT, part, entry)
 
     local watchName = DUEL.myWatch and T_("开", "ON") or T_("关", "OFF")
     items[#items + 1] = {
-        label = string.format(T_("只看不上场：< %s >", "WATCH ONLY: < %s >"), watchName),
+        label = string.format(T_("只观战：< %s >", "WATCH ONLY: < %s >"), watchName),
         act = function() DUEL.setWatchOnly(not DUEL.myWatch) end
     }
+    -- 11-18：轮换规则写出来（以前客机只能看到自己 [只看]，不知道是房主设的"只有前两位上场"）
+    local rot = isH and (c.duelRot or "loser") or DUEL.remoteRot
+    local rotName = (rot == "both") and T_("两人都下场", "BOTH ROTATE")
+                    or (rot == "fixed") and T_("只有前两位上场（其他人一直观战）", "FIRST TWO ONLY (OTHERS WATCH)")
+                    or (rot == "loser") and T_("败者下场（胜者守擂）", "LOSER ROTATES")
+                    or nil
+    if rotName and (not isH or rot == "fixed") then
+        items[#items + 1] = { label = T_("房主轮换规则：", "HOST ROTATION: ") .. rotName }
+    end
+    if not DUEL.myWatch and DUEL.isWatch(me) then
+        items[#items + 1] = { label = T_("你在轮换外：请房主改规则或把你调成下一位", "OUTSIDE THE ROTATION: ASK THE HOST TO CHANGE IT OR MOVE YOU UP") }
+    end
 
     if DUEL.fa and DUEL.fa ~= 0 and DUEL.fb and DUEL.fb ~= 0 then
         items[#items + 1] = { label = string.format(T_("在场：%s  对  %s", "FIGHTING: %s  VS  %s"), mp.nameOf(DUEL.fa), mp.nameOf(DUEL.fb)) }
@@ -1897,3 +1965,4 @@ end
 
 return DUEL
 end
+

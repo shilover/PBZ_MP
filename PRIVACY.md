@@ -1,6 +1,6 @@
 # PBZ_MP 隐私说明
 
-适用版本 v0.34.8。本文由 `tools/gen_privacy.py` 从 `fornet_ui.lua` 的 CONSENT 表生成，和游戏内弹窗逐字一致；手改无效。
+适用版本 v0.34.10。本文由 `tools/gen_privacy.py` 从 `fornet_ui.lua` 的 CONSENT 表生成，和游戏内弹窗逐字一致；手改无效。
 
 这个模组是单人游戏的第三方联机 MOD。你没同意过下面任何一项时，它不会发出任何带你标识的数据（唯一的例外是末尾说的"联机是否可用"查询，不带标识）。
 

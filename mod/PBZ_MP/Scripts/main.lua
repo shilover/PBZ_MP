@@ -21,7 +21,7 @@
 
 local UEHelpers = require("UEHelpers")
 
-local VERSION = "0.34.8"
+local VERSION = "0.34.10"
 local TAG = "[PBZ_MP] "
 -- v0.14.0：所有文件都放在模组自己的目录（…/Mods/PBZ_MP/），不再写死本机的游戏路径，别人的电脑上也能用。
 -- 从本脚本的路径推出模组目录（脚本在 PBZ_MP/Scripts/main.lua）；拿不到时退回 UE4SS 的工作目录（游戏 exe 所在的 platform/steam）下的相对路径
@@ -260,7 +260,8 @@ do
         out("!! require pbz_game 失败（%s），改从 %s 加载", tostring(mk), (((FORNET or {}).GAME_DIR or (ROOT .. "/Scripts")) .. "/pbz_game.lua"))
         mk = dofile((((FORNET or {}).GAME_DIR or (ROOT .. "/Scripts")) .. "/pbz_game.lua"))
     end
-    G = mk({ out = out, ST = ST, NET = NET, MATCH = MATCH, PLACE_DIST = PLACE_DIST })
+    G = mk({ out = out, ST = ST, NET = NET, MATCH = MATCH, PLACE_DIST = PLACE_DIST, NET_DIR = NET_DIR,
+             logFlush = LOGBUF.flush })     -- §386 钩子回调里"进入 / 读参数"要立刻落盘（mp_probe.log 是攒着写的）
 end
 -- 下面这些名字和搬家前一样，调用处不用改
 local full, pathOf, valid, try, rawProp, shortName, short, sameObj = G.full, G.pathOf, G.valid, G.try, G.rawProp, G.shortName, G.short, G.sameObj
@@ -776,7 +777,9 @@ local function drivePuppet(pup, pos, vel, yaw)
 end
 
 local function pupAction(name, how)
-    ST.lastPupAction = { name = name, at = now() }
+    local tn = now()
+    ST.lastPupAction = { name = name, at = tn }
+    if CTRD then CTRD.onPuppet(name, how, tn) end        -- §396 红反链：对方红光反击（替身放出来的）
     if SUMMON.armName and SUMMON.armName(name) then ST.summonArmAt, ST.summonName = now(), name end   -- §94 / §242 接下来几秒找它的召唤物
     out("替身出招 [%s] %s", how, name)
 end
@@ -1254,8 +1257,8 @@ end
 --   0 = 每场（默认）：一场对局只在第 1 回合开始时给，之后的回合接着用剩下的；1 = 每局：每个回合开始都重置成设定值
 -- §113.4 ultx = 精纯杀气获取倍率（百分比，只能取 RES_STEPS 里的值；用户"精纯杀气的获取倍率能加房间设置改么"）：
 --   对局中把自己的 UltimateChargeGainRateMultiplier（游戏的获取倍率属性，平时 1.0）设成 对局前的值 × ultx%，结束还原；每回合都写，不管每场 / 每局
-NET.RES_KEYS, NET.RES_DEF, NET.RES_MAX = { "ult0", "ultx", "sp0", "resm", "acc", "accn" }, { ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 0, accn = 6 },
-                                         { ult0 = 3, ultx = 300, sp0 = 6, resm = 1, acc = 3, accn = 6 }   -- §176 accn = 生效饰品数量（6 = 不限）   -- §170.1 acc = 饰品等级   -- §113.3 默认精纯杀气改 0
+NET.RES_KEYS, NET.RES_DEF, NET.RES_MAX = { "ult0", "ultx", "sp0", "resm", "acc", "accn" }, { ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 2, accn = 3 },
+                                         { ult0 = 3, ultx = 300, sp0 = 6, resm = 1, acc = 3, accn = 6 }   -- §176 accn = 生效饰品数量（6 = 上限；11-19 10:5x 默认 3 = 只生效前 3 件）   -- §170.1 acc = 饰品等级（11-19 10:5x 默认 2 = 强化满）   -- §113.3 默认精纯杀气改 0
 NET.RES_STEPS = { ultx = { 0, 25, 50, 75, 100, 150, 200, 300 } }
 NET.RES_ATTR = { ult0 = "UltimateChargeCount", sp0 = "SpiritShadow" }
 NET.RES_NAME = { ult0 = { "开局精纯杀气", "STARTING ULTIMATE CHARGES" }, ultx = { "精纯杀气获取", "ULTIMATE CHARGE GAIN" },
@@ -1267,7 +1270,7 @@ NET.RES_TEXT = { resm = { [0] = { "每场给一次", "ONCE PER MATCH" }, [1] = {
                          [2] = { "强化满", "FULLY REFINED" }, [3] = { "失效", "DISABLED" } },
                  accn = { [0] = { "0 件（全不生效）", "NONE" }, [6] = { "不限", "ALL" } } }     -- §176 其余显示"前 N 件"
 for i = 1, 5 do NET.RES_TEXT.accn[i] = { "前 " .. i .. " 件", "FIRST " .. i } end
-NET.resCfg, NET.rres = { ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 0, accn = 6 }, {}
+NET.resCfg, NET.rres = { ult0 = 0, ultx = 100, sp0 = 3, resm = 0, acc = 2, accn = 3 }, {}
 function NET.resValid(k, n)
     if n == nil or n ~= math.floor(n) then return false end
     if NET.RES_STEPS[k] then
@@ -1351,10 +1354,12 @@ NET.RES_TEXT.dif = { [0] = { "各用自己存档的", "EACH PLAYER'S OWN" }, [1]
                      [3] = { "逆天者", "HELLWALKER" }, [4] = { "六十六天", "66 DAYS" } }
 NET.RES_MISSING = { dif = 0 }
 -- §176 禁用饰品（房间设置 accban=，内测反馈"慈母护符太强"）：饰品 ID 去掉 AC_、逗号隔开（"-" = 一件都不禁），
--- 只认 STD.ACCESSORIES 里的 66 件、按那个顺序存。默认禁慈母护符（破防回血）、百相傩面和舞扇（§259）；武林盟主固定默认名单（不走 rkrules）。
+-- 只认 STD.ACCESSORIES 里的 66 件、按那个顺序存。全模组默认（普通房间 / 服务器大厅房间 / 武林盟主一样）= 舞扇、慈母护符、古甲残片、百相傩面、神奇刀鞘（§259、11-19 用户"盟主模式的配置就是全 mod 的默认配置"）。
 -- 和 RES 键同一套：存 rules.txt、主机定、客机按主机状态包 accban= 走（没收到 = 默认）、开局时定进 MATCH.res.accban
-NET.ACCBAN_DEF = "AnimMovement,BreakRegen,MagicWeapon"   -- §259 11-12 加舞扇（用户："普通房间反正只是默认值"）
-NET.accBanCfg, NET.raccban = NET.ACCBAN_DEF, nil
+-- §408 默认名单从 NET.RK_RULES（base_dif.lua，唯一真源）的 accban= 来。base_dif 在下面 §266 那段才加载，
+-- 这里先占位，加载完再填（见 §266 之后那段）；运行期只会读已经填好的值。
+NET.ACCBAN_DEF, NET.ACCBAN_RK = nil, nil
+NET.accBanCfg, NET.raccban = nil, nil
 function NET.accBanNorm(s)
     local want = {}
     for x in (s or ""):gmatch("[%w_]+") do want["AC_" .. x:gsub("^AC_", "")] = true end
@@ -1377,7 +1382,7 @@ function NET.accBanOf()
     local inM = sm and sm.inMatch and sm.inMatch()     -- 只在多人对局中读开局快照；1v1 照旧
     if inM and MATCH.res and MATCH.res.accban ~= nil then return MATCH.res.accban end
     local on, lr = NET.locked()
-    if on then return lr and lr.accban and NET.accBanNorm(lr.accban) or NET.ACCBAN_DEF end     -- 定死规则在生效（规则还没到 = 默认名单）
+    if on then return lr and lr.accban and NET.accBanNorm(lr.accban) or NET.accBanDefNow() end     -- 定死规则在生效（规则还没到 = 盟主默认名单）
     local rr = NET.fixedRules()
     if rr and rr.accban then return NET.accBanNorm(rr.accban) end
     if sm and sm.inMp and sm.inMp() then
@@ -1394,13 +1399,13 @@ function NET.accBanOf()
     return NET.accBanCfg
 end
 -- 普通服务器大厅房间未手动改过的规则：默认按当前排位标准，不写盘；切回别的联机方式还原
-NET.SV_DEF = {
-    dm   = 20,   -- 11-17 盟主伤害 20%
-    flag = { med = 0, bal = 1, std = 1, gcd = 1, dgc = 0, sycd = 1, stg = 1, swk = 0 },   -- 11-16 盟主关闪避扣杀气 / 切武器保持杀气
-    res  = { ultx = 200, acc = 2, accn = 3, dif = 3 },
-}
+-- §408 不再在这里抄一份值：dm / flag / res 全部从 NET.RK_RULES → NET.RK_DEF 派生（base_dif.lua 是唯一真源）。
+-- base_dif 在本文件后面 §266 那段才加载，所以 NET.SV_DEF 也在加载完之后填（见那段末尾）；这里只先建表。
+NET.SV_DEF = { dm = nil, flag = {}, res = {} }
 NET.svOn, NET.svMode = false, nil
-function NET.accBanDefNow() return NET.ACCBAN_DEF end
+function NET.accBanDefNow()     -- §408 正常路径是加载完填好的 NET.ACCBAN_DEF；抽段测试 / 加载顺序异常时回落到 RK_DEF / 字面量
+    return NET.ACCBAN_DEF or (NET.RK_DEF and NET.RK_DEF.accban) or "AnimMovement,BreakRegen,HealthResistance,MagicWeapon,SwitchEndure"
+end
 function NET.rulesUnset(k)
     local f = NET.AB_FILE or NET.RULES_FILE
     if not f then return end
@@ -2344,6 +2349,15 @@ DIFM = BASEPARTS.load("dif", { NET = NET, MATCH = MATCH, NET_DIR = NET_DIR, G = 
     -- 主循环那段会把这几个换成计时包装（PROF.wrap）：传"调用时再取"，和搬出来之前一样
     out = function(...) return out(...) end, fileReadKV = function(...) return fileReadKV(...) end })
 
+-- §408 base_dif 已加载：盟主默认值（唯一真源 NET.RK_RULES → NET.RK_DEF）现在填进本文件前面占位的两处。
+-- 服务器大厅房间默认（NET.SV_DEF）和禁用饰品默认名单（NET.ACCBAN_DEF / NET.ACCBAN_RK）都从同一份派生。
+NET.ACCBAN_DEF = NET.RK_DEF.accban or "AnimMovement,BreakRegen,HealthResistance,MagicWeapon,SwitchEndure"
+NET.ACCBAN_RK = NET.ACCBAN_DEF
+NET.accBanCfg = NET.ACCBAN_DEF
+NET.SV_DEF.dm = NET.RK_DEF.dm
+for _, k in ipairs(NET.FLAG_KEYS) do if NET.RK_DEF[k] ~= nil then NET.SV_DEF.flag[k] = NET.RK_DEF[k] end end
+for _, k in ipairs(NET.RES_KEYS) do if NET.RK_DEF[k] ~= nil then NET.SV_DEF.res[k] = NET.RK_DEF[k] end end
+
 -- ============================================================ M3：判定结果回传
 -- 防守方判定（交接文档 §2 方案 C）：对方每出一招，本机开一个 JUDGE_WIN 秒的窗口看结果：
 --   血量下降 → hit（附伤害）；出现 *Deflect* 动画且没掉血 → deflect；都没有 → miss
@@ -2492,7 +2506,7 @@ local function suppressLocalReact()
             -- （天煞双钺 L1+重击连放：第二下斧子还没飞到就 -400，用户 11-17）
             if k == "_Hit_" and not PEER.on then
                 if not TOUCH.hitFresh(an, mt, name, now()) then return end
-                TOUCH.mark(now())      -- §107 碰到了（AI 对战据此回报）
+                TOUCH.mark(now(), nil, true)      -- §107 碰到了（AI 对战据此回报）；§388 新受击动作 = 最近一招
             end
             -- §299 多人：本机游戏给某个替身播了受击 = 我的招碰到了它（只认我自己最近 3 秒出过攻击招的时候；
             -- 替身血量是按对方的包写的，掉血不能当"我打的"，所以不看血量）
@@ -3207,7 +3221,16 @@ end
 -- §115 本机真实伤害（用户 2026-11-06"天煞双钺的大招打不掉伤害"：AI 每招固定扣 400、一招只算一次，多段大招也就 400）：
 -- 替身本机掉的血按招式号累加，乘上对方给我的替身乘的系数（伤害倍率 × 武器平衡 / 影之武装，同 LO.rescale），
 -- 状态包 td=<招式号:累计伤害,...> 发出去；AI 按它扣血、后几段报"追加命中"。没有 td= 的旧模组 AI 照旧按 400。真人对手不看 td=
-TOUCH = { ids = {}, dmg = {}, KEEP = 2.0, n = 0, SUM_WIN = 20.0, ATK_LIVE = 3.0, sumLogs = 0 }
+TOUCH = { ids = {}, dmg = {}, KEEP = 2.0, n = 0, SUM_WIN = 20.0, ATK_LIVE = 3.0, sumLogs = 0,
+          -- §388 紫冥剑收尾招的飞剑：飞剑是收尾招放完 0.3–2 秒才打到，掉血时我可能已经接了下一招；
+          -- 以前 TOUCH.srcId 一律记在"最近一招"上，飞剑伤害记到下一招头上、收尾招被判落空（§370.2 07:02:16 #995 ABB → #996 B_C -225）。
+          -- 现在收尾招放出来就记下它，掉血时飞剑还在场（BP_Hun_ZiMingJian_FlyingSword_Shoot）→ 记回发射它的那一招。
+          SWORD = { ["GA_Hun_ZiMingJian_New_ABB_C"] = true, ["GA_Hun_ZiMingJian_New_BBB_C"] = true,
+                    ["GA_Hun_ZiMingJian_New_AAAAA_C"] = true, ["GA_Hun_ZiMingJian_New_AABB_C"] = true,
+                    ["GA_Hun_ZiMingJian_New_AAABB_C"] = true },
+          SWORD_WIN = 3.0, sword = nil, swordAt = nil, swordN = 0, swordLogs = 0, swordMissFor = nil, swordMissLogs = 0,
+          -- §388 落空行带招名：NET.evName 只留 300 个号，落空往往 1.5 秒后才回来，那时名字已经清了（旧日志里落空行只有编号）
+          names = {}, nameAt = {}, NAME_WIN = 60.0 }
 -- §350 我的召唤物（绝影分身 / 召唤类影之武装）打替身：掉血以前记在 PRED.myAttackId()（最近 5 个事件里最后一个攻击招）上——
 -- 放分身前那一刀（11-16 15:27 是切刀斩 #133，早已报完落空、在 AI 那边过期），分身那一招 GA_Hun_Double_JueYing_Clone_C 不算攻击招，
 -- 本地 AI 也不登记 → 分身打木桩 47 秒一点血没扣。现在：SUM_WIN 秒内放过召唤、而且召唤比最后那个攻击招新（或那一招已经放出去 ATK_LIVE 秒），
@@ -3231,7 +3254,33 @@ TOUCH.LINGER, TOUCH.lingerAt, TOUCH.lingerLogs = 20.0, {}, 0
 function TOUCH.isFlowerCast(n)
     return n ~= nil and n:find("^GA_Hun_GuiTouBlade_") ~= nil
 end
-function TOUCH.srcId(tn)
+-- §388 飞剑还在不在场（只在掉血那一帧问；0.1 秒内复用同一结果）。只认主人是我、状态 2 的 FlyingSword_Shoot
+function TOUCH.swordLive(tn)
+    if PEER.on or not NET.rai then return false end
+    if TOUCH.swordAt and tn - TOUCH.swordAt < 0.1 then return (TOUCH.swordN or 0) > 0 end
+    local p1 = getP1 and getP1()
+    if not valid(p1) then return false end
+    local n = 0
+    -- ① 精确类名（LO.bulletsOf 会退回 GetOwner，主人读不到 BulletOwnerAvatar 也认）
+    if LO and LO.bulletsOf then
+        for _, cls in ipairs({ "BP_Hun_ZIMingJian_FlyingSword_Shoot_C", "BP_ZiMingJian_FlyingSword_Shoot_C" }) do
+            local ok, list = pcall(LO.bulletsOf, p1, cls)
+            for _, e in ipairs(ok and list or {}) do
+                local st = rawProp(e.actor, "BulletStatus")
+                if (st == 2 or st == 3) and rawProp(e.actor, "bHidden") ~= true then n = n + 1 end
+            end
+        end
+    end
+    -- ② 退回按名字扫 BulletActorBase（类名对不上时）
+    if n == 0 and G and G.summonCount then
+        local ok, c = pcall(G.summonCount, p1, "FlyingSword_Shoot")
+        n = ok and (tonumber(c) or 0) or 0
+    end
+    TOUCH.swordAt, TOUCH.swordN = tn, n
+    return n > 0
+end
+-- fromHit = true：本机游戏给替身播了新受击动作（真的碰到了，记最近一招）；false / nil：只有掉血（可能是飞剑晚到）
+function TOUCH.srcId(tn, fromHit)
     local id = PRED.myAttackId()
     local a = TOUCH.lastAtk
     local fresh = a ~= nil and a.id == id and tn - a.at <= TOUCH.ATK_LIVE
@@ -3256,10 +3305,27 @@ function TOUCH.srcId(tn)
         end
         return f.id
     end
+    -- §388 收尾招的飞剑晚到：最近一招已经换了、新的招还没碰到替身 → 这一下是飞剑，记回发射它的收尾招。
+    -- 只认掉血（fromHit=false）；新受击动作（fromHit=true）永远记最近一招，免得把下一刀的受击抢走
+    local sw = TOUCH.sword
+    if NET.rai and not fromHit and sw and sw.id ~= id and tn - sw.at < TOUCH.SWORD_WIN and not TOUCH.ids[id] then
+        if TOUCH.swordLive(tn) then
+            if TOUCH.swordLogs < 20 then
+                TOUCH.swordLogs = TOUCH.swordLogs + 1
+                out("§388 紫冥剑飞剑晚到：这一下记在发射它的第 #%d 招 %s 上（不记在最近的 #%d；放出 %.1f 秒）",
+                    sw.id, sw.name, id, tn - sw.at)
+            end
+            return sw.id
+        elseif TOUCH.swordMissFor ~= sw.id and TOUCH.swordMissLogs < 10 then
+            TOUCH.swordMissFor, TOUCH.swordMissLogs = sw.id, TOUCH.swordMissLogs + 1
+            out("§388 紫冥剑飞剑没数到（收尾招 #%d %s 放出 %.1f 秒；掉血先记最近一招 #%d；FlyingSword_Shoot 可能已停用 / 主人不是自己）",
+                sw.id, sw.name, tn - sw.at, id)
+        end
+    end
     return id
 end
-function TOUCH.mark(tn, d)
-    local id = TOUCH.srcId(tn)
+function TOUCH.mark(tn, d, fromHit)
+    local id = TOUCH.srcId(tn, fromHit)
     if id <= 0 then return end
     if d == nil then                                     -- §381 真碰到（受击 / 破防）：押着的那一下就是这一招的刀
         d = DTICK and DTICK.aiContact(id, tn)
@@ -3275,7 +3341,7 @@ function TOUCH.add(id, tn, d)
         if TOUCH.lingerLogs < 30 and TOUCH.lingerAt[id] then
             TOUCH.lingerLogs = TOUCH.lingerLogs + 1
             out("§380.1 我第 #%d 招 %s 隔 %.1f 秒又碰到替身：累计接着 -%.0f 记（不从 0 记，本地 AI 才会补扣）",
-                id, tostring(NET.evName and NET.evName[id]), tn - TOUCH.lingerAt[id], TOUCH.lingerDmg[id])
+                id, tostring((TOUCH.names and TOUCH.names[id]) or (NET.evName and NET.evName[id])), tn - TOUCH.lingerAt[id], TOUCH.lingerDmg[id])
         end
         TOUCH.dmg[id], TOUCH.lingerDmg[id], TOUCH.lingerAt[id] = TOUCH.lingerDmg[id], nil, nil
     end
@@ -3403,6 +3469,37 @@ function DTICK.defCheck(p1, m, j, drop, tn)
         NET.lastHit and NET.lastHit.r and string.format("算进上一招 远端#%d 的追加", NET.lastHit.r.atk) or "不回报", DTICK.def)
     return "tick"
 end
+-- §389 受击动作镜像（hr=）里的同一种跳伤：对方被点燃 / 流血跳一下，游戏也会给他播一个很轻的受击，
+-- 他那边就发 hr=；我们照着播，看起来就是"我的刀还没到，对方先僵直"（第六轮"炽刃焰波 / 炽杀命中前对方先僵直"）。
+-- §381 只管"掉血被算成中招"（res= / td=），这一条走的是 hr=，以前没管。
+-- 判据（四条一起，宁可漏掐也不误掐真刀）：① 动作是 Hit_VeryLight / Hit_Light；② 同一包 hp= 只掉一点点
+-- （> 0 且 ≤ HR_MAX，跳伤在日志里是 1–13，真刀 10% 房间也在百以上）；③ 对方自己的 inf= 有持续伤害；
+-- ④ 同一包 res= 里没有新的"中招"结果（真刀会带一条；跳伤不会）。④ 是最后一道保险。
+DTICK.HR_MAX, DTICK.HR_LOGS, DTICK.hrN = 40, 20, 0
+function DTICK.hrSkip(t, tag, tn)
+    if not tag then return false end
+    if not (tag:find("Hit_VeryLight", 1, true) or tag:find("Hit_Light", 1, true)) then return false end
+    local hp = tonumber(t and t.hp)
+    local drop = (hp and NET.remoteHp and NET.remoteHp > 0 and hp >= 0) and (NET.remoteHp - hp) or nil
+    if not (drop and drop > 0 and drop <= DTICK.HR_MAX) then return false end
+    local dot
+    for id, _, lv in (t.inf or ""):gmatch("(%a+):(%d+):(%d+)") do
+        if tonumber(lv) > 0 then
+            for _, k in ipairs(DTICK.KINDS) do if id == k then dot = k; break end end
+        end
+        if dot then break end
+    end
+    if not dot then return false end
+    for id, _, kind in (t.res or ""):gmatch("(%d+):(%d+):(%a+)") do
+        if kind == "hit" and not (NET.resSeen and NET.resSeen[tonumber(id)]) then return false end
+    end
+    DTICK.hrN = DTICK.hrN + 1
+    if DTICK.hrN <= DTICK.HR_LOGS then
+        out("§389 对方受击 %s 是%s跳伤带的（这一下只掉 %.0f，没有新的中招结果）→ 先不播（第 %d 次）",
+            tag, (DOT.NAME[dot] or dot), drop, DTICK.hrN)
+    end
+    return true
+end
 -- §384 这一招的累计 td= 加一笔（YQX.minePend 晚记的那一下也走这里；§380.1 过期后留着的累计接着记）
 function TOUCH.addDmg(id, add)
     if TOUCH.dmg[id] == nil and TOUCH.lingerDmg[id] then TOUCH.dmg[id], TOUCH.lingerDmg[id], TOUCH.lingerAt[id] = TOUCH.lingerDmg[id], nil, nil end
@@ -3417,10 +3514,10 @@ function TOUCH.markBreak(name, tn)
     TOUCH.brkName, TOUCH.brkSeen = name, tn
     if not fresh then return false end
     if not (NET.myAtkAt and tn - NET.myAtkAt <= TOUCH.BRK_WIN) then return false end
-    TOUCH.mark(tn)
+    TOUCH.mark(tn, nil, true)          -- §388 破防 / 挣脱是新受击，记最近一招（不抢成飞剑）
     if TOUCH.brkLogs < 30 then
         TOUCH.brkLogs = TOUCH.brkLogs + 1
-        out("§356 替身在我这边破防 / 挣脱（%s）→ 算我第 #%d 招碰到了（本地 AI 据此回报）", name, TOUCH.srcId(tn))
+        out("§356 替身在我这边破防 / 挣脱（%s）→ 算我第 #%d 招碰到了（本地 AI 据此回报）", name, TOUCH.srcId(tn, true))
     end
     return true
 end
@@ -3561,17 +3658,26 @@ function TOUCH.distStep(p1, pup, tn)
     e.at = tn
     if d <= TOUCH.SNAP_REACH and (not e.snapD or d < e.snapD - TOUCH.SNAP_STEP) then      -- §385 最近那一刻
         e.snapD = d
-        e.snap = TOUCH.snapshot(pup, id, tn - at)
+        e.snap = TOUCH.snapshot(pup, id, tn - at, p1, a, b)
     end
 end
 -- §385 一次快照（只在变近时拍，一招最多十几次）：返回一段说明文字
-function TOUCH.snapshot(pup, id, dt)
+-- §388 多记我朝哪：A_Dash 穿过木桩后下一招打空，日志里只有距离、看不出是不是目标在身后
+function TOUCH.snapshot(pup, id, dt, p1, a, b)
     local m = montageOf(pup)
     local inv = G and G.tagsMatching and G.tagsMatching(pup, TOUCH.INV_TAGS) or nil
     local okC, col = pcall(function() return pup:GetActorEnableCollision() end)
-    local n = NET.evName and NET.evName[id]
+    local n = (TOUCH.names and TOUCH.names[id]) or (NET.evName and NET.evName[id])
     local live = n and NET.prevAbs and (NET.prevAbs[n] and "还挂着" or "已收") or "?"
-    return string.format("出招后 %.1f 秒，替身动作 %s%s%s，我这招%s", dt, (m and m ~= "") and tostring(m) or "无",
+    local ang = ""
+    if p1 and a and b then
+        local okY, yaw = pcall(function() return yawOf and yawOf(p1) end)
+        if okY and type(yaw) == "number" then
+            local off = math.abs((math.deg(math.atan(b.Y - a.Y, b.X - a.X)) - yaw + 180.0) % 360.0 - 180.0)
+            ang = string.format("、我朝向偏 %.0f°", off)
+        end
+    end
+    return string.format("出招后 %.1f 秒%s，替身动作 %s%s%s，我这招%s", dt, ang, (m and m ~= "") and tostring(m) or "无",
         (inv and #inv > 0) and ("，替身标签 " .. table.concat(inv, "/")) or "",
         (okC and col == false) and "，替身碰撞关" or "", live)
 end
@@ -3580,7 +3686,7 @@ function TOUCH.missNote(id)
     if not e then return "" end
     local pup = puppet()
     local m = pup and montageOf(pup) or nil
-    local n = NET.evName and NET.evName[id]
+    local n = (TOUCH.names and TOUCH.names[id]) or (NET.evName and NET.evName[id])
     local sn = (ST.snaps or 0) - (e.sn0 or ST.snaps or 0)
     return string.format("（诊断：%s出招时离替身 %.1f 米，这招期间最近 %.1f 米%s%s，替身动作 %s）", n and (n .. "，") or "", e.d0, e.d,
         e.snap and ("（最近时 " .. e.snap .. "）") or "", sn > 0 and string.format("，期间替身瞬移校正 %d 次", sn) or "",
@@ -3678,6 +3784,13 @@ function TOUCH.isBig(n)
     return k ~= nil and TOUCH.BIG[k] == true
 end
 function TOUCH.noteFire(n, tn)      -- ULT.emit 发出招事件时调
+    if NET.evId then                                 -- §388 名字多留 60 秒：落空回来时 NET.evName 常常已经清掉
+        TOUCH.names[NET.evId], TOUCH.nameAt[NET.evId] = n, tn
+        for k, t in pairs(TOUCH.nameAt) do
+            if tn - t > TOUCH.NAME_WIN then TOUCH.names[k], TOUCH.nameAt[k] = nil, nil end
+        end
+    end
+    if n and TOUCH.SWORD[n] then TOUCH.sword = { id = NET.evId, at = tn, name = n } end     -- §388 紫冥剑收尾招的飞剑
     if TOUCH.isBig(n) then TOUCH.bigAt = tn end
     if SUMMON and SUMMON.armName and SUMMON.armName(n) then TOUCH.sum = { id = NET.evId, at = tn, name = n }      -- §350
     elseif isAttackAbility(n) then
@@ -3958,6 +4071,236 @@ function NOCTR.check(p1, name, tn)
             NOCTR.n)
     end
     return true
+end
+
+-- ============================================================ §396 红蓝光反击链诊断（只记日志，不改判定 / 不拦技能）
+-- 用户 11-19："红蓝光反击，对面闪避我的红光大招时，会触发完美红光反击，这个完美红光反击还可以被我完美红光闪避反击，
+--   之后就无法防御了，要加这个的日志"（例：黑魔伤开大招之后的攻击被红光完美闪避反击）。
+-- 抓的是一条链：
+--   A 我的攻击被对方完美闪避 → 对方红光反击（替身真放出来，或放不出时 PDX 直接播）
+--   B 我完美闪避对方的红光反击 → 我的红光反击技能出现
+--   C 之后 12 秒里我能不能进架势：架势进出、破防、Stance.Forbid / HoldingStanceKey 标签、杀气、按住的输入、
+--     STG 关输入、当前动作 / 技能。重点两行：Stance.Forbid 挂着、按着格挡键却没进架势。
+-- 只读：每帧只用 netSend 已经读到的动作 / 技能表；标签 / 按住输入 / 杀气每秒采样一次（一次链最多 12 次）。
+-- 查 net/redlight_off.txt 不影响这段（PDX 关了也照样记 A / B）。
+CTRD = { ON = true, MAX_CHAIN = 12, MAX_LINES = 400, WATCH = 12.0, SAMPLE = 1.0, MON = 1.0, SPLOG = 60, spLogs = 0,
+         TAGS = { "CharacterState.AbilityState.Stance.Forbid", "CharacterState.AbilityState.Stance.HoldingStanceKey",
+                  "CharacterState.AIState.CanNotDeflect", "CharacterState.AbilityState.YuuBlade.ExplodeCannotDeflect",
+                  "CharacterState.Stun" },
+         n = 0, lines = 0, cur = nil, lastPup = nil }
+
+function CTRD.on()
+    if not (CTRD.ON and NET.fighting()) then return false end
+    if CTRD.offC == nil then CTRD.offC = io.open((NET_DIR or "net") .. "/ctrdiag_off.txt", "r") ~= nil end   -- 想关：放这个文件
+    return not CTRD.offC
+end                                                             -- 只在交手阶段记（倒计时 / 结算 / 对局外不记）
+function CTRD.log(...)
+    if CTRD.lines >= CTRD.MAX_LINES then return end
+    CTRD.lines = CTRD.lines + 1
+    out(...)
+    if CTRD.lines == CTRD.MAX_LINES then out("§396 红反链日志记满 %d 行，这一节不再记", CTRD.MAX_LINES) end
+end
+-- 完美红光反击 / 蓝光精防反击的技能名（对方放出来、我放出来都算）
+function CTRD.isCounter(n)
+    return n ~= nil and (n:find("PerfectDodge", 1, true) ~= nil or n:find("DeflectCounter", 1, true) ~= nil)
+end
+function CTRD.skills(act)
+    local t = {}
+    for n in pairs(act or {}) do
+        if n:find("Stance", 1, true) or n:find("Deflect", 1, true) or n:find("PerfectDodge", 1, true)
+            or n:find("BreakEscape", 1, true) or n:find("SWT", 1, true) or n:find("SwitchForm", 1, true)
+            or n:find("Execution", 1, true) or n:find("HeiMoShang", 1, true) then
+            t[#t + 1] = n
+            if #t >= 5 then break end
+        end
+    end
+    return #t > 0 and table.concat(t, ",") or "无"
+end
+-- 我最近一招（被对面完美闪避的那一招）：招式号 → 名字（名字留 300 个，落空晚回来也有）
+function CTRD.myAtk(tn)
+    local id = NET.myAtkId
+    local nm = (id and NET.evName and NET.evName[id]) or NET.lastMyAtk
+    if nm then return string.format("%s（%.2f 秒前）", nm, tn - (NET.myAtkAt or tn)) end
+    return "读不到"
+end
+-- 开一条链 / 接在当前链上（A → B 3 秒内算同一条）；超过上限不再记
+function CTRD.open(kind, name, tn)
+    local c = CTRD.cur
+    if not (c and tn - c.t0 <= 3.0 and tn <= (c.untilT or 0) + 0.1) then
+        CTRD.n = CTRD.n + 1
+        if CTRD.n > CTRD.MAX_CHAIN then
+            if not CTRD.capped then CTRD.capped = true; CTRD.log("§396 红反链记满 %d 条，后面不再记", CTRD.MAX_CHAIN) end
+            return nil
+        end
+        c = { id = CTRD.n, t0 = tn, untilT = tn + CTRD.WATCH, guardN = 0, breakN = 0 }
+        CTRD.cur = c
+    end
+    c.lastKind, c.lastAt = kind, tn
+    return c
+end
+-- 替身放出来的远端技能（base_replay 的 activateOnPuppet → main.lua pupAction）
+function CTRD.onPuppet(name, how, tn)
+    if not CTRD.on() then return end
+    if isAttackAbility(name) then CTRD.lastPup = { name = name, at = tn } end     -- 对方最近一招（我闪避的是它）
+    if CTRD.isSpecial(name) then
+        CTRD.splog("§396 特殊攻击（对方）：%s；%s；我最近一招 %s", name, tostring(how), CTRD.myAtk(tn))
+    end
+    if not CTRD.isCounter(name) then return end
+    local c = CTRD.open("A", name, tn)
+    if not c then return end
+    CTRD.log("§396 红反链#%d A 对方红光反击（替身放）：%s；%s；我最近一招 %s", c.id, name, tostring(how), CTRD.myAtk(tn))
+end
+-- 对方红光反击是模组直接播的（PDX：替身放不出时）；base_diag 的 PDX.start 里调
+function CTRD.onPdx(use, tn)
+    if not CTRD.on() then return end
+    local c = CTRD.open("A", use, tn)
+    if not c then return end
+    c.pdx = true
+    CTRD.log("§396 红反链#%d A 对方红光反击是模组直接播的（PDX）：%s；我最近一招 %s", c.id, tostring(use), CTRD.myAtk(tn))
+end
+-- 我身上新出现红光反击技能（netSend 技能差里调）
+function CTRD.onMine(name, tn)
+    if not CTRD.on() then return end
+    if CTRD.isSpecial(name) then
+        CTRD.sp = { name = name, at = tn, segs = 0 }
+        CTRD.splog("§396 特殊攻击（我）：%s 出现（按住续段看后面「第 N 段」，4 秒还没结束会再记一行）", name)
+    end
+    if not CTRD.isCounter(name) then return end
+    local c = CTRD.open("B", name, tn)
+    if not c then return end
+    c.untilT, c.skill, c.skillEnded, c.sampleAt = tn + CTRD.WATCH, name, false, tn
+    local r = CTRD.lastPup
+    local prev = (r and tn - r.at <= 3.0) and string.format("%s（%.2f 秒前）", r.name, tn - r.at) or "没有（3 秒内没看到对方出招）"
+    CTRD.log("§396 红反链#%d B 我的红光反击出现：%s；对方上一招 %s；ctr=%s；开始观察防御 %.0f 秒",
+        c.id, name, prev, NOCTR.active() and "关（这招会被拦）" or "开", CTRD.WATCH)
+end
+-- 每秒采样：标签 / 按住输入 / 杀气 / 动作 / 技能 / 输入锁
+function CTRD.sample(c, p1, m, act, tn)
+    local tags = G.tagsMatching(p1, CTRD.TAGS) or {}
+    local set = {}
+    for _, t in ipairs(tags) do set[t] = true end
+    local h = G.holdingInputs(p1)
+    local hn = {}
+    for k in pairs(h or {}) do hn[#hn + 1] = k end
+    table.sort(hn)
+    local sh = attrOf(p1, "Shachi")
+    CTRD.log("§396 红反链#%d +%.1fs 动作=%s 架势=%s 杀气=%s 按住=%s 标签=%s 输入锁=%s 技能=%s",
+        c.id, tn - c.t0, (m and m ~= "") and m or "（空）", c.guard and "在" or "不在",
+        sh and string.format("%.0f", sh) or "?", #hn > 0 and table.concat(hn, "+") or "无",
+        #tags > 0 and table.concat(tags, ",") or "无", STG.active(tn) and "关着" or "开", CTRD.skills(act))
+    if set["CharacterState.AbilityState.Stance.Forbid"] and not c.forbid then
+        c.forbid = true
+        CTRD.log("§396 红反链#%d !! Stance.Forbid（架势被禁）挂着：动作 %s，杀气 %s",
+            c.id, (m and m ~= "") and m or "（空）", tostring(sh))
+    end
+    if set["CharacterState.AbilityState.Stance.HoldingStanceKey"] and not c.guard then
+        c.holdBad = (c.holdBad or 0) + 1
+        if c.holdBad == 1 or c.holdBad % 3 == 0 then
+            CTRD.log("§396 红反链#%d !! 按着格挡键（HoldingStanceKey）但没进架势：动作 %s，标签 %s",
+                c.id, (m and m ~= "") and m or "（空）", #tags > 0 and table.concat(tags, ",") or "无")
+        end
+    end
+    c.lastTags = tags
+end
+-- 特殊攻击（防御+重攻击，DB / SpecialSkill / GuardPoint）：按住会续段，同一个技能一直挂着时 netSend 的技能差看不到"新一招"，
+--   模组只发一次，对方替身只播一次动作（11-19 伊格尼斯："只显示前 3 次攻击旋转的动作，后续按住不给对方显示动作，但实际生效"）。
+--   这里只记：我这边的技能出现 / 每换一段动作 / 结束（几段、多少秒）/ 挂了 4 秒还没结束；对方收到的是什么。
+function CTRD.isSpecial(n)
+    return n ~= nil and (n:find("_DB_C", 1, true) or n:find("_DB_", 1, true) or n:find("SpecialSkill", 1, true)
+        or n:find("GuardPoint", 1, true) or n:find("Special_Defence", 1, true))
+end
+function CTRD.splog(...)
+    if CTRD.spLogs >= CTRD.SPLOG then return end
+    CTRD.spLogs = CTRD.spLogs + 1
+    CTRD.log(...)
+end
+-- 常驻防御监视（交手中每秒一次，不依赖红反链）：11-19 伊格尼斯"只有黑魔伤会永久无法防御"——
+--   Stance.Forbid 是黑魔伤 SWT / 混沌切形态 / 处决这些技能自己挂的（gasgraph 标签反查），要是技能卡住不结束、
+--   标签不撤，就会一直进不了架势。这里只记它出现 / 解除（解除时带挂了多少秒）和"按着格挡键却没进架势"。
+function CTRD.monFrame(p1, m, act, tn)
+    if not CTRD.on() then return end
+    if tn - (CTRD.monAt or -100) < CTRD.MON then return end
+    CTRD.monAt = tn
+    local tags = G.tagsMatching(p1, CTRD.TAGS) or {}
+    local set = {}
+    for _, t in ipairs(tags) do set[t] = true end
+    local forbid = set["CharacterState.AbilityState.Stance.Forbid"] == true
+    local hold = set["CharacterState.AbilityState.Stance.HoldingStanceKey"] == true
+    local guard = BLK.guarding(m, act) ~= nil
+    if forbid ~= (CTRD.monForbid or false) then
+        CTRD.monForbid = forbid
+        if forbid then CTRD.forbidAt = tn end
+        CTRD.log("§396 防御监视：Stance.Forbid %s%s 动作=%s 技能=%s 杀气=%s 按住格挡=%s 标签=%s",
+            forbid and "出现" or "解除",
+            (not forbid and CTRD.forbidAt) and string.format("（挂了 %.1f 秒）", tn - CTRD.forbidAt) or "",
+            (m and m ~= "") and m or "（空）", CTRD.skills(act), tostring(attrOf(p1, "Shachi")),
+            hold and "是" or "否", #tags > 0 and table.concat(tags, ",") or "无")
+    end
+    if hold and not guard then
+        if not CTRD.holdBad then
+            CTRD.holdBad = tn
+            CTRD.log("§396 防御监视 !! 按着格挡键但没进架势：动作=%s 技能=%s 标签=%s 杀气=%s",
+                (m and m ~= "") and m or "（空）", CTRD.skills(act),
+                #tags > 0 and table.concat(tags, ",") or "无", tostring(attrOf(p1, "Shachi")))
+        end
+    elseif CTRD.holdBad then
+        CTRD.log("§396 防御监视：架势回来了（按着格挡 %.1f 秒没进）", tn - CTRD.holdBad)
+        CTRD.holdBad = nil
+    end
+end
+-- 每帧（netSend 读完动作 / 技能表之后）：架势进出、破防、红光反击技能结束、采样、到点收尾
+function CTRD.frame(p1, m, act, tn)
+    local sp = CTRD.sp
+    if sp then
+        if m ~= sp.mont and m ~= "" then
+            sp.mont = m
+            sp.segs = sp.segs + 1
+            CTRD.splog("§396 特殊攻击（我）：%s 第 %d 段动作 %s（+%.1f 秒）", sp.name, sp.segs, m, tn - sp.at)
+        end
+        if not (act and act[sp.name]) then
+            CTRD.splog("§396 特殊攻击（我）：%s 结束（%.1f 秒，%d 段动作）", sp.name, tn - sp.at, sp.segs)
+            CTRD.sp = nil
+        elseif tn - sp.at > 4.0 and not sp.longLogged then
+            sp.longLogged = true
+            CTRD.splog("§396 特殊攻击（我）：%s 已经挂了 %.1f 秒还在（第 %d 段动作）——按住续段 / 技能没结束；对方只收到第一次",
+                sp.name, tn - sp.at, sp.segs)
+        end
+    end
+    local c = CTRD.cur
+    if not c then return end
+    if tn > (c.untilT or 0) then
+        if not c.done then
+            c.done = true
+            CTRD.log("§396 红反链#%d 观察结束（%.1f 秒）：进架势 %d 次；破防 %s；架势被禁 %s；按着格挡没进架势 %s；最后动作 %s；最后标签 %s",
+                c.id, tn - c.t0, c.guardN or 0, (c.breakN or 0) > 0 and tostring(c.breakN) or "没有",
+                c.forbid and "有" or "没有", (c.holdBad or 0) > 0 and (c.holdBad .. " 次采样") or "没有",
+                (m and m ~= "") and m or "（空）", (c.lastTags and #c.lastTags > 0) and table.concat(c.lastTags, ",") or "无")
+        end
+        return
+    end
+    if c.skill and not c.skillEnded and not (act and act[c.skill]) then
+        c.skillEnded = true
+        CTRD.log("§396 红反链#%d 我的红光反击 %s 结束（%.2f 秒），动作 %s",
+            c.id, c.skill, tn - c.t0, (m and m ~= "") and m or "（空）")
+    end
+    local brk = act and act["GA_Hun_BreakEscape_C"]
+    if brk and not c.breakOn then
+        c.breakOn, c.breakN = true, (c.breakN or 0) + 1
+        CTRD.log("§396 红反链#%d 破防（GA_Hun_BreakEscape_C），动作 %s，杀气 %s",
+            c.id, (m and m ~= "") and m or "（空）", tostring(attrOf(p1, "Shachi")))
+    elseif not brk then
+        c.breakOn = false
+    end
+    local g = BLK.guarding(m, act)
+    if (g ~= nil) ~= (c.guard or false) then
+        c.guard = g ~= nil
+        if g then c.guardN = (c.guardN or 0) + 1 end
+        CTRD.log("§396 红反链#%d 架势%s", c.id, g and ("进入（" .. g .. "）") or ("离开（动作 " .. tostring(m) .. "）"))
+    end
+    if tn - (c.sampleAt or -100) >= CTRD.SAMPLE then
+        c.sampleAt = tn
+        CTRD.sample(c, p1, m, act, tn)
+    end
 end
 
 -- ============================================================ §161 连续 3 次被精防的硬直锁住出招
@@ -4664,6 +5007,7 @@ local function netSend(p1, tn)
     local act = activeAbilities(p1, NET.wantAb) or {}
     if NET.prevAbs then
         for n in pairs(act) do
+            if not NET.prevAbs[n] then CTRD.onMine(n, tn) end      -- §396 红反链：我的红光反击出现
             if not NET.prevAbs[n] and HLFX and n == HLFX.NAME then pcall(HLFX.cast, "me", p1, n, tn) end  -- §246 火流星 DB：我放招（事件触发）
             if not NET.prevAbs[n] then SWK.note(n, tn); ABUF.onAbility(n, tn, true) end   -- §200.11 切武器（切刀斩）；§349 武器状态 / 放血计时
             if not NET.prevAbs[n] and SUMMON.armName and SUMMON.armName(n) then ST.p1SummonAt = tn end   -- §118 / §242 我放了召唤（认替身分身时用）
@@ -4697,6 +5041,8 @@ local function netSend(p1, tn)
     -- 发 hr=<次数>:<动作名>，对方让替身播同一个
     local hm = montageOf(p1)
     BLK.watch(hm, act, tn)          -- §87 记"开始格挡"的时刻（软格挡按它分精防 / 普防）
+    CTRD.frame(p1, hm, act, tn)     -- §396 红反链：之后能不能进架势
+    CTRD.monFrame(p1, hm, act, tn)  -- §396 防御监视：Stance.Forbid 出现 / 解除、按着格挡没进架势
     if hm ~= NET.hrPrev and LO.isHitMontage(hm) then
         NET.hrN, NET.hrT = (NET.hrN or 0) + 1, hm
     end
@@ -4810,18 +5156,41 @@ end
 
 -- §83 连着管道：这次驱动之前收到的每个包都按顺序过一遍（LAT.onPacket 每个包一次，包龄 / 往返照算）；
 -- 没连：照旧读文件里最新的那一个
+-- §性能（11-19 用户"动不动突然卡住"）：一帧最多处理 RX_MAX 个包，剩下的按原顺序排到下一帧。
+-- 切图 / 卡顿后联机程序一次能给 48 个（GamePipe.MaxQueue），以前一帧全做完 → 单帧 200–1000 ms（日志 收包 344/580/993 ms），
+-- 越卡下一帧越重。单包报错也只丢那一个，不再让整个收包循环中断。
+NET.RX_MAX, NET.rxq, NET.rxErrN = 12, nil, 0
 local function netRecv(p1, tn)
     local list = PIPE and PIPE.recv()
     if not list then list = { fileReadKV(F_REMOTE) } end
-    for _, t in ipairs(list) do
-        -- §141 观战：主机转发来的两路包（src=h / src=c）交给观战代码，不当成对手
-        if t.src and t.src:match("^%d+$") then
-            -- 多人混战 ②b：多人房间的包（src = 玩家编号，主机 1）交给 pbz_multi.lua，每个编号一个替身
-            BASEHOOK.emit("base.feedMp", t, tn)     -- L5：多人 mod 订阅
-        elseif t.src then
-            BASEHOOK.emit("base.feedSrc", t, tn)     -- L3：观战 mod 订阅
-        else
-            NET.recvOne(p1, tn, t)
+    local q = NET.rxq
+    if q and #q > 0 then
+        for i = 1, #q do list[#list + 1] = q[i] end
+        NET.rxq = nil
+    end
+    local n, maxn = #list, NET.RX_MAX
+    if n > maxn then
+        local rest = {}
+        for i = maxn + 1, n do rest[#rest + 1] = list[i] end
+        while #rest > 120 do table.remove(rest, 1) end      -- 保险：真积压太多就丢最旧的（位置类包下一包会补上）
+        NET.rxq = rest
+        n = maxn
+    end
+    for i = 1, n do
+        local t = list[i]
+        local ok, err = pcall(function()
+            if t.src and t.src:match("^%d+$") then
+                -- 多人混战 ②b：多人房间的包（src = 玩家编号，主机 1）交给 pbz_multi.lua，每个编号一个替身
+                BASEHOOK.emit("base.feedMp", t, tn)     -- L5：多人 mod 订阅
+            elseif t.src then
+                BASEHOOK.emit("base.feedSrc", t, tn)     -- L3：观战 mod 订阅
+            else
+                NET.recvOne(p1, tn, t)
+            end
+        end)
+        if not ok then
+            NET.rxErrN = (NET.rxErrN or 0) + 1
+            if NET.rxErrN <= 20 then out("!! 收包 -> %s", tostring(err)) end
         end
     end
 end
@@ -5053,7 +5422,9 @@ function NET.recvOne(p1, tn, t)
     local hn2, ht2 = (t.hr or ""):match("^(%d+):([%w_%.]+)$")
     hn2 = tonumber(hn2)
     if hn2 then
-        if NET.hrIn and hn2 > NET.hrIn and LO.isHitMontage(ht2) and not REP.on then
+        -- §389 对方只是被点燃 / 流血跳了一下：hr= 不镜像（不播受击、也不记成"对方被打断"）。真刀同一包会带新的中招结果
+        local tickHr = DTICK and DTICK.hrSkip and DTICK.hrSkip(t, ht2, tn)
+        if NET.hrIn and hn2 > NET.hrIn and LO.isHitMontage(ht2) and not REP.on and not tickHr then
             -- v0.23.1 对方在自己的游戏里真被打出受击 = 他那一刀被打断了：替身正在重放的招式立刻停掉（不淡出），
             -- 不然受击动画盖在上面、伤害窗口还开着，照样砍中玩家
             local busy = puppetAttacking(puppet())
@@ -6132,7 +6503,7 @@ function PP.poll()
 end
 
 function PP.text()
-    return T("Phantom Pact 合作联机中，请先在 F5 面板里离开", "PHANTOM PACT CO-OP IS ON - LEAVE IT IN ITS F5 PANEL FIRST")
+    return T("Phantom Pact 联机中，先在 F5 面板离开", "PHANTOM PACT CO-OP IS ON - LEAVE IT IN ITS PANEL FIRST")
 end
 
 function PP.rows()
@@ -6211,7 +6582,7 @@ function NET.rulesRows(size, room)
     local rows = {}
     for _, ln in ipairs(RT.wrapRules(NET.rulesList(room), RT.RULE_W)) do rows[#rows + 1] = { c = ln, col = COL_ORANGE, size = size } end
     if room and CFG.srvNewer then        -- 旧版 1v1 的倒计时自己另写这一行
-        rows[#rows + 1] = { c = T("大厅服务器的数值表比你的模组新，这一场用的是模组自带的，请更新模组", "SERVER BALANCE TABLE IS NEWER THAN YOUR MOD: UPDATE"),
+        rows[#rows + 1] = { c = T("服务器数值表比模组新，本场用模组自带的，请更新模组", "SERVER TABLE IS NEWER THAN YOUR MOD: UPDATE"),
                             col = COL_RED, size = size, nolog = true }
     end
     return rows
@@ -6235,7 +6606,7 @@ local function matchRows(tn)
         for _, r in ipairs(NET.rulesRows()) do rows[#rows + 1] = r end
         for _, r in ipairs(RFP.rows() or {}) do rows[#rows + 1] = r end     -- §210 双方规则不一致
         if CFG.srvNewer then         -- §210 大厅服务器的数值表比我的模组新、没用上（规则指纹也会和新版本对不上）
-            rows[#rows + 1] = { c = T("大厅服务器的数值表比你的模组新，这一场用的是模组自带的，请更新模组", "SERVER BALANCE TABLE IS NEWER THAN YOUR MOD: UPDATE"),
+            rows[#rows + 1] = { c = T("服务器数值表比模组新，本场用模组自带的，请更新模组", "SERVER TABLE IS NEWER THAN YOUR MOD: UPDATE"),
                                 col = COL_RED, size = 0.8, nolog = true }
         end
         for _, r in ipairs(FMATCH.rowsOf("cd", tn)) do rows[#rows + 1] = r end     -- 规则来源 / 扩展加的行（排位：我的积分 / 名次）
@@ -6333,17 +6704,35 @@ end
 --   准备（F1）或在对局里（倒计时 / 交手 / 回合结算 / 结算）时，把游戏开界面的输入映射摘掉（G.uiCtxStrip：Esc 菜单 / 地图 / 拍照 / 感知 + 交互键），
 --   取消准备 / 回自由活动挂回。只在事件上调（F1、enter、开局被拒、地图 / 对手变化、掉线），不轮询。
 --   兜底（用户："不好做的话，打开界面依然受到伤害也行"）：界面还是开出来、游戏暂停了 → 取消暂停（umgHud 本来就在看暂停切换）
+-- 11-19：新版房间（多人房 / 对决）不写 MATCH.ready / MATCH.role，所以这里再问一句玩法 mod（BASEHOOK.mp.uiWant）；
+--   want 也可以由调用方显式给（测试 / 特殊场景）
 MATCH.uib = { on = false, list = nil, pauseN = 0 }
-function MATCH.uiSync(why)
+function MATCH.uiSync(why, want)
     local u = MATCH.uib
-    local want = (MATCH.ready or MATCH.role ~= nil) and true or false
+    if want == nil then
+        want = (MATCH.ready or MATCH.role ~= nil) and true or false
+        if not want then
+            local mp = BASEHOOK and BASEHOOK.mp
+            if mp and mp.uiWant then
+                local ok, w = pcall(mp.uiWant)
+                want = (ok and w) and true or false
+            end
+        end
+    end
     if want == u.on then return end
     if want then
-        local list, desc = G.uiCtxStrip()
+        local okS, list, desc = pcall(G.uiCtxStrip)
+        if not okS then out("!! §260 摘输入映射失败：%s（%s）", tostring(list), why or "-"); return end
         u.on, u.list = true, list
         out("§260 准备 / 对局中不能开界面（%s）：%s", why or "-", tostring(desc))
+        -- 兜底：开始屏蔽时游戏已经暂停（开局前菜单就开着）= 不会再触发暂停翻转，这里补一次取消暂停
+        if list and #list > 0 then
+            local okP, paused = pcall(function() return gstat():IsGamePaused(getP1PC()) end)
+            if okP and paused == true then MATCH.uiPaused() end
+        end
     else
-        local ok, desc = G.uiCtxRestore(u.list)
+        local okR, ok, desc = pcall(G.uiCtxRestore, u.list)
+        if not okR then out("!! §260 挂回输入映射失败：%s（%s）", tostring(ok), why or "-"); return end
         out("§260 开界面恢复（%s）：%s", why or "-", tostring(desc))
         if ok then u.on, u.list = false, nil end     -- 挂不回：留着 on，下一个事件再试
     end
@@ -6653,7 +7042,7 @@ end
 -- §180 禁用武器 / 影之武装的开局关卡（WBAN 段在房间设置那里）。屏幕提示 = 一条橙字 + 一行灰字
 function WBAN.toast(msg, tn)
     MATCH.toast = { rows = { { c = T(msg[1], msg[2]), col = COL_ORANGE, size = 1.3 },
-                             { c = T("房间设置禁用了这些武器 / 影之武装（联机面板 → 房间设置）", "BANNED BY THE ROOM RULES (PANEL -> ROOM SETTINGS)"), col = COL_GRAY } },
+                             { c = T("房间设置禁用了这些武器 / 影之武装", "BANNED BY THE ROOM RULES (PANEL -> ROOM SETTINGS)"), col = COL_GRAY } },
                     till = tn + TOAST_SEC }
 end
 -- 主机开局前（F1 准备、startMatchNow——两边都准备好的自动开局也走它）：先查自己，再复核对方状态包的 wpn= / edg=（以主机为准，
@@ -7903,8 +8292,8 @@ function NETUI.aiLoadItems(lb, items, toPage)
             items[#items + 1] = { label = string.format(T("  饰品 %d：", "  SLOT %d: "), i) .. (a and AIL.nameOf("a", lb, a) or T("（空）", "(EMPTY)")), act = toPick("a" .. i) }
         end
     end
-    items[#items + 1] = { label = T("（对战中改了下一招就用新的；药血掉到四成以下喝、回四成；房间设置关了血瓶就不喝）",
-                                    "(CHANGES APPLY MID-FIGHT; DRINKS BELOW 40% HP; NOT WHEN POTIONS ARE OFF)") }
+    items[#items + 1] = { label = T("（改了下招生效；血低于四成喝；房间关了血瓶就不喝）",
+                                    "(APPLIES MID-FIGHT; DRINKS UNDER 40% HP; NOT WHEN POTIONS ARE OFF)") }
     items[#items + 1] = { label = T("返回", "BACK"), act = toPage("main") }
 end
 
@@ -7998,7 +8387,7 @@ local function roomSpec(k)
     elseif k == "accban" then       -- §176 禁用饰品：点进勾选页（客机 / 武林盟主也能进去看，只是改不了）
         local function banPage() NETUI.page, NETUI.sel = "accban", 1 end
         return { lbl = function(v) return T("禁用饰品：", "BANNED ACCESSORIES: ") .. clipText(T(ACC.banText(v, 1), ACC.banText(v, 2)), 18) .. " >" end,
-                 cli = NET.accBanOf, cfg = function() return NET.accBanCfg end, rk = function() return NET.ACCBAN_DEF end,
+                 cli = NET.accBanOf, cfg = function() return NET.accBanCfg end, rk = function(r) return (r and r.accban and NET.accBanNorm(r.accban)) or NET.accBanDefNow() end,
                  who = T("禁用饰品由主机设置", "THE HOST DECIDES THIS RULE"), click = banPage, view = banPage }
     elseif WBAN.LIST[k] then        -- §180 禁用武器 / 影之武装：同禁用饰品，点进勾选页
         local kn = WBAN.KIND_NAME[k]
@@ -8027,19 +8416,26 @@ function NETUI.roomItem(k, lb)
     else
         it = { label = s.lbl(s.cfg()) .. (s.tail or T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)")), act = s.click }
     end
-    if it and BASEHOOK.inMp() and (k == "npos" or ((k == "bo" or k == "tl") and not (BASEHOOK.mp.isDuel and BASEHOOK.mp.isDuel()))) then
+    -- 11-18：多人房（淘汰 / 积分）不用"局数 / 回合时限"（它有自己的命数 / 时限，在玩法设置页），
+    -- 隐藏掉，别让人以为改了会影响多人对局。对决和旧版 1v1 都用这两项，照常显示。
+    if it and BASEHOOK.inMp() and k == "npos" then
         it.label = it.label .. T("（只用于 1v1）", " (1v1 ONLY)")
     end
     return it
 end
--- §171 房间设置页：这三项放最上，其余按类折叠（一次只展开一类，展开最多的一类也不超出面板行数）。
--- npos（严格跟随）在系统设置页；没归类的新键自动进"其他"
-NETUI.ROOM_TOP = { "std", "bal", "acc", "accn", "accban", "wpnban", "edgeban" }      -- §176 生效饰品数量 / 禁用饰品跟在饰品后面；§180 禁用武器 / 影之武装再往下
+-- §171 房间设置页：全部按类折叠（一次只展开一类，展开最多的一类也不超出面板行数）。
+-- 11-18 用户"顶部这些（标准数值 / 武器平衡 / 饰品 / 生效饰品数量 / 禁用饰品 / 禁用武器 / 禁用影之武装）
+-- 合并成一个叫'对局平衡设置'的分类里"：原来置顶的 7 项收进第一个折叠类
+-- npos（严格跟随）在系统设置 → 网络；没归类的新键自动进"其他"
+NETUI.ROOM_TOP = {}
 NETUI.ROOM_CATS = {
-    { id = "match", zh = "对局", en = "MATCH", keys = { "bo", "dm", "bar", "tl" } },     -- §173 tl 回合时限
+    -- 11-18 用户"房间设置里的几局几胜 / 对局时间移到旧版 1v1 分类里"：bo / tl 挪去最后一类；
+    -- 对决的这两项在"玩法设置"页里改（同一个 NET.boCfg / NET.resCfg.tl，两边都是入口）
+    { id = "balance", zh = "对局平衡设置", en = "MATCH BALANCE", keys = { "std", "bal", "acc", "accn", "accban", "wpnban", "edgeban" } },   -- §176 / §180
+    { id = "match", zh = "对局", en = "MATCH", keys = { "dm", "bar" } },
     { id = "combat", zh = "战斗规则", en = "COMBAT", keys = { "dif", "ab", "ctr", "med", "gcd", "dgc", "swk", "sycd", "stg" } },     -- §216 / §228 / §266 对局难度
     { id = "res", zh = "开局资源", en = "STARTING RESOURCES", keys = { "ult0", "ultx", "sp0", "resm" } },
-    { id = "spec", zh = "观战 / 排队", en = "SPECTATORS / QUEUE", spec = true },
+    { id = "spec", zh = "旧版 1v1", en = "CLASSIC 1V1", spec = true, keys = { "bo", "tl" } },   -- 11-18 局数 / 时限 + 观战排队（旧版 1v1 才显示）
 }
 NETUI.ROOM_ELSEWHERE = { npos = true }
 -- §176 禁用饰品勾选页（NETUI.page = "accban"）：66 件按 STD.ACCESSORIES 顺序，每页 NETUI.ACCBAN_PER 件。
@@ -8123,12 +8519,13 @@ function NETUI.wbanItems(kind, lb, items, toPage)
     items[#items + 1] = { label = T("返回", "BACK"), act = toPage("room") }
 end
 -- 11-16 用户"一键改成武林盟主模式的设置，直接加在任何房间设置中"：房间设置页"返回"上面一行，点两下（3 秒内）把本机房间设置整套写成盟主规则。
--- 规则来源：联机程序拿到过的盟主规则（lobby.txt rkrules=，当前是武林盟主方式时才有）优先，没有就用下面这串
--- （= 排位服务端的 RULES；改盟主规则时这里一起改）；串里没写的键按 NET.RK_DEF（火枪冷却 / 瞬影冷却 / 精防硬直开、逆天者；闪避扣杀气 / 切武器保持杀气 11-16 起串里写明关）。
+-- 规则来源：联机程序拿到过的盟主规则（lobby.txt rkrules=，当前是武林盟主方式时才有）优先，没有就用 NET.RK_PRESET
+-- §408 NET.RK_PRESET 就是 NET.RK_RULES（base_dif.lua，唯一真源；= 排位服务端 RULES）；串里没写的键按 NET.RK_DEF。
 -- 只写本机 rules.txt（和逐项点一样，下一局生效）；客机 / 定死规则生效时不显示
-NET.RK_PRESET = "bo=3;dm=20;med=0;bal=1;ctr=1;ab=0;npos=1;ultx=200;std=1;ult0=0;sp0=3;resm=0;acc=2;accn=3;tl=180;dgc=0;swk=0;accban=BreakRegen,MagicWeapon,AnimMovement"
+NET.RK_PRESET = NET.RK_RULES
 function NET.rkPresetApply(lb)
-    local src = lb and lb.rkrules and lb.rkrules ~= "" and lb.rkrules or NET.RK_PRESET
+    local fromSrv = lb and lb.rkrules and lb.rkrules ~= ""
+    local src = fromSrv and lb.rkrules or NET.RK_PRESET
     local r = NET.rkParse(src) or NET.rkParse(NET.RK_PRESET)
     if not r then return false end
     if NET.boValid(r.bo) then NET.boSet(r.bo) end
@@ -8140,15 +8537,57 @@ function NET.rkPresetApply(lb)
     for _, k in ipairs(NET.RES_KEYS) do
         if r[k] ~= nil and NET.resValid(k, r[k]) then NET.resSet(k, r[k]) end
     end
-    NET.accBanSet(r.accban or NET.ACCBAN_DEF)
+    NET.accBanSet(r.accban or NET.accBanDefNow())
     WBAN.set("wpnban", r.wpnban or WBAN.DEF)
     WBAN.set("edgeban", r.edgeban or WBAN.DEF)
-    out("联机面板：一键套用武林盟主规则（%s）：%s", src == NET.RK_PRESET and "内置" or "服务器给的", src)
+    out("联机面板：一键套用武林盟主规则（%s）：%s", fromSrv and "服务器给的" or "内置", src)
     return true
+end
+-- 0.34 最终方案 4：数值表不再自动下发，玩家点一下才向大厅服务器要（先二次确认）；显示本地缓存的哈希 / 时间和上次结果。
+-- 11-18 用户"获取最新数值表的功能，移到一键套用盟主规则下面"：从系统设置 → 对局 挪到房间设置页底部（"一键套用武林盟主规则…"和"返回"之间）。
+local function cfgFetchItems(lb, items)
+    local ch, cat = (lb.cfgh or "") ~= "" and lb.cfgh or nil, tonumber(lb.cfgat) or 0
+    items[#items + 1] = { label = T("服务器数值表：", "SERVER TABLE: ")
+                              .. (ch and (ch .. (cat > 0 and ("  " .. os.date("%m-%d %H:%M", cat)) or "")) or T("没有（用模组自带的）", "NONE (BUILT-IN)"))
+                              .. T("  → 点击获取", "  → CLICK TO FETCH"),
+                          act = function() CONSENT.ask("cfg_fetch", function() netuiCmd("cfgfetch") end) end }
+    if (lb.cfgst or "") ~= "" then items[#items + 1] = { label = clipText(lb.cfgst, 44) } end
+end
+-- 11-18 用户"现在的房间设置里有些选项是旧版 1v1 专用的，重新整理一版分类"：联机省流三种玩法都用，单独"联机"分类。
+-- 以前它在 pbz_spec 的"观战 / 排队"里，观战 mod 没装 / 旧版 1v1 之外容易被当成观战专用；现在由 base 自己写。
+local function netRows(lb, items)
+    local notHost = lb.role == "client" or lb.role == "spec"
+    local val = notHost and lb.dzhost or lb.dz
+    local state
+    if lb.role == "spec" then
+        state = (lb.dzact == "1") and T("开（现在收的是省流包）", "ON (RECEIVING SAVED PACKETS)") or T("现在收的是完整包", "RECEIVING FULL PACKETS")
+    elseif val == "-1" then
+        state = T("未知（主机是旧版，或还没收到主机的包）", "UNKNOWN (OLD HOST OR NOT YET HEARD)")
+    else
+        state = (val ~= "0" and T("开", "ON") or T("关", "OFF"))
+                .. (lb.role and lb.role ~= "" and lb.role ~= "none" and (lb.dzact == "1" and T("（现在：省流中）", " (NOW: ON)") or T("（现在：完整包）", " (NOW: FULL)")) or "")
+    end
+    local dzOn = val ~= "0"
+    items[#items + 1] = { label = T("联机省流：", "SAVE BANDWIDTH: ") .. state
+                                  .. (notHost and T("（主机设置）", " (HOST'S SETTING)") or T("（主机设置）", " (HOST)")),
+                          act = function()
+                              if notHost then netuiFlash(T("联机省流由主机设置", "THE HOST DECIDES THIS")); return end
+                              netuiCmd("dz", "on=" .. (dzOn and "0" or "1") .. "\n")
+                              out("联机面板：联机省流设为 %s", dzOn and "关" or "开")
+                          end }
 end
 local function roomPageItems(lb, items)
     local lk = FMATCH.lockedBy()
     local ranked = lk ~= nil     -- 定死规则的来源（排位）在生效
+    -- 11-18：新版房间 = 玩法设置里另有局数 / 时限（多人房还有命数 / 时限），
+    -- 房间设置 → 旧版 1v1 这两项不显示（它们在玩法设置页里改，存的是同一份）
+    local function inNewModeRoom()
+        local sm = BASEHOOK.mp
+        if sm and sm.isDuel and sm.isDuel() then return true end
+        if sm and sm.inMp and sm.inMp() then return true end
+        local ses = MATCH.session
+        return ses ~= nil and (ses.mp == "1" or ses.duel == "1")
+    end
     if ranked then
         if lk.headerItems then lk.headerItems(lb, items) end     -- 来源自己写顶上的说明（排位：固定规则 / 最低版本 / 正在获取）
     elseif NET.roomRules() then
@@ -8156,25 +8595,6 @@ local function roomPageItems(lb, items)
     end
     local used = {}
     for k in pairs(NETUI.ROOM_ELSEWHERE) do used[k] = true end
-    for _, k in ipairs(NETUI.ROOM_TOP) do
-        used[k] = true
-        local it = NETUI.roomItem(k, lb)
-        if it then items[#items + 1] = it end
-    end
-    -- §279（用户 11-13）"对局走桥接"三档：关闭 / 直连失败时走桥接（默认）/ 一直桥接。只管我开的房；客机一律按主机的设置连，自己设成什么都不管。
-    -- 用桥接要先同意 bridge_match：切到 1 / 2 档时问；没同意时 1 档开房只走直连，2 档开房时会问。只在装了桥接扩展包、桥在时显示（§278）
-    if NETUI.hasBridge() then
-        local m = tonumber(lb.bridgeroom or "1") or 1
-        if m < 0 or m > 2 then m = 1 end
-        local names = { [0] = { "关闭", "OFF" }, [1] = { "直连优先，不通或明显更慢时走桥接", "DIRECT FIRST, BRIDGE IF IT FAILS OR IS MUCH SLOWER" }, [2] = { "一直桥接", "ALWAYS BRIDGE" } }
-        items[#items + 1] = { label = T("对局走桥接：< ", "PLAY OVER BRIDGE: < ") .. T(names[m][1], names[m][2]) .. " >",
-                              act = function()
-                                  local nx = (m + 1) % 3
-                                  local function go() netuiCmd("bridgeroom", "mode=" .. nx .. "\n") end
-                                  if nx == 0 then go() else CONSENT.ask("bridge_match", go) end
-                              end }
-        items[#items + 1] = { label = T("  客机按主机的这项设置连接；走桥接要双方都启用了桥接扩展包并同意", "  Players follow the host's setting; the bridge needs the extension enabled and agreed on both sides"), col = COL_LABEL }
-    end
     local cats = {}
     for _, c in ipairs(NETUI.ROOM_CATS) do
         cats[#cats + 1] = c
@@ -8186,10 +8606,16 @@ local function roomPageItems(lb, items)
     if #rest > 0 then cats[#cats + 1] = { id = "other", zh = "其他", en = "OTHER", keys = rest } end
     for _, c in ipairs(cats) do
         local sub = {}
-        if c.spec then      -- §141.7 排队规矩（排位房间不显示，同以前）
+        if c.spec then      -- 旧版 1v1：局数 / 时限 + 排队规矩（排位房间只显示固定规则，不显示排队）
+            if not inNewModeRoom() then
+                for _, k in ipairs(c.keys or {}) do
+                    local it = NETUI.roomItem(k, lb)
+                    if it then sub[#sub + 1] = it end
+                end
+            end
             if not ranked then BASEHOOK.emit("base.roomCat.spec", sub, T, lb.role == "client" or lb.role == "spec", netuiFlash, lb, netuiCmd) end     -- L3：观战 mod 订阅
         else
-            for _, k in ipairs(c.keys) do
+            for _, k in ipairs(c.keys or {}) do
                 local it = NETUI.roomItem(k, lb)
                 if it then sub[#sub + 1] = it end
             end
@@ -8212,7 +8638,7 @@ local function roomPageItems(lb, items)
     end
     if not ranked and lb.role ~= "client" and not (NET.roomRules() and MATCH.session and MATCH.session.matchhost == "1") then
         local armed = NETUI.rkPresetAt and (now() - NETUI.rkPresetAt) < 3
-        items[#items + 1] = { label = armed and T(">> 再点一次：把下面的房间设置全部改成武林盟主规则 <<", ">> CLICK AGAIN TO SET EVERYTHING BELOW TO RANKED RULES <<")
+        items[#items + 1] = { label = armed and T(">> 再点一次：全部改成盟主规则 <<", ">> CLICK AGAIN TO SET EVERYTHING BELOW TO RANKED RULES <<")
                                             or T("一键套用武林盟主规则…", "APPLY RANKED (WULIN MENGZHU) RULES…"),
                               act = function()
                                   if not armed then NETUI.rkPresetAt = now(); return end
@@ -8222,12 +8648,29 @@ local function roomPageItems(lb, items)
                                   end
                               end }
     end
+    -- 11-18：获取服务器数值表挪到这里（客机 / 排位也显示：本机换表随时可用，不影响主机下发的那份）
+    cfgFetchItems(lb, items)
 end
 
 -- 面板里可选的行：{ label, act = function() } ；没有 act 的是说明行。NETUI.page = main / rooms / settings（系统设置）/ room（房间设置）/ thanks
 -- F3b-5：调度骨架在 fornet_ui.lua（U.netuiItems：没响应提示、page / settingsBtns、按名字找注册页）；这里只剩默认内容：
 -- 主页 / 房间列表 / 系统设置 / 房间设置（都是影之刃零这份模组的具体项），由核心在没有注册页接手时调
 local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
+    -- 11-18 用户"旧版的 2 个选项并入一个子项":旧版 1v1 的开房 / 加入收进这一页
+    if NETUI.page == "classic" then
+        items[#items + 1] = { label = T("创建旧版房间（1v1）", "HOST A CLASSIC 1V1 ROOM"), act = function() netuiCmd("host") end }
+        local prompt, hint
+        if NETUI.viaServer(mode) then
+            prompt, hint = T("房间号，或 IP:端口 / [IPv6]:端口", "ROOM CODE, OR IP:PORT / [IPV6]:PORT"), "ABC234"
+        elseif mode == "bridge" then
+            prompt, hint = T("输入主机的" .. NETUI.bridgeSvc() .. " ID", "ENTER THE HOST'S " .. NETUI.bridgeSvc():upper() .. " ID"), ""
+        else
+            prompt, hint = T("房主地址（IPv6 写 [地址]:端口）", "HOST ADDRESS (IPV6: [ADDR]:PORT)"), "192.168.1.8"
+        end
+        items[#items + 1] = { label = T("加入旧版房间…", "JOIN A CLASSIC ROOM..."), act = function() editStart("join", prompt, "", hint) end }
+        items[#items + 1] = { label = T("返回", "BACK"), act = page("main") }
+        return items
+    end
     -- 房间设置页（用户 2026-11-06"单独出个页面放房间设置"）：主机 / 没联机时点了换值，客机只看主机定的；都是下一局生效。
     -- §110 武林盟主：规则是服务器定的固定值，只显示、点了不改。§171 入口挪到各页"系统设置…"上面，返回回主页
     if NETUI.page == "room" then
@@ -8240,8 +8683,7 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
     if NETUI.page == "settings" then
         items[#items + 1] = { label = T("昵称：", "NAME: ") .. clipText(lb.name or "?", 20),
                               act = function() editStart("name", T("输入新昵称（空着回车 = 不改）", "NEW NAME (EMPTY = KEEP)"), "", lb.name or "") end }
-        items[#items + 1] = { label = T("网络与连接…（端口 / UPnP / 大厅服务器 / 密码 / 仅本地模式）", "NETWORK... (PORT / UPNP / LOBBY SERVER / PASSWORD / LOCAL-ONLY)"), act = page("settings:net") }
-        items[#items + 1] = { label = T("对局…（对手位置跟随 / 服务器数值表）", "MATCH... (OPPONENT POSITION / SERVER TABLE)"), act = page("settings:match") }
+        items[#items + 1] = { label = T("网络与连接…", "NETWORK..."), act = page("settings:net") }
         items[#items + 1] = { label = T("界面与语言…", "DISPLAY & LANGUAGE..."), act = page("settings:ui") }
         if ST.ext then ST.ext.rows("settings", items, lb) end                               -- X1 扩展包加在系统设置的行
         BASEUI.rowsOf("settings", items, lb)                                                -- L3 玩法 mod 加在系统设置的行
@@ -8255,8 +8697,8 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
     end
     if NETUI.page == "settings:net" then
         local on = lb.upnpon == "1"
-        items[#items + 1] = { label = T("端口：", "PORT: ") .. (lb.cfgport or "?") .. T("（服务器大厅的 IP 直连用）", " (DIRECT IP)"),
-                              act = function() editStart("port", T("输入新端口 1–65535（空着回车 = 不改）", "NEW PORT 1-65535 (EMPTY = KEEP)"), "", lb.cfgport or "27015") end }
+        items[#items + 1] = { label = T("端口：", "PORT: ") .. (lb.cfgport or "?") .. T("（IP 直连用）", " (DIRECT IP)"),
+                              act = function() editStart("port", T("新端口 1–65535（回车不改）", "NEW PORT 1-65535 (EMPTY = KEEP)"), "", lb.cfgport or "27015") end }
         items[#items + 1] = { label = T("UPnP 自动转发端口：", "UPNP PORT FORWARDING: ") .. (on and T("开", "ON") or T("关", "OFF")),
                               act = function()
                                   local function upnpGo() netuiCmd("upnp", "on=" .. (on and "0" or "1") .. "\n") end
@@ -8265,44 +8707,50 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
         -- 服务器大厅用的服务器地址（域名或 IP[:端口]，默认端口 27020）
         local srv = (lb.srv or "") ~= "" and lb.srv or T("未填", "NOT SET")
         items[#items + 1] = { label = T("大厅服务器：", "LOBBY SERVER: ") .. clipText(srv, 24),
-                              act = function() editStart("server", T("输入大厅服务器地址 域名或IP[:端口]（空着回车 = 不改）", "LOBBY SERVER HOST[:PORT] (EMPTY = KEEP)"), "",
+                              act = function() editStart("server", T("大厅服务器 域名或 IP[:端口]（回车不改）", "LOBBY SERVER HOST[:PORT] (EMPTY = KEEP)"), "",
                                                          (lb.srv or "") ~= "" and lb.srv or "1.2.3.4:27020") end }
         -- §102 的"直连不通时用服务器中转"0.34 去掉了（TASK_0.34 最终方案 3：对局不经服务器中转；替代是房间设置"对局走 Steam"）
         -- v0.22.0 联机密码（可选，两边填同一个；空 = 不签名）。面板只显示设没设，密码本身不回传给游戏
-        items[#items + 1] = { label = T("联机密码：", "PASSWORD: ") .. (lb.secret == "1" and T("已设置", "SET") or T("未设置（不签名）", "NONE (UNSIGNED)")),
-                              act = function() editStart("secret", T("输入联机密码，两边要一样（空着回车 = 不改，输入 - = 清除）", "PASSWORD, SAME ON BOTH SIDES (EMPTY = KEEP, - = CLEAR)"), "",
+        items[#items + 1] = { label = T("联机密码：", "PASSWORD: ") .. (lb.secret == "1" and T("已设置", "SET") or T("未设置", "NONE")),
+                              act = function() editStart("secret", T("联机密码，两边一样（回车不改，- 清除）", "PASSWORD, SAME ON BOTH SIDES (EMPTY = KEEP, - = CLEAR)"), "",
                                                          T("对方也要填同一个", "BOTH SIDES USE THE SAME ONE")) end }
         -- §294 多人房隐藏我的 IP（§306 用户 11-14 要求从首页挪到系统设置；只对服务器大厅的多人房有用，局域网里大家本来同一个网）
         local hideip = lb.hideip == "1"
-        items[#items + 1] = { label = T("房间里隐藏我的 IP（服务器大厅；只有房主知道，经房主转发）：", "HIDE MY IP IN ROOMS (SERVER LOBBY; HOST ONLY, VIA HOST): ") .. (hideip and T("开", "ON") or T("关", "OFF")),
+        items[#items + 1] = { label = T("隐藏我的 IP（仅服务器大厅）：", "HIDE MY IP (LOBBY ROOMS): ") .. (hideip and T("开", "ON") or T("关", "OFF")),
                               act = function()
                                   netuiCmd("hideip", "on=" .. (hideip and "0" or "1") .. "\n")
                                   netuiFlash(T("下次开 / 进房间生效", "TAKES EFFECT IN THE NEXT ROOM"))
                               end }
+        -- 11-18 用户"对局走桥接 / 联机省流 / 对手位置严格跟随 是不是应该放网络里"：挪到网络与连接页。
+        -- 这三项都是"开房时才算数"的联机设置（省流 / 桥接存 netcfg，严格跟随是房间规则 npos），客机跟主机
+        items[#items + 1] = { label = T("开房时的联机：", "HOSTING NETWORK:"), col = COL_LABEL }
+        netRows(lb, items)
+        if NETUI.hasBridge() then
+            local m = tonumber(lb.bridgeroom or "1") or 1
+            if m < 0 or m > 2 then m = 1 end
+            local names = { [0] = { "关闭", "OFF" }, [1] = { "直连优先，不通或明显更慢时走桥接", "DIRECT FIRST, BRIDGE IF IT FAILS OR IS MUCH SLOWER" }, [2] = { "一直桥接", "ALWAYS BRIDGE" } }
+            items[#items + 1] = { label = T("对局走桥接：< ", "PLAY OVER BRIDGE: < ") .. T(names[m][1], names[m][2]) .. " >",
+                                  act = function()
+                                      local nx = (m + 1) % 3
+                                      local function go() netuiCmd("bridgeroom", "mode=" .. nx .. "\n") end
+                                      if nx == 0 then go() else CONSENT.ask("bridge_match", go) end
+                                  end }
+            if not lb.role or lb.role == "none" or lb.role == "" then
+                items[#items + 1] = { label = T("  客机跟主机；桥接要双方都启用并同意", "  Guests follow the host; the bridge needs both sides"), col = COL_LABEL }
+            end
+        end
+        local npos = NETUI.roomItem("npos", lb)
+        if npos then items[#items + 1] = npos end
         -- §125 桥接连接自检（单机能跑，约 12 秒）：看游戏有没有把外部服务的连接回调送到，结果写进 net\bridge_conn.log（F4c-2：只在装了桥接扩展包时显示）
         if NETUI.hasBridge() then
             local svc = NETUI.bridgeSvc()
-            items[#items + 1] = { label = T(svc .. "连接自检（约 12 秒，结果在 net\\bridge_conn.log）", svc:upper() .. " SELF-TEST (~12 S, SEE NET\\BRIDGE_CONN.LOG)"),
+            items[#items + 1] = { label = T(svc .. "连接自检（约 12 秒）", svc:upper() .. " SELF-TEST (~12 S, SEE NET\\BRIDGE_CONN.LOG)"),
                                   act = function() netuiCmd("bridgetest") end }
         end
         -- 0.34 §2.4：安全模式 L0（本地硬开关，只留局域网 / 本地 AI、不连大厅服务器、不碰 Steam）；隐私说明页（和 PRIVACY.md 同一份文字）
         local safe = lb.safe == "1"
-        items[#items + 1] = { label = T("仅本地模式（只留局域网 / 本地 AI，不连服务器、不用扩展的外部服务）：", "LOCAL-ONLY MODE (LAN / LOCAL AI ONLY): ") .. (safe and T("开", "ON") or T("关", "OFF")),
+        items[#items + 1] = { label = T("仅本地模式（只留局域网 / 本地 AI）：", "LOCAL-ONLY MODE (LAN / LOCAL AI): ") .. (safe and T("开", "ON") or T("关", "OFF")),
                               act = function() netuiCmd("safemode", "on=" .. (safe and "0" or "1") .. "\n") end }
-        items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
-        return items
-    end
-    if NETUI.page == "settings:match" then
-        -- §171 对手位置严格跟随（房间规则 npos，主机定）放在系统设置（用户 11-09）；房间设置…入口挪到各页"系统设置…"上面
-        local npos = NETUI.roomItem("npos", lb)
-        if npos then items[#items + 1] = npos end
-        -- 0.34 最终方案 4：数值表不再自动下发，玩家点一下才向大厅服务器要（先二次确认）；显示本地缓存的哈希 / 时间和上次结果
-        local ch, cat = (lb.cfgh or "") ~= "" and lb.cfgh or nil, tonumber(lb.cfgat) or 0
-        items[#items + 1] = { label = T("服务器数值表：", "SERVER TABLE: ")
-                                  .. (ch and (ch .. (cat > 0 and ("  " .. os.date("%m-%d %H:%M", cat)) or "")) or T("没有（用模组自带的）", "NONE (BUILT-IN)"))
-                                  .. T("  → 点击获取", "  → CLICK TO FETCH"),
-                              act = function() CONSENT.ask("cfg_fetch", function() netuiCmd("cfgfetch") end) end }
-        if (lb.cfgst or "") ~= "" then items[#items + 1] = { label = clipText(lb.cfgst, 44) } end
         items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
         return items
     end
@@ -8338,7 +8786,7 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
                               act = function()
                                   local i, ms = 1, NETUI.modes()
                                   for k, m in ipairs(ms) do if m == roomMode then i = k end end
-                                  -- 跳过 ai 和不能当 AI 等人房间的方式（§110：排位房间不跟 AI 对战混着开，UI.MODE_NO_AIROOM）
+                                  -- 跳过 ai 和不能当 AI 等人房间的方式（§110 只剩 AI 自己；11-19 起武林盟主也能当等人的房间）
                                   local nx = ms[i % #ms + 1]
                                   for _ = 1, #ms do
                                       if not UI.MODE_NO_AIROOM[nx] then break end
@@ -8347,6 +8795,11 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
                                   end
                                   netuiCmd("airoommode", "mode=" .. nx .. "\n")
                               end }
+        if roomMode == "ranked" then     -- 11-19：排位房间（排位确实激活时才轮得到它，见 mods\ranked\client.lua 的注册）。
+                                         -- 文案按半角 56 格以内（论坛 / 1080p 全屏都放得下；写长会把整个面板撑出屏幕，见 §398）
+            items[#items + 1] = { label = T("（排位房：AI 对打中也等真人，进来就转成排位对局、计分）",
+                                            "(RANKED ROOM: WAITS DURING THE AI FIGHT, RATED)") }
+        end
     end
     if mode == "ai" and NETUI.page == "rooms" then NETUI.page = "main" end
     if mode == "ai" and (lb.role or "none") == "none" then
@@ -8359,11 +8812,14 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
         items[#items + 1] = dstatBtn
         aiRoomItems()
         if aiLv == 3 then
-            items[#items + 1] = { label = T("（木桩：站着不动、不出招、不防、空血回满不会死、不限时；默认不带饰品；伤害按完整一招算）",
-                                            "(DUMMY: STANDS STILL, NEVER ATTACKS/BLOCKS/DIES, REFILLS WHEN EMPTY; NO ACCESSORIES BY DEFAULT)") }
+            -- 两条都控制在半角 56 格以内：一条写太长会把整个文字面板撑出屏幕（§398）
+            items[#items + 1] = { label = T("（木桩：站着不动、不出招、不防、不会死、不限时）",
+                                            "(DUMMY: STANDS STILL, NEVER ATTACKS OR DIES)") }
+            items[#items + 1] = { label = T("（默认不带饰品；伤害按完整一招算）",
+                                            "(NO ACCESSORIES; DAMAGE COUNTS THE WHOLE MOVE)") }
         end
-        items[#items + 1] = { label = roomOn and T("（开打后同时开着房间，有人进来就结束 AI 对战、改成和他打）", "(A PLAYER WHO JOINS REPLACES THE AI)")
-                                         or T("（AI 照抄你的攻击属性，武器等在\"AI 装备\"里选；开始后按 F1 开打）", "(COPIES YOUR STATS; PICK ITS GEAR IN AI LOADOUT; PRESS F1 TO FIGHT)") }
+        items[#items + 1] = { label = roomOn and T("（有人进来就结束 AI 对战、改成和他打）", "(A PLAYER WHO JOINS REPLACES THE AI)")
+                                         or T("（AI 照抄你的属性，武器在「AI 装备」里选；F1 开打）", "(COPIES YOUR STATS; GEAR IN AI LOADOUT; F1 TO FIGHT)") }
         settingsBtns()
         return items
     end
@@ -8375,7 +8831,7 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
         items[#items + 1] = dstatBtn
         aiRoomItems()
         if lb.aiwait == "1" then
-            items[#items + 1] = { label = roomMode == "server" and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制房间地址（发给朋友）", "COPY MY ADDRESS"),
+            items[#items + 1] = { label = NETUI.viaServer(roomMode) and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制房间地址（发给朋友）", "COPY MY ADDRESS"),
                                   act = function() netuiCmd("copy"); netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end }
         end
         settingsBtns()
@@ -8408,6 +8864,17 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
                 end
             }
         end
+        -- 11-18 用户"像筛选那样加一个独立的 2 态按钮（观战 / 上场）"：进列表方式，点一下切换；点房间按当前方式走
+        if mode ~= "ai" and mode ~= "ranked" and not (GUI and GUI.on) then
+            local w = (NETUI.roomWatch == true)
+            items[#items + 1] = { label = T("进入方式：< ", "ENTER AS: < ") .. (w and T("只观战", "SPECTATE") or T("上场", "PLAY")) .. " >",
+                                  act = function()
+                                      local nw = not w
+                                      NETUI.roomWatch = nw
+                                      netuiCmd("specq", "on=" .. (nw and "1" or "0") .. "\n")
+                                      netuiFlash(nw and T("进入方式：只观战", "ENTER AS: SPECTATE") or T("进入方式：上场", "ENTER AS: PLAY"))
+                                  end }
+        end
         local pages = roomPages(rooms)
         NETUI.roomPage = math.min(math.max(NETUI.roomPage or 1, 1), pages)
         local from = (NETUI.roomPage - 1) * perPage()
@@ -8438,94 +8905,124 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
         for _, r in ipairs(allRooms) do if roomOpen(r) then open = open + 1 end end
         items[#items + 1] = { label = #allRooms == 0 and (T("房间列表", "ROOM LIST") .. " " .. NETUI.noRooms(lb, mode, tn) .. "…")
                                      or string.format(T("房间列表（%d 个，可加入 %d）…", "ROOM LIST (%d, %d OPEN)..."), #allRooms, open),
-                              act = NETUI.openRooms }
+                              act = function()      -- 11-18：按当前"进入方式"显示（2 态按钮在列表页里切换）
+                                  NETUI.roomWatch = (lb.specnoq == "1")
+                                  NETUI.openRooms()
+                              end }
         local steam = mode == "bridge"     -- F4c-2：桥接方式（输入对方在外部服务里的 ID）
         local isSrv = mode == "server"
+        -- 11-18 用户："旧版入口从大厅和局域网里隐藏，功能留着"：这两种方式不再显示旧版 1v1 入口 / 新版推荐分隔线
+        local showClassic = not (mode == "lan" or isSrv)
+        -- 11-19 用户："只装基础包时开房开不出来"：没装 / 没启用多人模块（BASEHOOK.mp 是它登记进来的）时，
+        -- 下面的几个按钮以前照样发 mphost / mpjoin，可 mp 那条同意是多人模块登记的 → 面板翻到"文案缺失"的同意页、
+        -- 联机程序也回"要先同意 mp"，房开不出来。这种时候改成开 / 加入旧版 1v1 房间（走 play 那条同意，基础包自己有）。
+        local mpOn = BASEHOOK.mp ~= nil
         if mode == "lan" or isSrv or steam then      -- 多人混战 ②（docs/MULTI.md）：局域网与服务器大厅与桥接
             local mpn = BASEHOOK.mp and BASEHOOK.mp.cfg and BASEHOOK.mp.cfg.size or 4
             -- §306 用户 11-14："房间人数能不能在房间里设置而不是在主面板"：首页只留开房按钮（按上次存的人数开），
             -- 人数在房间里房主的多人面板改（pbz_multi.lua MP.panel → 联机程序 mpsize）；隐藏 IP 挪到系统设置
             -- 11-17 用户：新版两行上下各加一排分隔线强调，旧版直接在标题上写"即将下线"、去掉单独的提示行
-            items[#items + 1] = { label = T("---------------- 新版房间（推荐） ----------------", "---------------- NEW ROOMS (RECOMMENDED) ----------------"), col = COL_GREEN }
-            -- 11-17 用户：按钮不再写人数 / "进房后可改"
-            local hostMpLabel = steam and T("创建房间（桥接）", "HOST A ROOM (BRIDGE)") or T("创建房间", "HOST A ROOM")
-            items[#items + 1] = { label = hostMpLabel,
-                                  act = function() netuiCmd("mphost", "n=" .. mpn .. "\n") end }
-            -- 加入多人房间（联机程序 mpjoin：服务器大厅认房间号或 IP，局域网认地址，桥接认 ID）
-            local mpPrompt = isSrv and T("输入房间号，或房主的 IP:端口 / [IPv6]:端口", "ROOM CODE, OR HOST IP:PORT / [IPV6]:PORT")
-                          or steam and T("输入主机的" .. NETUI.bridgeSvc() .. " ID", "ENTER THE HOST'S " .. NETUI.bridgeSvc():upper() .. " ID")
-                          or T("输入房主的地址（IPv6 写 [地址]:端口）", "HOST ADDRESS (IPV6: [ADDR]:PORT)")
-            items[#items + 1] = { label = T("加入房间…", "JOIN A ROOM..."),
-                                  act = function() editStart("mpjoin", mpPrompt, "", isSrv and "ABC234" or steam and "" or "192.168.1.8") end }
-            items[#items + 1] = { label = "--------------------------------------------------", col = COL_GREEN }
+            if not mpOn then
+                -- 没多人模块：直接给旧版 1v1 的开 / 加入（和「旧版 1v1…」子页同一套；那块子页这时也不另显示）
+                local cp, ch
+                if isSrv then cp, ch = T("房间号，或 IP:端口 / [IPv6]:端口", "ROOM CODE, OR IP:PORT / [IPV6]:PORT"), "ABC234"
+                elseif steam then cp, ch = T("输入主机的" .. NETUI.bridgeSvc() .. " ID", "ENTER THE HOST'S " .. NETUI.bridgeSvc():upper() .. " ID"), ""
+                else cp, ch = T("房主地址（IPv6 写 [地址]:端口）", "HOST ADDRESS (IPV6: [ADDR]:PORT)"), "192.168.1.8" end
+                items[#items + 1] = { label = T("创建房间（旧版 1v1）", "HOST A ROOM (CLASSIC 1V1)"),
+                                      act = function() netuiCmd("host") end }
+                items[#items + 1] = { label = T("加入房间…（旧版 1v1）", "JOIN A ROOM... (CLASSIC 1V1)"),
+                                      act = function() editStart("join", cp, "", ch) end }
+                items[#items + 1] = { label = T("（没装多人模块：只能开 / 加入旧版 1v1 房间）",
+                                                "(NO MULTIPLAYER MODULE: CLASSIC 1V1 ROOMS ONLY)"), col = COL_ORANGE }
+            else
+                if showClassic then
+                    items[#items + 1] = { label = T("---------------- 新版房间（推荐） ----------------", "---------------- NEW ROOMS (RECOMMENDED) ----------------"), col = COL_GREEN, sep = true }
+                else
+                    items[#items + 1] = { label = "--------------------------------------------------", col = COL_GREEN, sep = true }     -- 11-19 只留线、不写字
+                end
+                -- 11-17 用户：按钮不再写人数 / "进房后可改"
+                local hostMpLabel = steam and T("创建房间（桥接）", "HOST A ROOM (BRIDGE)") or T("创建房间", "HOST A ROOM")
+                items[#items + 1] = { label = hostMpLabel,
+                                      act = function() netuiCmd("mphost", "n=" .. mpn .. "\n") end }
+                -- 加入多人房间（联机程序 mpjoin：服务器大厅认房间号或 IP，局域网认地址，桥接认 ID）
+                local mpPrompt = isSrv and T("房间号，或 IP:端口 / [IPv6]:端口", "ROOM CODE, OR IP:PORT / [IPV6]:PORT")
+                              or steam and T("输入主机的" .. NETUI.bridgeSvc() .. " ID", "ENTER THE HOST'S " .. NETUI.bridgeSvc():upper() .. " ID")
+                              or T("房主地址（IPv6 写 [地址]:端口）", "HOST ADDRESS (IPV6: [ADDR]:PORT)")
+                items[#items + 1] = { label = T("加入房间…", "JOIN A ROOM..."),
+                                      act = function() editStart("mpjoin", mpPrompt, "", isSrv and "ABC234" or steam and "" or "192.168.1.8") end }
+            end
+            items[#items + 1] = { label = "--------------------------------------------------", col = COL_GREEN, sep = true }
         end
-        -- 11-15 用户："新版的创建和加入放在旧版的上面"：旧版两行挪到多人房两行后面
+        -- 11-15 用户："新版的创建和加入放在旧版的上面"。11-18 用户："旧版的 2 个选项并入一个子项里"：
+        -- 旧版创建 / 加入收进"旧版 1v1（即将下线）…"一页；排位（hl）保持自己的开房按钮 + 加入（房号）
         local hl = UI.MODE_HOST_LABEL[mode]     -- 注册进来的方式（排位）自己的开房按钮文字
-        items[#items + 1] = { label = hl and T(hl[1], hl[2]) or T("创建房间（旧版，即将下线）", "HOST A ROOM (CLASSIC, RETIRING SOON)"), act = function() netuiCmd("host") end }
-        -- 加入房间（旧版）：服务器大厅填房间号或 IP，局域网填地址，桥接填 ID；武林盟主只有下面的"输入房间号加入"
-        if isSrv then
-            items[#items + 1] = { label = T("加入房间（旧版，即将下线）…", "JOIN A ROOM (CLASSIC, RETIRING SOON)..."),
-                                  act = function() editStart("join", T("输入房间号，或主机的 IP:端口 / [IPv6]:端口", "ROOM CODE, OR HOST IP:PORT / [IPV6]:PORT"), "", "ABC234") end }
-        elseif not NETUI.viaServer(mode) then
-            items[#items + 1] = { label = T("加入房间（旧版，即将下线）…", "JOIN A ROOM (CLASSIC, RETIRING SOON)..."),
-                                  act = function()
-                                      editStart("join", steam and T("输入主机的" .. NETUI.bridgeSvc() .. " ID", "ENTER THE HOST'S " .. NETUI.bridgeSvc():upper() .. " ID") or T("输入主机地址（IPv6 写 [地址]:端口）", "ENTER THE HOST ADDRESS (IPV6: [ADDR]:PORT)"),
-                                                "", steam and "" or "192.168.1.8")
-                                  end }
+        if hl then
+            items[#items + 1] = { label = T(hl[1], hl[2]), act = function() netuiCmd("host") end }
+            items[#items + 1] = { label = T("加入房间…（房号）", "JOIN A ROOM... (CODE)"),
+                                  act = function() editStart("join", T("输入房间号（6 位）", "ENTER THE ROOM CODE"), "", "ABC234") end }
+        elseif showClassic and mpOn then      -- 没多人模块时上面已经给了旧版开 / 加入，不再重复一个子页入口
+            items[#items + 1] = { label = T("旧版 1v1（即将下线）…", "CLASSIC 1V1 (RETIRING)..."), act = page("classic") }
         end
         for i = 1, math.min(#quick, NETUI_QUICK) do items[#items + 1] = joinItem(quick[i]) end
         items[#items + 1] = { label = T("最近一起玩过的人…", "RECENTLY PLAYED WITH..."), act = page("recent") }     -- 0.34 §3.1（§281 起只有联机记录）
-        if NETUI.viaServer(mode) then
-            items[#items + 1] = { label = T("输入房间号加入…", "JOIN BY ROOM CODE..."),
-                                  act = function() editStart("join", T("输入房间号（6 位）", "ENTER THE ROOM CODE"), "", "ABC234") end }
-            -- 原来的广域网：主机开了端口转发 / UPnP 时直接连，服务器连不上也能用（§110 武林盟主不支持：结果要经服务器记分）
-            if isSrv then
-                items[#items + 1] = { label = T("输入 IPv4 / IPv6 加入…", "JOIN BY IPV4 / IPV6..."),
-                                      act = function() editStart("join", T("输入主机的 公网IP:端口 或 [IPv6]:端口（服务器连不上时用）", "HOST PUBLIC-IP:PORT OR [IPV6]:PORT (IF THE SERVER IS DOWN)"), "", "1.2.3.4:27015") end }
-            end
-        end
+        -- 11-18 用户："房间号和 IP 加入也不会因此少功能，去掉"：服务器大厅不再单列两个快捷入口，旧版加入里都能填
         -- v0.20.1：没建房时一律不显示"复制地址 / 房间号"（用户："我没创建房间，复制功能应该是不能用的"）。
         -- v0.19.1 只对服务器大厅这样做，其他方式当时觉得建房前就有地址可复制
         local mr = UI.MODE_ROWS[mode]     -- 注册进来的方式自己的行（排位：排行榜 / 统计 / 规则说明 / 规则没到）
         if mr then mr(lb, items, page, false) end
     else
+        local SEP = "----------------------------------------"     -- 11-18 用户：房间里按组分隔
+        BASEHOOK.emit("base.roomHead", items, T, lb)      -- 房间：我是 X 号 / 对局主机（显示在第一条分隔线上面）
+        local grp = {}
         if MAPGO.check() == "ok" then     -- v0.24.1 客机、地图不同、主机地图在地图表里
-            items[#items + 1] = { label = T("前往主机所在地图（会自动存档）", "GO TO THE HOST'S MAP (AUTO-SAVES)"),
-                                  act = function() MAPGO.go(getP1(), true) end }
+            grp[#grp + 1] = { label = T("前往主机所在地图（会自动存档）", "GO TO THE HOST'S MAP (AUTO-SAVES)"),
+                              act = function() MAPGO.go(getP1(), true) end }
         end
         if MAPGO.far and sessionRole() == "client" and not MATCH.role then     -- §156
-            items[#items + 1] = { label = T("传送到主机身边", "TELEPORT TO THE HOST"), act = function() MAPGO.toHost(getP1(), true) end }
+            grp[#grp + 1] = { label = T("传送到主机身边", "TELEPORT TO THE HOST"), act = function() MAPGO.toHost(getP1(), true) end }
         end
         if CHAT.can(lb) then       -- §112 / §250.4：只有快捷语，没有自由文本
-            items[#items + 1] = { label = T("快捷语…（Delete）", "QUICK PHRASES... (DELETE)"), act = function() CHAT.open(true) end }
+            grp[#grp + 1] = { label = T("快捷语…（Delete）", "QUICK PHRASES... (DELETE)"), act = function() CHAT.open(true) end }
         end
-        BASEHOOK.emit("base.roomRows", items, T, lb, netuiCmd, netuiFlash)      -- L3：往上加的 mod 在房间里加行（观战：换下一位 / 我下去观战 / 排第几）
-        BASEHOOK.emit("base.mpRows", items, T)              -- L5：多人 mod 订阅（命数 / 时限 / 开始）
-        items[#items + 1] = { label = T("断开", "DISCONNECT"), act = function() netuiCmd("stop") end }
-        if lb.role == "host" then items[#items + 1] = copy end      -- 客机复制自己的地址没用
+        BASEHOOK.emit("base.roomRows", grp, T, lb, netuiCmd, netuiFlash)      -- L3：往上加的 mod 在房间里加行（观战：换下一位 / 我下去观战 / 排第几）
+        BASEHOOK.emit("base.mpRows", grp, T)              -- L5：多人 mod 订阅（命数 / 时限 / 开始）
+        if #grp > 0 then
+            for _, it in ipairs(grp) do items[#items + 1] = it end
+        end
+        local cp = {}
+        if lb.role == "host" then cp[#cp + 1] = copy end      -- 客机复制自己的地址没用
         if lb.role == "host" and (lb.myv6 or "") ~= "" then     -- §280 本机有公网 IPv6：不在同一个网络的朋友可以"输入 IP 直连"填它
-            items[#items + 1] = { label = T("复制我的 IPv6 地址（朋友直连用）", "COPY MY IPV6 ADDRESS (FOR DIRECT JOIN)"),
-                                  act = function() netuiCmd("copy", "v6=1\n"); netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end }
+            cp[#cp + 1] = { label = T("复制 IPv6 地址（直连用）", "COPY IPV6 (DIRECT JOIN)"),
+                            act = function() netuiCmd("copy", "v6=1\n"); netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end }
         end
-        -- 11-15 复制我的 IPv4 地址（服务器大厅房主；"输入 IPv4 / IPv6 加入"用）。公网 IPv4 只有 UPnP 成功时才知道（联机程序 lobby.txt myv4=），
-        -- 没拿到也显示这一行，点了提示要先在系统设置 → 网络与连接里打开 UPnP 并成功
+        -- 11-15 复制我的 IPv4 地址（服务器大厅房主；"输入 IPv4 / IPv6 加入"用）。公网 IPv4 只有 UPnP 成功时才知道（联机程序 lobby.txt myv4=）。
+        -- 11-18 用户："UPnP 失败提示不要常驻，点复制 IPv4 失败时再弹"：面板不再列 UPnP 状态行，只在这里按需提示。
         if lb.role == "host" and lb.mode == "server" then
             local v4 = lb.myv4 or ""
-            items[#items + 1] = { label = v4 ~= "" and T("复制我的 IPv4 地址（朋友直连用）", "COPY MY IPV4 ADDRESS (FOR DIRECT JOIN)")
-                                                 or T("复制我的 IPv4 地址（需要 UPnP 成功）", "COPY MY IPV4 ADDRESS (NEEDS UPNP)"),
-                                  act = function()
-                                      if v4 == "" then
-                                          netuiFlash(lb.upnpon == "1" and T("UPnP 还没成功（看下面的 UPnP 提示），成功后才能拿到公网 IP 地址", "UPNP HASN'T SUCCEEDED YET; THE PUBLIC IP COMES FROM UPNP")
-                                                                       or T("需要在 系统设置 → 网络与连接 里打开 UPnP 并成功，才能获取公网 IP 地址", "TURN ON UPNP (SETTINGS → NETWORK) AND LET IT SUCCEED TO GET THE PUBLIC IP"), COL_ORANGE)
-                                          return
-                                      end
-                                      netuiCmd("copy", "v4=1\n")
-                                      if lb.myv4np == "1" then
-                                          netuiFlash(T("已复制。注意：路由器报的外网地址不是公网 IP（多层路由 / 运营商 NAT），朋友可能连不进来", "COPIED. NOTE: THE ROUTER'S EXTERNAL ADDRESS ISN'T PUBLIC (DOUBLE NAT); FRIENDS MAY NOT REACH IT"), COL_ORANGE)
-                                      else netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end
-                                  end }
+            cp[#cp + 1] = { label = v4 ~= "" and T("复制 IPv4 地址（直连用）", "COPY IPV4 (DIRECT JOIN)")
+                                              or T("复制 IPv4 地址（需 UPnP）", "COPY IPV4 (NEEDS UPNP)"),
+                            act = function()
+                                if v4 == "" then
+                                    if lb.upnpon ~= "1" then
+                                        netuiFlash(T("UPnP 没开：先去 系统设置 → 网络与连接 打开", "UPNP IS OFF: TURN IT ON IN SETTINGS → NETWORK"), COL_ORANGE)
+                                    else
+                                        local why = (lb.upnp or "")
+                                        if why == "" then why = T("路由器没开 UPnP（或网络发现关了）", "ROUTER UPNP IS OFF") end
+                                        netuiFlash(T("UPnP 失败：", "UPNP FAILED: ") .. why .. T("；请在路由器里把 UDP 27015 转发到本机", "; FORWARD UDP 27015 IN YOUR ROUTER"), COL_ORANGE)
+                                    end
+                                    return
+                                end
+                                netuiCmd("copy", "v4=1\n")
+                                if lb.myv4np == "1" then
+                                    netuiFlash(T("已复制；这个地址可能不是公网 IP（多层路由 / 运营商 NAT）", "COPIED; THIS MAY NOT BE A PUBLIC IP (DOUBLE NAT)"), COL_ORANGE)
+                                else netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end
+                            end }
         end
-        NETUI.upnpInfo(lb, items)       -- §129
+        if #cp > 0 then
+            if #grp > 0 then items[#items + 1] = { label = SEP, col = COL_GREEN, sep = true } end
+            for _, it in ipairs(cp) do items[#items + 1] = it end
+        end
+        items[#items + 1] = { label = T("断开", "DISCONNECT"), act = function() netuiCmd("stop") end }
         UI.modeRowsInRoom(lb, items, page)     -- 房间里也能看注册方式自己的行（排位：排行榜 / 统计 / 规则说明；靠 rk=1 认出排位房间）
     end
     if ST.ext then ST.ext.rows("main", items, lb) end                                      -- X1 扩展包加在首页的行
@@ -8615,12 +9112,18 @@ function BASEUI.modKeys(S, name)     -- 这个玩法的同意键：manifest cons
     return keys
 end
 function BASEUI.modState(S, m)
-    local st = m.state == "on" and T("已加载", "LOADED") or m.state == "off" and T("已停用", "DISABLED") or T("没加载", "NOT LOADED")
+    -- 状态说的是"这次游戏里加载了没有"；点了开关还没重启时不能写成"已停用 / 已启用"（用户 11-19：
+    -- "设置启用后这里应该显示未加载，而不是已停用"）。状态和按钮都按同一份 want 算，免得上面写停用、下面按钮也是停用。
+    local on = m.state == "on"
+    local st = on and T("已加载", "LOADED") or m.state == "off" and T("已停用", "DISABLED") or T("没加载", "NOT LOADED")
     local pend = false
     if m.name ~= "base" then
         local want = BASEUI.wanted(S, m.name)
-        pend = want ~= (m.state == "on")
-        if pend then st = st .. (want and T("（重启游戏后启用）", " (ENABLED AFTER RESTART)") or T("（重启游戏后停用）", " (DISABLED AFTER RESTART)")) end
+        pend = want ~= on
+        if pend then
+            st = want and T("未加载（重启游戏后加载）", "NOT LOADED (LOADS AFTER RESTART)")
+                      or T("已加载（重启游戏后停用）", "LOADED (DISABLES AFTER RESTART)")
+        end
     end
     return st, pend
 end
@@ -8632,7 +9135,7 @@ UI.page("mods", function(lb, tn, items, page)
     local S = FORNET and FORNET.modsys
     local X = EXTCTX or {}
     local C = X.COL or {}
-    items[#items + 1] = { label = T("玩法 mod（mods\\<名>\\）：点进去看说明 / 条款 / 启用停用，改了重启游戏生效", "GAME MODES (MODS\\<NAME>\\): OPEN ONE FOR INFO / TERMS / ON-OFF; CHANGES APPLY AFTER A RESTART"), col = C.label }
+    items[#items + 1] = { label = T("已装的玩法：点进去看说明 / 条款 / 开关（改后重启生效）", "GAME MODES: OPEN ONE FOR INFO / TERMS / ON-OFF (RESTART TO APPLY)"), col = C.label }
     for _, m in ipairs(S and S.status() or {}) do
         local st, pend = BASEUI.modState(S, m)
         local title = T(m.title or m.name, m.titleEn or m.title or m.name)
@@ -8653,13 +9156,18 @@ UI.pagePrefixReg("modinfo:", function(lb, tn, items, page)
     local m = BASEUI.modOf(S, ((X.NETUI and X.NETUI.page) or ""):match("^modinfo:(.+)$"))
     if not m then items[#items + 1] = { label = T("返回", "BACK"), act = page("mods") }; return end
     local st, pend = BASEUI.modState(S, m)
+    local on = m.state == "on"
+    local want = m.name ~= "base" and BASEUI.wanted(S, m.name) or on
     items[#items + 1] = { label = string.format("■ %s  v%s  %s", T(m.title or m.name, m.titleEn or m.title or m.name), tostring(m.version), st),
-                          col = pend and C.orange or m.state == "on" and C.green or C.label }
-    if pend then items[#items + 1] = { label = "  " .. T("需要重启游戏才生效", "RESTART THE GAME TO APPLY"), col = C.orange } end
+                          col = pend and C.orange or on and C.green or C.label }
+    if pend then
+        items[#items + 1] = { label = "  " .. (want and T("请重启游戏加载", "RESTART THE GAME TO LOAD IT")
+                                                    or T("请重启游戏生效", "RESTART THE GAME TO APPLY")), col = C.orange }
+    end
     if m.why and m.state ~= "off" then items[#items + 1] = { label = "  " .. tostring(m.why), col = C.orange } end
     local keys = BASEUI.modKeys(S, m.name)
     if #keys > 0 then
-        items[#items + 1] = { label = T("启用这个玩法 = 同意下面这些条款（点开看全文）：", "ENABLING THIS MODE = AGREEING TO THESE TERMS (OPEN TO READ):"), col = C.label }
+        items[#items + 1] = { label = T("启用 = 同意这些条款（点开看全文）：", "ENABLING = AGREEING TO THESE TERMS (OPEN TO READ):"), col = C.label }
         CONSENT.titleRows(items, keys)
     end
     for _, pg in ipairs(BASEUI.pages[m.name] or {}) do
@@ -8671,15 +9179,20 @@ UI.pagePrefixReg("modinfo:", function(lb, tn, items, page)
         if not ok then out("!! 玩法 mod %s 的说明行出错：%s", m.name, tostring(err)) end
     end
     if m.name ~= "base" then     -- 基础联机包停了，这个面板也就没了；真要停就删它目录里的 on.txt
-        local want = BASEUI.wanted(S, m.name)
         local missing = false
         for _, k in ipairs(keys) do if not CONSENT.has(k) then missing = true end end
         if want and missing then
-            items[#items + 1] = { label = T("同意上面的条款", "AGREE TO THE TERMS ABOVE"),
+            items[#items + 1] = { label = T("同意上面的条款", "AGREE TO THE TERMS"),
                                   act = function() CONSENT.grantKeys(keys); out("玩法 mod %s：同意 %s", m.name, table.concat(keys, ",")) end }
         end
-        local lbl = want and (#keys > 0 and T("停用（同时撤回上面的同意，重启游戏生效）", "DISABLE (ALSO WITHDRAWS THE TERMS; RESTART TO APPLY)") or T("停用（重启游戏生效）", "DISABLE (RESTART TO APPLY)"))
-                    or (#keys > 0 and T("同意上面的条款并启用（重启游戏生效）", "AGREE TO THE TERMS AND ENABLE (RESTART TO APPLY)") or T("启用（重启游戏生效）", "ENABLE (RESTART TO APPLY)"))
+        -- 点了还没重启（on.txt 和这次加载状态对不上）时按钮写清是"取消这次启用"，不要写"停用"让人以为在关一个已启用的
+        local lbl
+        if want and not on then     -- 点了启用、还没重启：按钮是"取消这次启用"，不是"停用"
+            lbl = #keys > 0 and T("取消启用（撤回同意）", "CANCEL ENABLE (WITHDRAW TERMS)") or T("取消启用", "CANCEL ENABLE")
+        else
+            lbl = want and (#keys > 0 and T("停用（同时撤回同意，重启生效）", "DISABLE (ALSO WITHDRAWS TERMS; RESTART)") or T("停用（重启生效）", "DISABLE (RESTART)"))
+                        or (#keys > 0 and T("同意并启用（重启生效）", "AGREE AND ENABLE (RESTART)") or T("启用（重启生效）", "ENABLE (RESTART)"))
+        end
         items[#items + 1] = { label = lbl,
                               act = function()
                                   local f = S.onFile(m.name)
@@ -8843,7 +9356,7 @@ end
 function CHAT.recvText(rest)
     if CHAT.textWarned == CHAT.peer then return end
     CHAT.textWarned = CHAT.peer
-    CHAT.add(nil, T("对方的模组是旧版，发来的文字聊天不再显示", "PEER RUNS AN OLD VERSION; TYPED CHAT IS NO LONGER SHOWN"), "sys")
+    CHAT.add(nil, T("对方模组太旧，文字聊天不显示", "PEER RUNS AN OLD VERSION; TYPED CHAT IS NO LONGER SHOWN"), "sys")
 end
 
 -- Delete 键 / 面板按钮：打开面板翻到快捷语页。面板关着时先打开，发完一句后再关上（CHAT.autoClose）
@@ -9030,6 +9543,21 @@ local function guiTick(v)
         local nav = {}
         for i, it in ipairs(items) do if it.nav then nav[it.nav] = { it = it, i = i } end end
         guiLabel(GUI.pageNo, string.format(T("第 %d / %d 页", "PAGE %d / %d"), v.roomPage or 1, v.pages or 1), COL_WHITE)
+        -- 11-18 房间列表：进入方式做成翻页栏里的小按钮（上场 / 只观战）
+        if GUI.enterMode then
+            guiVis(GUI.enterMode, v.rooms and 0 or 1)
+            if v.rooms then
+                local w = NETUI.roomWatch == true
+                guiLabel(GUI.enterMode, w and T("进入方式：只观战", "ENTER: SPECTATE") or T("进入方式：上场", "ENTER: PLAY"), COL_WHITE)
+                guiBg(GUI.enterMode, GUI.enterMode.hov and BG_HOVER or BG_ROW)
+                if guiClicked(GUI.enterMode) then
+                    NETUI.roomWatch = not w
+                    netuiCmd("specq", "on=" .. (w and "0" or "1") .. "\n")
+                    netuiFlash(w and T("进入方式：上场", "ENTER AS: PLAY") or T("进入方式：只观战", "ENTER AS: SPECTATE"))
+                    return
+                end
+            end
+        end
         for _, k in ipairs({ "prev", "next", "filter", "back" }) do
             local p, n = GUI[k], nav[k]
             if p then
@@ -9109,6 +9637,9 @@ local function guiTick(v)
         local scrolled = body < nRows
         local i = scrolled and (off + ri - 1) or ri
         local it = items[i]
+        -- 11-19 用户："分割线要居中"：分隔行在按钮里居中，普通行仍靠左（只改对齐，不动坐标）
+        local wantJ = (it and it.sep) and 2 or 1
+        if r.s and r.just ~= wantJ then r.just = wantJ; pcall(function() r.s:SetHorizontalAlignment(wantJ) end) end
         if scrolled and (ri == 1 or ri == nRows) then
             local up = ri == 1
             local more = up and off or (nItems - off - body)
@@ -9128,7 +9659,7 @@ local function guiTick(v)
         else
             guiVis(r, it.act and 0 or 3)
             if it.act then
-                guiLabel(r, it.label, COL_WHITE)
+                guiLabel(r, it.label, UI.netuiItemCol(it) or COL_WHITE)     -- 11-18 结束 / 退出类按钮红字（其余照旧白）
                 local clicked = guiClicked(r)
                 if r.entered then NETUI.sel = i; NETUI.selTarget = nil end    -- 鼠标移上去 = 选中（键盘接着从这里走）
                 guiBg(r, (r.down and BG_DOWN) or (i == NETUI.sel and BG_SEL) or (r.hov and BG_HOVER) or BG_ROW)
@@ -10893,6 +11424,116 @@ function OPPBAR.step(tn)
     end
 end
 
+-- ============================================================ §406 破军冲锋减伤（改成真正削承伤倍率）
+
+-- §406 破军冲锋减伤：改成真正削承伤倍率（§269.25 那版是给攻击方补攻击力，实测冲锋中 m=0 时无效，已整段撤掉）。
+-- 资产：DB 挂 GE_PoJun_ChargeDamageReduction（Physical / ImpactShachi ×0.2）和 GE_StrongDefence（×0.7）；
+-- 铸魂 Evolution 后 DB 还挂 GE_IgnoreAllDamage（五个承伤倍率 Override 0 = 完全免伤，实测起手约 1.8 秒）。
+-- 做法：不撤 GE、也不动攻击力，只在冲锋期间把**挨打方自己**的承伤倍率当前值改成
+--   m0 × (1 − r × keep)：m0 = 不在冲锋时的值（每 3 帧空闲时刷新，饰品 / 护体都算进去），
+--   m = 冲锋中游戏算出来的值，r = 1 − m/m0 是原减伤，keep = 数值表 co= 的 PoJunDR（默认 0.25）。
+--   只写 CurrentValue（BaseValue 不动，游戏重算时还能回到原样）；结束后写回 m0（游戏自己重算过就不写）。
+-- 只在武器平衡开着（BAL.active）且交手中（NET.fighting）时做。另：结束后 0.3 秒还有 EndurePhase → 撤 GE（§269.25 的"用一次一直减伤"兜底）。
+PJ = { GA = { GA_Hun_PoJun_DB_C = true, GA_Hun_PoJun_DB_02_C = true },
+       ATTR = { "TakenReductionMultiplier_Physical", "TakenReductionMultiplier_Elemental", "TakenReductionMultiplier_ImpactShachi" },
+       TAG = "CharacterState.AbilityState.PoJun.EndurePhase",
+       GE = "/PBZCombatAsset/ActorData/Players/Hun/Weapon/PoJun/GE_PoJun_ChargeDamageReduction.GE_PoJun_ChargeDamageReduction_C",
+       on = false, base = {}, want = {}, r = {}, checkAt = nil, logged = false, n = 0, removed = 0, skipped = 0 }
+function PJ.keep()
+    local v = tonumber(BAL.cost("PoJunDR"))
+    if not v then v = 0.25 end
+    if v < 0 then v = 0 elseif v > 1 then v = 1 end
+    return v
+end
+function PJ.inCharge()
+    local abs = ST.watch and ST.watch.p1 and ST.watch.p1.abs
+    if type(abs) ~= "table" then return false end
+    for n in pairs(PJ.GA) do if abs[n] then return true end end
+    return false
+end
+-- 不在冲锋时刷新 m0（当前值 = 那时游戏算出来的承伤倍率）
+function PJ.readBase(p1)
+    for _, n in ipairs(PJ.ATTR) do
+        local m = attrOf(p1, n)
+        if type(m) == "number" and m > 0.001 then PJ.base[n] = m end
+    end
+end
+function PJ.scale(p1)
+    local keep, done = PJ.keep(), {}
+    for _, n in ipairs(PJ.ATTR) do
+        local m0, m = PJ.base[n], attrOf(p1, n)
+        if m0 and type(m) == "number" and m < m0 - 0.0001 then
+            if not PJ.want[n] or math.abs(m - PJ.want[n]) > 0.0001 then PJ.r[n] = 1 - m / m0 end
+            local r = PJ.r[n] or 0
+            local want = m0 * (1 - r * keep)
+            PJ.want[n] = want
+            if math.abs(m - want) > 0.001 then
+                local ok = G.setAttrCur and G.setAttrCur(p1, n, want) or setAttr(p1, n, want)
+                if ok then done[#done + 1] = string.format("%s %.2f→%.2f（原减伤 %.0f%%）",
+                    (n:gsub("TakenReductionMultiplier_", "")), m, want, r * 100) end
+            end
+        end
+    end
+    if #done > 0 and not PJ.logged then
+        PJ.logged = true
+        out("§406 破军冲锋减伤：保留原减伤的 %.0f%%（co= PoJunDR）；%s", keep * 100, table.concat(done, "，"))
+    end
+end
+-- 结束 / 中途改设置：把写过的那几个写回 m0（游戏自己重算过就不碰）
+function PJ.clearWant(p1, restore)
+    for _, n in ipairs(PJ.ATTR) do
+        local w, m0 = PJ.want[n], PJ.base[n]
+        if restore and w and m0 then
+            local cur = attrOf(p1, n)
+            if type(cur) == "number" and math.abs(cur - w) < 0.01 then
+                if G.setAttrCur then G.setAttrCur(p1, n, m0) else setAttr(p1, n, m0) end
+            end
+        end
+        PJ.want[n], PJ.r[n] = nil, nil
+    end
+end
+function PJ.tagLeft(p1)
+    if not (G.tagsMatching and valid(p1)) then return nil end
+    local ok, t = pcall(G.tagsMatching, p1, { PJ.TAG })
+    if not ok or type(t) ~= "table" or #t == 0 then return nil end
+    return table.concat(t, ",")
+end
+function PJ.step(p1, tn)
+    if not valid(p1) then PJ.on, PJ.want, PJ.r, PJ.checkAt = false, {}, {}, nil; return end
+    if PJ.inCharge() then
+        if not PJ.on then PJ.on, PJ.logged, PJ.n = true, false, PJ.n + 1 end
+        if BAL.active() and NET.fighting() and PJ.keep() < 1 then
+            if not next(PJ.base) then
+                if PJ.skipped < 3 then
+                    PJ.skipped = PJ.skipped + 1
+                    out("§406 破军冲锋减伤：还没记到基础承伤（不在冲锋时没读到），这次不削")
+                end
+            else
+                PJ.scale(p1)
+            end
+        elseif PJ.want[PJ.ATTR[1]] then
+            PJ.clearWant(p1, true)      -- 打到一半把武器平衡关了 / 离开交手 / keep 改成 1：写回去
+        end
+    else
+        if PJ.on then
+            PJ.on = false
+            PJ.clearWant(p1, true)
+            PJ.checkAt = tn + 0.3
+        end
+        PJ.readBase(p1)
+    end
+    if PJ.checkAt and tn >= PJ.checkAt then
+        PJ.checkAt = nil
+        local left = PJ.tagLeft(p1)
+        if left then
+            PJ.removed = PJ.removed + 1
+            out("§406 破军冲锋结束 0.3 秒后减伤还挂着（%s），撤掉（第 %d 次）", left, PJ.removed)
+            LO.removeGE(p1, PJ.GE, "§406 撤破军冲锋减伤")
+        end
+    end
+end
+-- §406 end
+
 -- ============================================================ 主循环
 
 local function onTick()
@@ -10947,6 +11588,7 @@ local function onTick()
     if ST.ticks % 3 == 0 then
         local monPrev = ST.watch.p1.montage
         watchActor("玩家1", p1, ST.watch.p1)
+        FMATCH.guard(PJ, "err", "§406 破军冲锋减伤", PJ.step, p1, now())   -- 冲锋期间按 co= PoJunDR 改自己的承伤倍率
         -- 玩家1 当前武器 = 最近一次新激活的、能认出武器族的技能
         local abs = ST.watch.p1.abs
         if abs then
@@ -10972,6 +11614,7 @@ local function onTick()
     if ST.ticks % 30 == 0 then
         hpTraceStep()
         keepPuppetAlive()
+        if ZMC then FMATCH.guard(ZMC, "err", "§372 斩马刀自伤守门", ZMC.step, now()) end   -- §389.1 交手中补扫实例 / 虚血结算延后；对局外写回
         if REP.on and REP.lastErr then out("回放跟随误差 %.0f", REP.lastErr) end
     end
 end
@@ -11605,6 +12248,7 @@ function ST.mpLock(on, what)
 end
 BASEHOOK.on("base.session", function(was, kv)
     if ST.mpLockHeld and (kv and kv.role or "none") == "none" then ST.mpLock(false, "离开房间") end     -- 多人房 connected 不一定是 1（换房主时 role 也会变），只认离开
+    if MATCH.uiSync then MATCH.uiSync("联机会话变化") end     -- §260 兜底：离开房间 / 换房主 / 掉线时重算一次（幂等）
 end)
 -- 多人混战 / 2v2 单机原型（pbz_multi.lua）：小键盘 / 开关、小键盘 . 换模式（观战原型以前用这两个键，现在没绑）。
 -- 文件不在（发布包不带）就不绑。包一层函数：主代码块的 local 已满
@@ -11735,6 +12379,13 @@ function BASEX.multiCtx()
                 unshield = function(p1) return RT.unshield(p1) end,
                 deadHp = DEAD_HP,
                 bestOf = NET.bestOf,
+                boCfg = function() return NET.boCfg end,
+                boSet = function(n) NET.boSet(n) end,
+                boNext = NET.boNext,
+                tlCfg = function() return NET.resCfg.tl end,
+                tlSet = function(n) NET.resSet("tl", n) end,
+                tlNext = function(n) return NET.resNext("tl", n) end,
+                resText = NET.resText,
                 toWin = NET.toWin,
                 tlLimit = RT.limit,
                 rdyTimeout = function()
@@ -11800,3 +12451,5 @@ for _, kb in ipairs({ { "PAGE_UP", "up" }, { "PAGE_DOWN", "down" }, { "END", "ok
         M4.netui(kb[2])
     end, "联机面板 " .. kb[2], true)
 end
+
+

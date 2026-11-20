@@ -1215,7 +1215,12 @@ end
 --    补漏（事件触发）：交手中我放出斩马刀招时还没改（开局那一下没拿到角色）→ 补改；不在对局里还改着（没走 rulesEnd）→ 补写回；
 --    载入后第一次在单机放斩马刀招时核对一次默认对象（重载模组丢了原值、默认对象还是 0 → 按游戏数据写回）。
 ZMC = { PAT = "^GA_Hun_ZhanMa_", PROP = "HealthCostPercent", LOGS = 40, logs = 0, active = false, checked = false,
-        orig = {}, cdos = {},
+        orig = {}, cdos = {}, cdo = {}, cdoAt = {}, cdoNames = nil, RETRY = 5.0,
+        -- §389.1 修正：技能格读不到 / 实例在开打前就建好了 → 只改默认对象没用，还要按类名 FindAllOf 直接改**活着的实例**。
+        -- insts: 实例 → { name, orig }（弱表，别把 UObject 拖住）；dly: 斩马刀被动实例 → 原结算延迟（弱表）
+        insts = setmetatable({}, { __mode = "k" }), dly = setmetatable({}, { __mode = "k" }),
+        DELAY_PROP = "VirtualDamageDealtDelay", DELAY = 3600.0, DEF_DELAY = 12.0,
+        dlyOn = false, dlyStuck = false, sweepAt = 0, SWEEP = 3.0,
         -- 游戏数据（_tools/gasgraph/招式技能字段.jsonl，build 26266538）：读到的默认对象已经是 0（上次没写回 / 重载了模组）时按这个写回
         DEF = { GA_Hun_ZhanMa_HeavyAttack_Base_C = 0.05, GA_Hun_ZhanMa_B_C = 0.1, GA_Hun_ZhanMa_BB_C = 0.15, GA_Hun_ZhanMa_AB_C = 0.2,
                 GA_Hun_ZhanMa_AAB_C = 0.225, GA_Hun_ZhanMa_AAAB_C = 0.25, GA_Hun_ZhanMa_B_Dash_C = 0.1, GA_Hun_ZhanMa_B_DashDraw_C = 0.1,
@@ -1237,16 +1242,168 @@ function ZMC.setOn(o, v)
     return 0, 1
 end
 function ZMC.shortName(n) return (n:gsub("^GA_Hun_ZhanMa_", ""):gsub("_C$", "")) end
+-- §389 补 §372 漏的两种情况（内测第七轮仍报"重击掉看不见的血、对决胜因 HP 归零判负"）：
+--   ① 开局时技能格里还没有那些招（换武器 / 对局中途才给技能、多人房换角色）→ 默认对象没改到，
+--      之后新给的实例从默认对象复制，照样 > 0；而 ZMC.active 已经是 true，原来的 onAbility 只补"不在对局"的情况，不再补改。
+--   ② 有些重击是别的技能临场给的（不在 ActivatableAbilities.Items 里，或给出来就收掉），技能格永远扫不到。
+-- 做法：除了技能格里的默认对象 / 实例，再按类名把**整个类的默认对象**（CDO）也写 0（所有斩马刀招，读到数字属性才动），
+-- 对局中每次放斩马刀招都幂等补一遍（有新实例 / 新类就补上）。默认对象改了，对局里新生成的实例就是 0；
+-- 结束还是按记下的原值写回（CDO 和技能格两路都写回）。扫不到类 / 读不到 CDO 不报错、也不改。
+function ZMC.nameList()
+    if ZMC.cdoNames then return ZMC.cdoNames end
+    local seen, list = {}, {}
+    for n in pairs(ZMC.DEF) do if not seen[n] then seen[n] = true; list[#list + 1] = n end end
+    local okI, idx = pcall(function() return LO.index and LO.index() or nil end)
+    for n in pairs((okI and type(idx) == "table" and idx.map) or {}) do
+        if n:find(ZMC.PAT) and not seen[n] then seen[n] = true; list[#list + 1] = n end
+    end
+    table.sort(list)
+    ZMC.cdoNames = list
+    return list
+end
+-- 一个类的默认对象（拿到了就记住；没拿到 = 资产还没载入 / 对局中才载入，过 RETRY 秒再试，别一次就永远放弃）
+function ZMC.classCdo(n)
+    local c = ZMC.cdo[n]
+    if c ~= nil then return c or nil end
+    local tn = now()
+    local at = ZMC.cdoAt[n]
+    if at and tn - at < ZMC.RETRY then return nil end
+    local ok, o = pcall(function() return LO.cdoByName and LO.cdoByName(n) or nil end)
+    o = (ok and valid(o)) and o or nil
+    if o then ZMC.cdo[n] = o else ZMC.cdoAt[n] = tn end
+    return o
+end
+-- 把一个不在技能格里的招的默认对象也改成 0；返回 改了, 失败
+function ZMC.patchCdo(n)
+    if ZMC.cdos[n] then return 0, 0 end
+    local o = ZMC.classCdo(n)
+    if not o then return 0, 0 end
+    local cur = rawProp(o, ZMC.PROP)
+    if type(cur) ~= "number" then return 0, 0 end
+    if ZMC.orig[n] == nil then ZMC.orig[n] = cur > 0 and cur or ZMC.DEF[n] end
+    ZMC.cdos[n] = o
+    return ZMC.setOn(o, 0)
+end
+-- 有自伤的招（ZMC.DEF 的键 = 重击一路：B / BB / AB / AAB / AAAB / Dash / Air …）；轻击没有 HealthCostPercent，不扫
+function ZMC.heavyList()
+    local list = {}
+    for n in pairs(ZMC.DEF) do list[#list + 1] = n end
+    table.sort(list)
+    return list
+end
+-- 某类活着的对象：走适配层 LO.liveInsts（游戏反射收在 pbz_game.lua，main / 基础包里不直接 FindAllOf）
+local function instList(n)
+    local ok, list = pcall(function() return LO.liveInsts and LO.liveInsts(n) or {} end)
+    return (ok and type(list) == "table") and list or {}
+end
+-- §389.1 修根因：开打前就建好的技能实例不会跟着默认对象变（实例在 grant 时已从 CDO 复制过一份），
+-- 而 costSpecs 在多人房 / 对决里经常"读不到我的技能格"（日志 11-18 20:22 起多次），只改 CDO 等于没改。
+-- 这里按类名 FindAllOf 把**所有活着的实例**里的 HealthCostPercent 也写 0；弱表记原值，结束时写回。
+-- 返回 改了, 失败, 找到的实例数（没有数字属性的对象不算）
+function ZMC.patchInst(n)
+    local list = instList(n)
+    local ch, bad, nf = 0, 0, 0
+    for _, o in ipairs(list) do
+        if valid(o) then
+            local cur = rawProp(o, ZMC.PROP)
+            if type(cur) == "number" then
+                nf = nf + 1
+                local rec = ZMC.insts[o]
+                if not rec then
+                    local want = ZMC.orig[n]
+                    if not (want and want > 0) then want = cur > 0 and cur or ZMC.DEF[n] end
+                    if want == nil then want = cur end
+                    ZMC.insts[o] = { name = n, orig = want }
+                    if ZMC.orig[n] == nil then ZMC.orig[n] = want end
+                end
+                local c, b = ZMC.setOn(o, 0)
+                ch, bad = ch + c, bad + b
+            end
+        end
+    end
+    return ch, bad, nf
+end
+-- §389.1 兜底：把斩马刀被动的虚血结算延迟临时拉到 1 小时。HealthCostPercent 万一还有一条路没改到
+-- （新实例、别的技能临场给的招），虚血也不会在对局里 12 秒后结算成真血 / 把人打死。
+-- 只动"读得到数字、比目标小"的被动实例；原值记在弱表里，对局结束（身上没虚血时）写回 12 秒。
+function ZMC.delaySet(v)
+    local n = 0
+    local function one(o)
+        if not valid(o) then return end
+        local cur = rawProp(o, ZMC.DELAY_PROP)
+        if type(cur) == "number" and cur < v then
+            if ZMC.dly[o] == nil then ZMC.dly[o] = cur end
+            pcall(function() o[ZMC.DELAY_PROP] = v end)
+            if rawProp(o, ZMC.DELAY_PROP) == v then n = n + 1 end
+        end
+    end
+    for _, o in ipairs(instList("GA_ZhanMa_Passive_C")) do one(o) end
+    local okC, cdo = pcall(function() return LO.cdoByName and LO.cdoByName("GA_ZhanMa_Passive_C") or nil end)
+    if okC then one(cdo) end                                                     -- 类默认对象（实例还没建出来时也先改）
+    return n
+end
+function ZMC.delayOn(tn)
+    if ZMC.dlyOn then return 0 end
+    local n = ZMC.delaySet(ZMC.DELAY)
+    if n > 0 then
+        ZMC.dlyOn = true
+        ZMC.log("§372 交手中把斩马刀重击的虚血结算延后（%s：%d 个被动，%s → %.0f 秒）（§389.1）",
+            tostring(tn and "对局中" or ""), n, tostring(ZMC.DEF_DELAY), ZMC.DELAY)
+    end
+    return n
+end
+function ZMC.delayOff(why, tn)
+    if not ZMC.dlyOn then return end
+    local p1 = getP1()
+    local vd = UICH.vd(p1)
+    if vd and vd > 0.005 then
+        -- 身上还有虚血：现在恢复 12 秒，它会在对局外结算成真掉血 → 先挂着，等虚血清掉再恢复（ZMC.step）
+        ZMC.dlyStuck = true
+        ZMC.log("§372 对局结束身上还有 %.0f%% 虚血，先不恢复 %.0f 秒结算（不让它在对局外掉血）（%s）",
+            vd * 100, ZMC.DEF_DELAY, tostring(why))
+        return
+    end
+    local n, bad = 0, 0
+    for o, orig in pairs(ZMC.dly) do
+        if valid(o) then
+            pcall(function() o[ZMC.DELAY_PROP] = orig end)
+            if rawProp(o, ZMC.DELAY_PROP) == orig then n = n + 1 else bad = bad + 1 end
+        end
+    end
+    ZMC.dly = setmetatable({}, { __mode = "k" })
+    ZMC.dlyOn, ZMC.dlyStuck = false, false
+    if n > 0 or bad > 0 then
+        ZMC.log("§372 斩马刀重击自伤写回（%s）：虚血结算恢复 %.0f 秒（%d 个被动%s）", tostring(why), ZMC.DEF_DELAY, n,
+            bad > 0 and ("，!! 失败 " .. bad .. " 个") or "")
+    end
+end
+-- 主循环每 30 帧调一次：交手中补扫实例 + 确认结算延迟；对局外等虚血清掉后把延迟写回
+function ZMC.step(tn)
+    if ZMC.active and ZMC.inMatch() then
+        if NET.fighting and NET.fighting() then
+            if not ZMC.dlyOn then ZMC.delayOn(tn) end
+            if tn - (ZMC.sweepAt or 0) >= ZMC.SWEEP then
+                ZMC.sweepAt = tn
+                for _, n in ipairs(ZMC.heavyList()) do ZMC.patchInst(n) end
+                ZMC.delaySet(ZMC.DELAY)                                             -- 换武器 / 新被动实例也补上
+            end
+        end
+    elseif ZMC.dlyStuck then
+        local vd = UICH.vd(getP1())
+        if not vd or vd <= 0.005 then ZMC.delayOff("虚血清掉了", tn) end
+    end
+end
 -- ① 对局开始（倒计时 / 开打都调，幂等：没有要改的就不记日志）
-function ZMC.apply(p1, why)
+-- onlyName：只补这一招（主循环看到"放了某个斩马刀招"时用，避免每次出招都扫全部类）
+function ZMC.apply(p1, why, onlyName)
     if not valid(p1) then p1 = getP1() end
     if not valid(p1) then return nil end
     ZMC.active = true
     UICH.matched = true
     local specs = LO.costSpecs and LO.costSpecs(p1, ZMC.PAT, ZMC.PROP)
-    if not specs then ZMC.log("!! §372 斩马刀重击自伤：读不到我的技能格（%s）", tostring(why)); return nil end
-    local ch, bad, names = 0, 0, {}
-    for _, s in ipairs(specs) do
+    if not specs and not onlyName then ZMC.log("!! §372 斩马刀重击自伤：读不到我的技能格（%s），改成按类名扫实例 + 默认对象", tostring(why)) end
+    local ch, bad, nInst, names = 0, 0, 0, {}
+    for _, s in ipairs(specs or {}) do
         if ZMC.orig[s.name] == nil then
             local o = s.cdoV
             if not (o and o > 0) then o = ZMC.DEF[s.name] end
@@ -1262,12 +1419,23 @@ function ZMC.apply(p1, why)
         if c > 0 or b > 0 then names[#names + 1] = string.format("%s %s→0%s", ZMC.shortName(s.name), tostring(ZMC.orig[s.name]),
             b > 0 and "（失败 " .. b .. "）" or "") end
     end
+    -- §389.1 技能格读不到 / 实例早于开打就建好：按类名直接改活着的实例（grid 里已经改过的会幂等返回 0）
+    for _, n in ipairs(onlyName and { onlyName } or ZMC.nameList()) do
+        local c, b = ZMC.patchCdo(n)                                            -- 不在技能格 / 对局中才给的招
+        local ci, bi, ni = ZMC.patchInst(n)                                     -- 已经建好的实例
+        ch, bad, nInst = ch + c + ci, bad + b + bi, nInst + ni
+        if c > 0 or b > 0 then names[#names + 1] = string.format("%s %s→0（默认对象）%s", ZMC.shortName(n), tostring(ZMC.orig[n]),
+            b > 0 and ("（失败 " .. b .. "）") or "") end
+        if ci > 0 or bi > 0 then names[#names + 1] = string.format("%s %s→0（实例）%s", ZMC.shortName(n), tostring(ZMC.orig[n]),
+            bi > 0 and ("（失败 " .. bi .. "）") or "") end
+    end
     if ch > 0 or bad > 0 then
         local vd = UICH.vd(p1)
-        ZMC.log("§372 交手中斩马刀重击不扣自己血（%s）：HealthCostPercent 改了 %d 处%s：%s%s", tostring(why), ch,
-            bad > 0 and ("，!! 失败 " .. bad .. " 处") or "", table.concat(names, "，"),
+        ZMC.log("§372 交手中斩马刀重击不扣自己血（%s）：HealthCostPercent 改了 %d 处（其中实例 %d 个）%s：%s%s", tostring(why), ch,
+            nInst, bad > 0 and ("，!! 失败 " .. bad .. " 处") or "", table.concat(names, "，"),
             vd and string.format("；开局时身上虚血 %.0f%%", vd * 100) or "")
     end
+    ZMC.delayOn()                                                               -- §389.1 兜底：交手中先别结算成真血
     return ch, bad
 end
 -- ① 对局结束：写回原值（默认对象按记下的写；实例按现在技能格里的写）。没记过原值、现在又是 0 的按游戏数据（重载模组那种）
@@ -1286,6 +1454,9 @@ function ZMC.restore(p1, why)
     for name, cdo in pairs(ZMC.cdos) do
         if valid(cdo) then put(name, cdo, rawProp(cdo, ZMC.PROP)) end
     end
+    for inst, rec in pairs(ZMC.insts) do                                                -- §389.1 直接改过的实例
+        if valid(inst) then put(rec.name, inst, rawProp(inst, ZMC.PROP)) end
+    end
     local specs = valid(p1) and LO.costSpecs and LO.costSpecs(p1, ZMC.PAT, ZMC.PROP) or {}
     for _, s in ipairs(specs) do
         put(s.name, s.cdo, s.cdoV)
@@ -1298,6 +1469,9 @@ function ZMC.restore(p1, why)
         ZMC.log("§372 斩马刀重击自伤写回（%s）：%d 处%s：%s", tostring(why), ch, bad > 0 and ("，!! 失败 " .. bad .. " 处") or "",
             table.concat(list, "，"))
     end
+    ZMC.cdos = {}          -- §389 下一场重新补；orig 留着（原值不会再变，重载模组会重记）
+    ZMC.insts = setmetatable({}, { __mode = "k" })                                  -- §389.1 下一场重新扫实例
+    ZMC.delayOff(why, nil)                                                          -- §389.1 恢复虚血结算（身上还有虚血就等清掉）
     return ch, bad
 end
 -- 事件：我新放出一个技能（主循环看到"+技能"那一下，单机也走）
@@ -1306,8 +1480,10 @@ function ZMC.onAbility(n, tn)
     local inM = ZMC.inMatch()
     if ZMC.active and not inM then
         ZMC.restore(nil, "不在对局里了，补写回")
-    elseif not ZMC.active and inM and NET.fighting and NET.fighting() then
-        ZMC.apply(nil, "交手中放了 " .. ZMC.shortName(n) .. "，开局没改上，补改")
+    elseif inM and NET.fighting and NET.fighting() then
+        -- §389 对局中一律幂等补改（原来只在 not ZMC.active 时补）：换武器 / 中途才给的招 / 新生成的实例
+        -- 不会因为"开局已经改过"就漏掉。没有要改的就不记日志。§389.1：只补这一招 + 它的活实例，别每次出招扫全部类。
+        ZMC.apply(nil, "交手中放了 " .. ZMC.shortName(n) .. (ZMC.active and "，补改新拿到的招 / 实例" or "，开局没改上，补改"), n)
     end
     if not inM and ZMC.DEF[n] then
         if not ZMC.checked then ZMC.checked = true; ZMC.restore(nil, "载入后第一次放斩马刀重击，核对") end

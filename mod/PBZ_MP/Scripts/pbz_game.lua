@@ -1257,6 +1257,40 @@ function LO.cdoNums(path, names)
     return t
 end
 
+-- §389 按技能类名拿整个类的默认对象（CDO）：pbz_abilities 里是 "<包路径>.<类名>_C"，
+-- CDO 是 "<包路径>.Default__<类名>_C"（和 §349 LO.cdoNums 读的写法一样）。给 §372 / §389 补"不在技能格里的招"用。
+-- allowLoad 默认不加载：对局开始时把整把武器的技能资产全 LoadAsset 一次会卡；类没载入就跳过，等它真被放出来
+-- （那时资产已载入）再由 onAbility 补。true 时找不到才 LoadAsset 一次（测试 / 手动排查用）。
+-- 【适配】require("pbz_abilities").map[类名] → StaticFindObject(<包>.Default__<类>)；allowLoad 时没有就 LoadAsset 一次再找
+function LO.cdoByName(name, allowLoad)
+    if type(name) ~= "string" or name == "" then return nil end
+    LO.index()
+    local paths = LO.abIndex and LO.abIndex.map and LO.abIndex.map[name]
+    if type(paths) ~= "table" then return nil end
+    for _, path in ipairs(paths) do
+        local pkg, cls = path:match("^(.-)%.([^%.]+)$")
+        if pkg and cls then
+            local cdoPath = pkg .. ".Default__" .. cls
+            local o = StaticFindObject(cdoPath)
+            if not valid(o) and allowLoad and type(LoadAsset) == "function" then
+                pcall(LoadAsset, (path:gsub("_C$", "")))
+                o = StaticFindObject(cdoPath)
+            end
+            if valid(o) then return o end
+        end
+    end
+    return nil
+end
+
+-- §389.1 所有活着的某类对象（技能实例 / 被动实例）；FindAllOf 按类短名，读不到返回 {}（不抛）。
+-- 斩马刀自伤那段要直接改"开打前就建好的技能实例"，不能只靠技能格（多人房 / 对决里经常读不到 ActivatableAbilities）。
+-- 【适配】FindAllOf(类短名)
+function LO.liveInsts(name)
+    if type(name) ~= "string" or name == "" then return {} end
+    local ok, list = pcall(function() return FindAllOf(name) end)
+    return (ok and type(list) == "table") and list or {}
+end
+
 -- §372 角色技能格里类名匹配 pat、默认对象上有数字属性 prop 的技能（斩马刀重击的 HealthCostPercent 是蓝图变量，
 -- 父类 GA_Hun_ZhanMa_HeavyAttack_Base）。返回 { { name, cdo = 默认对象, cdoV = 默认对象上的值, insts = { 实例… } }, … }；没 ASC 返回 nil
 -- 【适配】ASC.ActivatableAbilities.Items[i].Ability（= 技能的默认对象）、NonReplicatedInstances / ReplicatedInstances
@@ -2138,12 +2172,448 @@ function E.hitSources(victim, owner, seen, payOnly)
     return r
 end
 
+-- §386 无钩子路径：挨打者最近一次伤害的出手角色。
+-- 为什么不用钩子：2026-11-18 实测（A/B 各一局）——只挂 DealDamageToAvatar、回调一次都没进，多人房两个人同时生成替身时
+-- 第二下 BP_ApplyGameplayEffectToSelf(GE_LockHealth) 仍会 Fatal Error（crash_2026_11_18_19_52_36）；不挂钩子同一流程不崩。
+-- 所以改成读游戏自己的伤害载荷（对象池里的 UObject）：TargetActor = 挨打者，DamageSource = 伤害来源（子弹 / 扫掠模块），
+-- 来源的 LastOwnerAvatar 就是出手角色。只在挨打者掉血那一拍调用（调用方限频），读不到返回 nil，调用方照旧走猜测。
+-- 【适配】FindAllOf("DamageTakenPayload"/"DamagePreTakePayload")；载荷.TargetActor / .DamageSource；来源.LastOwnerAvatar
+function E.hitOwnerOf(victim)
+    if not valid(victim) then return nil end
+    local hit
+    for _, cls in ipairs({ "DamageTakenPayload", "DamagePreTakePayload" }) do
+        local ok, l = pcall(function() return FindAllOf(cls) end)
+        for _, p in ipairs(ok and l or {}) do
+            if valid(p) and sameObj(rawProp(p, "TargetActor"), victim) then
+                local src = rawProp(p, "DamageSource")
+                if src ~= nil and not valid(src) then
+                    local okO, o = pcall(function() return src:GetObject() end)     -- 接口属性万一包了一层
+                    if okO and valid(o) then src = o end
+                end
+                if valid(src) then
+                    local owner = rawProp(src, "LastOwnerAvatar")
+                    if valid(owner) then hit = { owner = owner, src = src } end
+                end
+            end
+        end
+    end
+    if not hit then return nil end
+    return hit.owner, (pathOf(hit.src) or "")
+end
+
 -- §139.3 角色控制器的朝向（替身 = 它的 AI 控制器；技能瞄准 / 光柱没锁定目标时看 GetControlRotation）。返回 是否成功
 -- 【适配】Pawn:GetController():SetControlRotation
 function E.setControlRot(actor, rot)
     local ok, c = pcall(function() return actor:GetController() end)
     if not (ok and valid(c)) then return false end
     return pcall(function() c:SetControlRotation({ Pitch = rot.Pitch, Yaw = rot.Yaw, Roll = 0.0 }) end)
+end
+
+-- ============================================================ §386 伤害"真实出手者"（钩子）
+-- 目标：多人房掉血那一刻，从游戏自己的伤害函数参数里读出出手者（Instigator / DamageSource / 子弹主人 / 召唤物主人），
+-- 交给 pbz_multi.lua 的 MP.hitsrcSink 映射成玩家编号，替代"谁最近出过招"的猜测。
+-- 开关（文件最多 5 秒看一次）：net/hitsrc_probe.on 存在 = 开；不存在 = 关（整套退回旧猜测）；net/hitsrc_off.txt = 强制关。
+-- 名单（§386 返工）：hitsrc_probe.on 的内容 = 要挂的钩子，一行一个短名（OnDamage / TakeDamage / DealDamageToAvatar /
+--   DealDamageCustom / BPI_TakeDamage）；空文件 = 只挂最稳的 DealDamageToAvatar；不在名单里的不 RegisterHook。
+-- 崩溃防护（2026-11-17 20:21 多人房 Fatal Error 后返工）：
+--   1) 回调第一行先写 "§386 进入 <函数>"，前 20 次立刻刷盘；前 3 次每读一个参数前写 "读 <参数名>" 并刷盘。
+--   2) 只读 FProperty 类型是 ObjectProperty 的参数（先 IsValid，再取全名）；Float / Int 等数值参数只取值；
+--      StructProperty / InterfaceProperty / 数组 / Map / 未知类型一律不 :get()、不读字段、不调方法，只记类型名。
+--   3) 回调里不调 GetOwner / GetInstigator / GetOuter；self / 挨打者 / 出手者只记引用 + 路径，入队，
+--      下一帧由 E.hitsrcDrain（pbz_multi 的 ruleTick 调）交给 MP.hitsrcSink 再映射。
+-- 规矩：钩子只装一次、装到游戏退出（UE4SS 运行中撤原生钩子会崩），所以换名单要重启游戏。
+-- 候选函数（ScriptObjects 里能查到的 UFunction，详见报告）：
+--   PBZCharacter:OnDamage（角色受击事件）、AttributeComponent:TakeDamage（伤害总入口）、
+--   BulletAttackModule:DealDamageToAvatar / DealDamageCustom（子弹命中）、Damage_BPI:BPI_TakeDamage（可破坏物，兜底）。
+--   两个 GetDamageSourceOwner getter 钩子已删（返回值在 pre 阶段未初始化，风险大）。
+-- 【适配】RegisterHook("/Script/类:函数", 回调)；回调 varargs 是 RemoteUnrealParam（:get()）；UObject:IsValid / GetFullName / GetClass
+do
+    local flushLog = ctx.logFlush        -- main.lua 给：LOGBUF.flush（立刻落盘，崩了也不丢"进入 / 读参数"）
+    local HS = {
+        installed = false, off = false, probe = false, sink = nil,
+        fns = {}, sig = {}, cand = {}, calls = 0, enter = {},
+        errs = 0, logs = 0, logAt = 0, chkAt = 0, chkT = 0, netDir = "net", why = nil,
+        list = {}, unknown = {}, defaulted = false, q = {}, drop = 0, stale = 0,
+        ENTER_LOG = 20, READ_LOG = 3, QMAX = 64, QAGE = 2.0,
+    }
+    E.HS = HS
+    HS.DEFAULT = "DealDamageToAvatar"
+    HS.cand = {
+        { name = "OnDamage",         path = "/Script/ProjectPBZ.PBZCharacter:OnDamage" },
+        { name = "TakeDamage",       path = "/Script/SGameAttributes.AttributeComponent:TakeDamage" },
+        { name = "DealDamageToAvatar", path = "/Script/SGameCombatSystem.BulletAttackModule:DealDamageToAvatar" },
+        { name = "DealDamageCustom", path = "/Script/SGameCombatSystem.BulletAttackModule:DealDamageCustom" },
+        { name = "BPI_TakeDamage",   path = "/Script/AkashaEffects.Damage_BPI:BPI_TakeDamage" },
+    }
+    local function flushNow()
+        if flushLog then pcall(flushLog) end
+    end
+    local function candOf(name)
+        for _, c in ipairs(HS.cand) do if c.name == name then return c end end
+    end
+    local function allNames()
+        local a = {}
+        for _, c in ipairs(HS.cand) do a[#a + 1] = c.name end
+        return table.concat(a, " / ")
+    end
+
+    -- RemoteUnrealParam / LocalUnrealParam → 里面的值；UObject / 普通值原样返回
+    local function uw(v)
+        if v == nil then return nil end
+        local ok, g = pcall(function() return v:get() end)
+        if ok and g ~= nil then return g end
+        return v
+    end
+    -- 读属性（UObject 的 UPROPERTY 走 obj[key]），读不到 nil；只对确认有效的对象用
+    local function fld(o, k)
+        if o == nil then return nil end
+        local ok, v = pcall(function() return o[k] end)
+        if ok then return uw(v) end
+        return nil
+    end
+    -- 日志用：有效 UObject 给全名；失效对象 / 结构体表不碰 GetFullName
+    local function descOf(o)
+        o = uw(o)
+        if o == nil then return "nil" end
+        if valid(o) then
+            local ok, f = pcall(function() return o:GetFullName() end)
+            return ok and f or "?"
+        end
+        if type(o) == "table" then return "结构体/表" end
+        return "<失效>"
+    end
+    -- 只给有效对象取路径；失效对象返回 nil（不调 GetFullName，§145）
+    local function pathOfObj(o)
+        if not valid(o) then return nil end
+        local ok, f = pcall(function() return o:GetFullName() end)
+        if not ok or f == nil then return nil end
+        return f:match("^%S+ (.+)$") or f
+    end
+    -- 类名：只对有效对象；GetClass 属于"取类名"那一档，允许
+    local function clsOf(o)
+        if not valid(o) then return nil end
+        local ok, c = pcall(function() return o:GetClass() end)
+        if not (ok and c ~= nil) then return nil end
+        local ok2, f = pcall(function() return c:GetFullName() end)
+        return ok2 and f or nil
+    end
+
+    -- 参数读取白名单：只有对象 / 数值参数才 :get()；结构体 / 接口 / 容器 / 未知类型只记类型名
+    local READ_OBJ = { ObjectProperty = true }
+    local READ_NUM = { FloatProperty = true, DoubleProperty = true, IntProperty = true, Int64Property = true,
+                       ByteProperty = true, Int8Property = true, Int16Property = true, UInt32Property = true }
+    local DMG_K = { HPDamageValue = true, Damage = true, BaseDamage = true, UnmitigatedDamage = true,
+                    MitigatedDamage = true, DamageAmount = true, DamageValue = true, FinalDamage = true }
+
+    local function addSrc(list, v)
+        v = uw(v)
+        if not valid(v) then return end
+        for _, x in ipairs(list) do
+            if x == v or sameObj(x, v) then return end
+        end
+        list[#list + 1] = v
+    end
+
+    -- 一次钩子的全部处理：self + 每个参数 → 挨打者 / 出手候选 / 伤害值（只读白名单，见文件头）
+    local function handle(name, hctx, nth, ...)
+        local early = nth <= HS.ENTER_LOG      -- 前 20 次：进入 / 自身行都刷盘
+        local trace = nth <= HS.READ_LOG       -- 前 3 次：读每个参数前写一行
+        local function tracef(f, ...)
+            if not trace then return end
+            out(f, ...)
+            flushNow()
+        end
+
+        -- 1) self：RegisterHook 给的函数接收者；必须先看有效，失效就不碰参数
+        tracef("§386   读 self（%s）", name)
+        local okS, self = pcall(function() return hctx:get() end)
+        if not okS or self == nil then
+            out("§386 跳过 %s：self 读不到（%s）", name, tostring(self))
+            return
+        end
+        if not valid(self) then
+            out("§386 跳过 %s：self 无效", name)
+            return
+        end
+        local selfPath = pathOfObj(self)
+        local selfCls = clsOf(self) or ""
+        local selfIsComp = selfCls:find("Component", 1, true) ~= nil
+        if early then
+            out("§386   自身 %s：%s", name, tostring(selfPath or selfCls))
+            flushNow()
+        end
+
+        local acc = { dmg = nil, victim = nil, vpath = nil, sources = {}, pdesc = {} }
+
+        -- 2) 子弹命中模块：出手者记在模块自己的 LastOwnerAvatar（读属性，不调方法）；最先读，作为第一候选
+        if name == "DealDamageToAvatar" or name == "DealDamageCustom" then
+            tracef("§386   读 self.LastOwnerAvatar（属性）")
+            local owner = fld(self, "LastOwnerAvatar")
+            if valid(owner) then addSrc(acc.sources, owner) end
+        end
+
+        -- 3) 参数：只 :get() 白名单里的类型；结构体 / 接口 / 容器一律不读
+        local n = select("#", ...)
+        local params = { ... }                 -- 只放 RemoteUnrealParam 包装，不提前 :get()
+        local sig = HS.sig[name]
+        for i = 1, n do
+            local meta = sig and sig[i]
+            local pname = meta and meta.name or ("参数" .. i)
+            local ptype = meta and meta.type or "?"
+            local raw = params[i]
+            if READ_OBJ[ptype] then
+                tracef("§386   读 参数%d %s（%s）", i, pname, ptype)
+                local ok, v = pcall(function() return raw:get() end)
+                if not ok then
+                    acc.pdesc[i] = pname .. "：读失败"
+                elseif v == nil then
+                    acc.pdesc[i] = pname .. "：nil"
+                elseif not valid(v) then
+                    acc.pdesc[i] = pname .. "：无效对象"
+                    tracef("§386   参数%d %s 无效，跳过", i, pname)
+                else
+                    local p = pathOfObj(v)
+                    acc.pdesc[i] = pname .. "：" .. tostring(p or "?")
+                    -- DealDamageToAvatar / DealDamageCustom 的参数 1 = TargetAvatar（日志原文）
+                    if i == 1 and (name == "DealDamageToAvatar" or name == "DealDamageCustom") and acc.victim == nil then
+                        acc.victim, acc.vpath = v, p
+                    end
+                    -- 其余 UObject 参数只记路径，不当出手者：语义没确认（AttackerAttributes 可能是挨打方自己的组件，
+                    -- 当来源会让 MP.hitSourcePid 把这一下记成"挨打者自己打自己"）
+                end
+            elseif READ_NUM[ptype] then
+                tracef("§386   读 参数%d %s（%s）", i, pname, ptype)
+                local ok, v = pcall(function() return raw:get() end)
+                if ok and type(v) == "number" then
+                    acc.pdesc[i] = pname .. "：" .. tostring(v)
+                    if acc.dmg == nil and DMG_K[pname] then acc.dmg = v end
+                else
+                    acc.pdesc[i] = pname .. "：读失败"
+                end
+            else
+                -- StructProperty / InterfaceProperty / Array / Map / 未知：这一轮只记类型名，不 :get()
+                tracef("§386   跳过 参数%d %s（%s，不读）", i, pname, ptype)
+                acc.pdesc[i] = pname .. "：" .. ptype .. "（不读）"
+            end
+        end
+
+        -- 4) 挨打者：DealDamage* 用参数 1（TargetAvatar）；其余钩子 self 就是挨打者，
+        --    AttributeComponent 的 self 是组件，下一帧在 MP.hitsrcSink 里才 GetOwner（回调里不调）
+        if acc.victim == nil and name ~= "DealDamageToAvatar" and name ~= "DealDamageCustom" then
+            acc.victim, acc.vpath = self, selfPath
+        end
+
+        -- 探针日志：限频（最短 0.05 秒一条）+ 前 60 条，之后每 200 条一条
+        if HS.probe and (HS.logs < 60 or HS.logs % 200 == 0) then
+            local t = os.clock()
+            if t - HS.logAt >= 0.05 then
+                HS.logAt = t
+                HS.logs = HS.logs + 1
+                local ps = {}
+                for i = 1, math.min(n, 6) do ps[#ps + 1] = acc.pdesc[i] or "?" end
+                out("§386 探针 %s：self=%s 挨打=%s 出手=%s 伤害=%s 参数%d（%s）", name,
+                    descOf(self), descOf(acc.victim), descOf(acc.sources[1]), tostring(acc.dmg), n,
+                    table.concat(ps, " / "))
+            end
+        end
+
+        -- 5) 入队：回调里到此为止，不调 GetOwner / GetInstigator / GetOuter、不做 FindAllOf。
+        --    下一帧 E.hitsrcDrain 再交给 MP.hitsrcSink 映射成玩家编号。
+        if HS.sink then
+            local q = HS.q
+            if #q >= HS.QMAX then
+                table.remove(q, 1)
+                HS.drop = HS.drop + 1
+            end
+            q[#q + 1] = { fn = name, self = self, selfPath = selfPath, selfCls = selfCls,
+                          selfIsComponent = selfIsComp, victim = acc.victim, victimPath = acc.vpath,
+                          sources = acc.sources, dmg = acc.dmg, nth = nth, enq = os.clock() }
+        end
+    end
+
+    local function netDirOf()
+        if ctx.NET_DIR then return ctx.NET_DIR end
+        if NET and NET.RULES_FILE then
+            local d = tostring(NET.RULES_FILE):match("^(.*)[/\\][^/\\]+$")
+            if d then return d end
+        end
+        return "net"
+    end
+    local function fileOn(name)
+        local f = io.open(HS.netDir .. "/" .. name, "r")
+        if f then f:close(); return true end
+        return false
+    end
+    -- 读 hitsrc_probe.on 的内容（不存在 = nil）；内容就是钩子名单
+    local function readOn()
+        local f = io.open(HS.netDir .. "/hitsrc_probe.on", "r")
+        if not f then return nil end
+        local ok, text = pcall(f.read, f, "*a")
+        f:close()
+        return ok and tostring(text or "") or ""
+    end
+    -- 名单解析：一行一个短名（也认逗号 / 分号 / 空格分隔）；# 后面当注释；不认识的名字单独记下来
+    local function parseNames(text)
+        local want, unknown, seen = {}, {}, {}
+        for line in tostring(text or ""):gmatch("[^\r\n]+") do
+            line = line:gsub("^\239\187\191", ""):gsub("#.*$", "")
+            for tok in line:gmatch("[^,%s;]+") do
+                local found
+                for _, c in ipairs(HS.cand) do
+                    if c.name:lower() == tok:lower() then found = c.name; break end
+                end
+                if found then
+                    if not seen[found] then seen[found] = true; want[#want + 1] = found end
+                else
+                    unknown[#unknown + 1] = tok
+                end
+            end
+        end
+        return want, unknown
+    end
+    -- 装钩子时反射一次函数参数（名字 + FProperty 类型名），只读、不调用。
+    -- 之后回调按类型决定读不读：真实日志里的参数名只用来写日志 / 认 TargetAvatar / 伤害名。
+    -- 【适配】UFunction:ForEachProperty + FProperty:GetClass():GetFName()
+    local function fnParams(path)
+        local ok, f = pcall(function() return StaticFindObject(path) end)
+        if not (ok and valid(f)) then return nil end
+        local ps = {}
+        pcall(function()
+            f:ForEachProperty(function(pr)
+                local nm, t = "?", "?"
+                pcall(function() nm = fnameStr(pr:GetFName()) end)
+                pcall(function() t = fnameStr(pr:GetClass():GetFName()) end)
+                ps[#ps + 1] = { name = nm, type = t }
+            end)
+        end)
+        return ps
+    end
+
+    local function hitsrcCb(name)
+        return function(hctx, ...)
+            if not HS.installed or HS.off or not HS.probe then return end
+            -- ① "进入"必须是第一行：写它之前不碰 hctx / 参数。前 20 次立刻刷盘，崩了也能看出是哪个钩子。
+            local nth = (HS.enter[name] or 0) + 1
+            HS.enter[name] = nth
+            HS.calls = HS.calls + 1
+            out("§386 进入 %s", name)
+            if nth <= HS.ENTER_LOG then flushNow() end
+            -- ② 开关文件最多 5 秒看一次（只看文件，不碰游戏对象）
+            local t = os.time()
+            if t ~= HS.chkAt then
+                HS.chkAt = t
+                if t - HS.chkT >= 5 then
+                    HS.chkT = t
+                    HS.off = fileOn("hitsrc_off.txt")
+                    HS.probe = fileOn("hitsrc_probe.on")
+                    HS.netDir = netDirOf()
+                    -- 探针文件删了 / off 文件出现：告诉多人那边整套停（退回旧猜测）
+                    if (HS.off or not HS.probe) and not HS.offTold then
+                        HS.offTold = true
+                        if HS.sink then pcall(HS.sink, { off = true }) end
+                    elseif not HS.off and HS.probe then
+                        HS.offTold = nil
+                    end
+                end
+            end
+            if HS.off or not HS.probe then return end
+            -- ③ 再处理 self / 参数（handle 里只读白名单，见文件头）
+            local ok, err = pcall(handle, name, hctx, nth, ...)
+            if not ok and HS.errs < 20 then
+                HS.errs = HS.errs + 1
+                out("!! §386 钩子 %s 回调出错：%s", name, tostring(err))
+            end
+        end
+    end
+
+    -- 装钩子（只装一次；装到游戏退出）。默认关：net/hitsrc_probe.on 存在才挂（它同时也是探针明细开关）；
+    -- net/hitsrc_off.txt 存在时即使有 probe.on 也不挂。返回 是否生效, 说明
+    function E.hitsrcInstall(opts)
+        opts = opts or {}
+        if opts.sink then HS.sink = opts.sink end
+        HS.netDir = opts.netDir or netDirOf()
+        HS.off = fileOn("hitsrc_off.txt")
+        local text = readOn()
+        HS.probe = text ~= nil
+        if HS.off then return false, "hitsrc_off.txt" end
+        if not HS.probe then return false, "没有 hitsrc_probe.on（默认关）" end
+        if HS.installed then
+            return (HS.got or 0) > 0, HS.why
+        end
+        if type(RegisterHook) ~= "function" then
+            HS.why = "没有 RegisterHook"
+            return false, HS.why
+        end
+        local want, unknown = parseNames(text)
+        HS.unknown = unknown
+        HS.defaulted = (#want == 0)
+        if HS.defaulted then want = { HS.DEFAULT } end       -- 空文件 / 只有注释 = 只挂最稳的那个
+        if #unknown > 0 then
+            out("!! §386 钩子名单不认识：%s（候选只有 %s）", table.concat(unknown, "、"), allNames())
+        end
+        HS.list = want
+        out("§386 钩子名单：%s（%s）", table.concat(want, " / "),
+            HS.defaulted and "空文件 → 默认只挂 " .. HS.DEFAULT or "按 hitsrc_probe.on 的内容")
+        local got, fails = 0, {}
+        for _, name in ipairs(want) do
+            local c = candOf(name)
+            if c and not HS.fns[c.name] then
+                local ps = fnParams(c.path)
+                HS.sig[c.name] = ps
+                if ps and #ps > 0 then
+                    local a = {}
+                    for _, p in ipairs(ps) do a[#a + 1] = p.name .. ":" .. p.type end
+                    out("§386 候选 %s 参数 %d 个：%s", c.name, #ps, table.concat(a, ", "))
+                else
+                    out("!! §386 候选 %s 反射不到签名：回调只记进入，不读参数", c.name)
+                end
+                local ok, err = pcall(function() return RegisterHook(c.path, hitsrcCb(c.name)) end)
+                if ok then
+                    HS.fns[c.name] = true
+                    got = got + 1
+                else
+                    fails[#fails + 1] = c.name .. "（" .. tostring(err):sub(1, 60) .. "）"
+                end
+            end
+        end
+        HS.installed = got > 0
+        HS.got = got
+        HS.why = string.format("%d/%d 个钩子%s", got, #want,
+            #fails > 0 and ("；没挂上 " .. table.concat(fails, "、")) or "")
+        out("§386 伤害出手者：%s（%s；%s）", got > 0 and "已挂" or "一个都没挂上", HS.why,
+            HS.off and "hitsrc_off.txt 关着" or (HS.probe and "探针开" or "探针关"))
+        return got > 0, HS.why
+    end
+    -- 下一帧（pbz_multi 的 ruleTick）调用：把回调里记下的记录交给 MP.hitsrcSink 再映射。
+    -- GetOwner / GetInstigator / GetOuter 只会在这一侧（正常逻辑）发生，不在钩子回调里。
+    function E.hitsrcDrain()
+        local q = HS.q
+        if #q == 0 then return 0 end
+        HS.q = {}
+        local n = 0
+        local nowC = os.clock()
+        for _, rec in ipairs(q) do
+            -- 钩子可能在不联机时响、记录一直排到下次进房：太旧的丢掉，别把几分钟前的一下当成刚打中
+            if rec.enq and nowC - rec.enq > HS.QAGE then
+                HS.stale = HS.stale + 1
+            elseif HS.sink then
+                local ok, err = pcall(HS.sink, rec)
+                if ok then
+                    n = n + 1
+                elseif HS.errs < 30 then
+                    HS.errs = HS.errs + 1
+                    out("!! §386 回调转交失败（%s）：%s", tostring(rec.fn), tostring(err))
+                end
+            end
+        end
+        return n
+    end
+    function E.hitsrcInfo()
+        return { installed = HS.installed, off = HS.off, probe = HS.probe, why = HS.why, calls = HS.calls,
+                 hooked = HS.fns, logs = HS.logs, list = HS.list, unknown = HS.unknown,
+                 defaulted = HS.defaulted, sig = HS.sig, enter = HS.enter, queued = #HS.q, drop = HS.drop,
+                 stale = HS.stale, cand = HS.cand }
+    end
 end
 
 -- ============================================================ 地图名
@@ -4996,7 +5466,7 @@ return {
     hudShow = E.hudShow,      -- §314 界面三态
     tagsMatching = tagsMatching, puppetDiag = puppetDiag, discardPuppet = discardPuppet, stashAway = stashAway,
     montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, flushInput = HOLDC.flushRun, gameInputBlock = E.gameInputBlock, inputFlushMsg = function() return E.flushMsg end, uiCtxStrip = E.uiCtxStrip, uiCtxRestore = E.uiCtxRestore, unpause = E.unpause, capsuleSize = E.capsuleSize, spawnFxAt = E.spawnFxAt, fxActive = E.fxActive, worldFx = E.worldFx, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = E.holdTaskProbe, inputEnsure = E.inputEnsure, worldTime = E.worldTime, linkAbilityInput = E.linkAbilityInput, inputHold = E.inputHold, inputHoldDump = E.inputHoldDump,
-    teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, hitSources = E.hitSources, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
+    teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, hitSources = E.hitSources, hitOwnerOf = E.hitOwnerOf, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
     laserEmitterSpawn = E.laserEmitterSpawn, emitterInfo = E.emitterInfo, moveEmitter = E.moveEmitter, destroyActor = E.destroyActor, stopBullets = E.stopBullets,
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
@@ -5018,6 +5488,7 @@ return {
     forcedApply = E.forcedApply, forcedRestore = E.forcedRestore, forcedActive = forcedActive, weaponSnapped = E.weaponSnapped,
     loadoutLists = E.loadoutLists, loadoutPush = E.loadoutPush, loadoutPop = E.loadoutPop, loadoutSnapshot = E.loadoutSnapshot,
     hookSaveFns = E.hookSaveFns, unhookAll = E.unhookAll,
+    hitsrcInstall = E.hitsrcInstall, hitsrcInfo = E.hitsrcInfo, hitsrcDrain = E.hitsrcDrain,     -- §386 伤害真实出手者（钩子）
     accEquipped = accEquipped, accAssemble = E.accAssemble, accSlots = accSlots, objCounts = E.objCounts,
     findOrLoad = E.findOrLoad,
     cdoTags = E.cdoTags,

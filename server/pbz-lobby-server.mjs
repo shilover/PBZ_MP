@@ -206,8 +206,9 @@ const ROOM_TL = Number.isFinite(ROOM_TL_RAW) ? Math.max(10, ROOM_TL_RAW) : 180;
 const ROOM_PICK_RAW = Number(arg('--pick-range', env('PICK_RANGE') || 5));
 const ROOM_PICK_RANGE = Number.isFinite(ROOM_PICK_RAW) ? Math.max(0, ROOM_PICK_RAW) : 5;
 const ROOM_PROPS = arg('--props', env('PROPS') || 'p1@0,0,0;p2@100,0,0;p3@0,100,0');
+// §408 服务器自己开的房：默认规则跟盟主标准（和客户端 NET.RK_RULES、排位 RULES、C# FormatRoomRules 兜底同一份，改一起改）
 const ROOM_RULES = arg('--room-rules', env('ROOM_RULES')
-    || 'bar=2;bo=3;dm=100;ab=0;ctr=1;bal=0;medok=1;npos=1;std=0;cs=1;gcd=1;dgc=1;sycd=1;stg=1;cfgh=0;acc=1;accn=3;accban=AnimMovement,BreakRegen,MagicWeapon;wpnban=-;edgeban=-;tl=180;ult0=0;sp0=3;resm=0;ultx=100;rdyto=10');
+    || 'bar=2;bo=3;dm=20;ab=0;ctr=1;bal=1;medok=0;npos=1;std=1;cs=0;gcd=1;dgc=0;sycd=1;stg=1;cfgh=0;acc=2;accn=3;accban=AnimMovement,BreakRegen,HealthResistance,MagicWeapon,SwitchEndure;wpnban=-;edgeban=-;tl=180;ult0=0;sp0=3;resm=0;ultx=200;rdyto=10');
 const newId = (len) => {
     // 房间号：去掉容易看错的 0 O 1 I L
     const abc = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';

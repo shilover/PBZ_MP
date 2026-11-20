@@ -36,6 +36,14 @@ namespace ForNet
         // §351 起手长的招（紫冥剑大招 C_C 放出后 2–4 秒才开始打到，用户 11-16"紫冥剑大招没伤害"）：TouchWait 一过先报落空，
         // 之后 LateTouch 秒内这招又碰到 / 报了伤害 → 同一个结果号改判（模组那边走"追加命中"，0.34.1 起的模组不用改）。以前判了落空就再也不看
         const double LateTouch = 6.0;
+        // §388 紫冥剑收尾招（ABB / BBB / AAAAA / AABB / AAABB）：收尾刀放完 0.3–2 秒，肩上的飞剑才射出去打到替身。
+        // 以前和普通招一样 1.5 秒（或 act= 放完）就判落空，落空和飞剑到同一秒 —— 玩家日志 10:59:40 #1652 / 10:59:49 #1657 的 BBB
+        // 先报"落空"再"追加命中"；这就是"重攻击大多数打不中"看到的那些行。收尾招等 SwordTouchWait 秒再判，
+        // 判了落空也留 SummonKeep 秒，飞剑晚到照样改判中招（模组那边 tc= 记回收尾招，§388）
+        const double SwordTouchWait = 3.0;
+        static readonly HashSet<string> SwordCast = new HashSet<string> {
+            "GA_Hun_ZiMingJian_New_ABB_C", "GA_Hun_ZiMingJian_New_BBB_C", "GA_Hun_ZiMingJian_New_AAAAA_C",
+            "GA_Hun_ZiMingJian_New_AABB_C", "GA_Hun_ZiMingJian_New_AAABB_C" };
         // §352 模组发了 act=（你还在放的攻击招）：这招放完还没碰到才判落空（同真人那边替身还在播就接着等），最多 ActMax 秒；
         // 没有 act= 的旧版模组照旧 TouchWait。pst=1（替身在你游戏里挨打 / 倒地 / 冻住）：AI 停手、不喝药、放下架势、这段时间防不了
         const double ActMax = 8.0;
@@ -169,7 +177,7 @@ namespace ForNet
         }
 
         internal class Ev { public int Id; public double T; public string Name; }
-        class Ans { public int Rid; public double Seen; public string Kind; public double Dmg, Paid, Last = -1; public bool Summon, Late, Linger; }   // §115 Dmg 这招累计伤害，Paid 已扣的血，Last 最后一次在 td= 里
+        class Ans { public int Rid; public double Seen; public string Kind; public double Dmg, Paid, Last = -1; public bool Summon, Late, Linger, Sword; }   // §115 Dmg 这招累计伤害，Paid 已扣的血，Last 最后一次在 td= 里；§388 Sword 紫冥剑收尾招（等飞剑）
 
         readonly string abilFile;
         readonly GamePipe mb;       // §84 和 AI 那个 Session 的内存交接（GamePipe.StartVirtual）
@@ -300,6 +308,12 @@ namespace ForNet
         public static bool IsLingerCast(string n)
         {
             return !string.IsNullOrEmpty(n) && n.StartsWith("GA_Hun_GuiTouBlade_", StringComparison.Ordinal);
+        }
+
+        // §388 紫冥剑收尾招：放完还会从肩上射一把飞剑，飞剑 0.3–2 秒后才到
+        public static bool IsSwordCast(string n)
+        {
+            return !string.IsNullOrEmpty(n) && SwordCast.Contains(n);
         }
 
         // 影之武装 folder 的招：pbz_abilities.lua 里路径在 ShachiAbility/<folder>/ 下的技能（去掉被动 / 处决 / 基类），
@@ -697,20 +711,21 @@ namespace ForNet
                 if (!summon && !IsAttack(evn)) continue;
                 // §350 召唤招：没有 tc= 的旧版模组照旧不掷（召唤招本身不出刀）；碰到了一律算中招（召出来的东西不按难度防）
                 if (summon && !touchInfo) continue;
-                answered[atk] = new Ans { Rid = ++resId, Seen = tnow, Kind = touchInfo ? null : Roll(lv, tnow), Summon = summon, Linger = IsLingerCast(evn) };
+                answered[atk] = new Ans { Rid = ++resId, Seen = tnow, Kind = touchInfo ? null : Roll(lv, tnow), Summon = summon, Linger = IsLingerCast(evn), Sword = IsSwordCast(evn) };
             }
             foreach (var kv in answered)
             {
                 var a = kv.Value;
                 if (a.Kind == "miss" && a.Late && touched.Contains(kv.Key))     // §351 落空后又碰到：改判，结果号不变
                 {
-                    a.Late = false; a.Kind = a.Summon || a.Linger ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay;   // §378 石蒜花晚炸 = 中招
+                    a.Late = false; a.Kind = a.Summon || a.Linger || a.Sword ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay;   // §378 石蒜花晚炸 = 中招；§388 飞剑晚到 = 中招
                     Log(L.T("AI：你的第 " + kv.Key + " 招先判落空、后来碰到了，改判 " + a.Kind, "AI: your move #" + kv.Key + " hit late, now " + a.Kind));
                     continue;
                 }
                 if (a.Kind != null) continue;
                 if (touched.Contains(kv.Key)) { a.Kind = a.Summon ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay; }
                 else if (a.Summon ? tnow - a.Seen >= SummonTouchWait
+                         : a.Sword ? ((tnow - a.Seen >= SwordTouchWait && (!actInfo || !acting.Contains(kv.Key))) || tnow - a.Seen >= ActMax)   // §388 等飞剑
                          : actInfo ? (tnow - a.Seen >= TouchWait && !acting.Contains(kv.Key)) || tnow - a.Seen >= ActMax     // §352
                          : tnow - a.Seen >= TouchWait) { a.Kind = "miss"; a.Seen = tnow - ResDelay; a.Late = touchInfo; }      // §382 召唤招也能改判
             }
@@ -730,7 +745,7 @@ namespace ForNet
             // §363 判完了、招还在 act= 里放（偃月刀大招：第一下拉人判中招 400，被拉开 3–4 秒后才砍下那一刀）别丢：
             // 以前判完 3 秒就丢，后面那刀的 td= 找不到这条结果、整招只剩 400（用户 11-16"第一下打到，第二下砍刀没伤害"）
             foreach (var kv in answered)
-                if (tnow - Math.Max(kv.Value.Seen, kv.Value.Last) >= (kv.Value.Kind == null ? ActMax + 1.0 : kv.Value.Summon || kv.Value.Linger ? SummonKeep : kv.Value.Late ? LateTouch : 3.0)   // §378 Linger
+                if (tnow - Math.Max(kv.Value.Seen, kv.Value.Last) >= (kv.Value.Kind == null ? ActMax + 1.0 : kv.Value.Summon || kv.Value.Linger || kv.Value.Sword ? SummonKeep : kv.Value.Late ? LateTouch : 3.0)   // §378 Linger；§388 飞剑
                     && !(kv.Value.Kind != null && actInfo && acting.Contains(kv.Key) && tnow - kv.Value.Seen < ActMax + 1.0)) old.Add(kv.Key);   // §350 / §351 / §352 还没判的（act= 里还在放）别先丢了
             foreach (var k in old) answered.Remove(k);
             // §86 伤害倍率：游戏是主机，按它包里的 dm= 缩放你砍中 AI 的那 400（旧版 / 坏值 = 100%）

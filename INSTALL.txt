@@ -1,7 +1,6 @@
 Phantom Blade Zero 1v1 PvP mod (PBZ_MP) {VERSION} - Install guide
 
 ======================================================================
-[BETA]
 Not all features are finished, and play between two real PCs has not
 been tested much yet. Expect disconnects, inaccurate hits, or even game
 crashes. If something goes wrong, send the author the files listed under
@@ -34,16 +33,17 @@ save first.
 ----------
 1) Put the whole PBZ_MP folder from the zip into:
        <game folder>\platform\steam\ue4ss\Mods\
-   You should end up with:
-       Mods\PBZ_MP\Scripts\main.lua
-       Mods\PBZ_MP\Scripts\pbz_game.lua
-       Mods\PBZ_MP\Scripts\pbz_abilities.lua
-       Mods\PBZ_MP\Scripts\pbz_places.lua
-       Mods\PBZ_MP\Scripts\pbz_balance.lua     (per-move PvP damage factors, editable)
-       Mods\PBZ_MP\enabled.txt
-       Mods\PBZ_MP\pbz_lobby.dll       (the online helper, runs inside the game)
-       Mods\PBZ_MP\net\                (empty folder)
-       Mods\PBZ_MP\rec\                (empty folder)
+   You should end up with (the layout changes between versions; these
+   are the parts that matter):
+       Mods\PBZ_MP\enabled.txt                 (without it UE4SS skips the mod)
+       Mods\PBZ_MP\fornet_lobby.dll            (the online helper; runs inside the game, ~5 MB)
+       Mods\PBZ_MP\Scripts\                    (host + net core: main.lua / fornet_*.lua)
+       Mods\PBZ_MP\games\pbz\                  (game adapter layer)
+       Mods\PBZ_MP\mods\base\                  (base package: main.lua / damage tables / UI)
+       Mods\PBZ_MP\mods\multi\  mods\spec\  mods\ranked\    (modes: multi / spectator / ranked, if present)
+       Mods\PBZ_MP\ext\steam\                  (Steam bridge extension, internal builds only)
+       Mods\PBZ_MP\net\                        (empty folder: online settings and state live here)
+       Mods\PBZ_MP\rec\                        (empty folder: recordings)
 2) UE4SS loads the mod because of enabled.txt. To be safe you can also
    open Mods\mods.txt and add the line:
        PBZ_MP : 1
@@ -53,6 +53,8 @@ Updating from an older version:
   recordings; keep them.
 - Versions before 0.28.6 had a separate PBZLobby.exe. It is no longer
   needed; you can delete Mods\PBZ_MP\PBZLobby.exe.
+- 0.33.x and older called the online helper pbz_lobby.dll; since 0.34 it
+  is fornet_lobby.dll. The old file is never loaded, so you can delete it.
 
 
 3. How to play online
@@ -62,11 +64,11 @@ Updating from an older version:
 2) Press Home in game to open the online panel. A mouse cursor appears
    and every button is clickable. Settings has a language option
    (Chinese / English).
-   (The online helper pbz_lobby.dll is loaded by the mod and runs inside
-   the game; there is no separate program to start or close.)
+   (The online helper fornet_lobby.dll is loaded by the mod and runs
+   inside the game; there is no separate program to start or close.)
 3) Pick the connection method at the top of the panel. Both players must
    pick the same one:
-   - Lobby server: someone has to host a lobby server (see section 8).
+   - Lobby server: someone has to host a lobby server (see section 9).
      Both players enter the same server address in the panel's
      "Settings..." (it is empty by default). The host creates a room;
      the guest clicks it in the room list, or uses "Join by room code...".
@@ -144,20 +146,61 @@ Pact disconnects (so the two mods never both spawn a partner).
   text falls back to English.
 
 
-7. Reporting problems
+7. The online helper won't start (red "HELPER FAILED" text)
+-----------------------------------------------------------
+Since 0.34 the online helper is fornet_lobby.dll, loaded inside the game
+process. The package no longer ships PBZLobby.exe. The panel now shows
+the actual reason it did not start (blocked by Windows App Control /
+fornet_lobby.dll missing / this UE4SS cannot load DLLs / started twice
+with no reply). Up to 0.34.8 it always said "HELPER FAILED: no
+PBZLobby.exe", which only meant "the fallback exe is missing too" - the
+real reason is in logs\<date>\mp_probe.log, in the lines starting with
+"!!".
+When it tells you to restart the game, it means it: the mod stops
+retrying the DLL for that session, and clicking "RESTART THE ONLINE
+HELPER" alone may not help (newer builds do retry the DLL, but a system
+policy will keep blocking it). Restart the game first.
+
+Try these in order:
+1) Restart the game. If it still fails, continue below.
+2) Windows 11 Smart App Control (or an "App Control" policy on a
+   work/school PC) blocks unsigned DLLs. The log then says
+   "An Application Control policy has blocked this file"
+   (error 0x800711C7). Turn it off: Settings -> Privacy & security ->
+   Windows Security -> App & browser control -> Smart App Control -> Off
+   (note: once it is off you cannot turn it back on without reinstalling
+   or resetting Windows). On a work/school PC you have to ask IT.
+3) Your antivirus deleted or quarantined fornet_lobby.dll: check that
+   the file exists in Mods\PBZ_MP and is about 5 MB. If it is missing,
+   extract it from the zip again and allow it in your antivirus.
+4) Right-click fornet_lobby.dll -> Properties -> tick "Unblock" -> OK,
+   then reboot and try again.
+5) If none of that helps, send the files listed in section 8. The two
+   that matter most are the lines starting with "!!" in
+   logs\<date>\mp_probe.log and net\lobby_errors.log (the helper's own
+   error log; if that file does not exist, that is a clue too).
+
+
+8. Reporting problems
 ---------------------
-Note roughly when it happened and what you were doing, then send these
-files to the author (Bugs tab on the Nexus page, or GitHub Issues:
+Note roughly when it happened and what you were doing (also whether you
+are on Windows 10 or 11), then send these files to the author (Bugs tab
+on the Nexus page, or GitHub Issues:
 https://github.com/shilover/PBZ_MP/issues):
-  <game folder>\platform\steam\ue4ss\Mods\PBZ_MP\mp_probe.log
-      (the mod's log; most important)
+  <game folder>\platform\steam\ue4ss\Mods\PBZ_MP\logs\<date>\mp_probe.log
+      (the mod's log; most important - if the logs folder could not be
+      created it falls back to the mod folder itself)
+  <game folder>\platform\steam\ue4ss\Mods\PBZ_MP\net\
+      (the whole folder; all small text files)
   <game folder>\platform\steam\ue4ss\UE4SS.log
       (the UE4SS log)
+  <game folder>\platform\steam\ue4ss\Mods\PBZ_MP\net\lobby_errors.log
+      (if present: errors reported by the online helper)
   If the game crashed: the newest crash_<date>_<time>.dmp in
   <game folder>\platform\steam\ue4ss\
 
 
-8. Hosting your own lobby server (optional; only for "Lobby server")
+9. Hosting your own lobby server (optional; only for "Lobby server")
 --------------------------------------------------------------------
 The server is the server\ folder (on Nexus: the optional "Lobby Server"
 file). It is licensed under AGPL-3.0 (see server\LICENSE); the rest of
@@ -182,7 +225,7 @@ console log prints player IPs and room names; add --quiet to turn that
 off.
 
 
-9. Thanks
+10. Thanks
 ---------
 Special thanks to 伊格尼斯 for the ongoing contributions to damage
 balance.

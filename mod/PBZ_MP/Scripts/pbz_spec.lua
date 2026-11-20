@@ -1302,7 +1302,17 @@ end
 -- 房间设置页：排队几项（主机 / 没联机时点一下换下一档；客机 / 观战者只看）。
 -- 观战人数上限存在联机程序里（netcfg.txt maxspec=，lobby.txt 报回来），改的时候发 cmd=maxspec
 SP.Q.MAXSPEC = { 0, 2, 4, 6, 8, 12, 16 }     -- 旧 1v1 观战超过 8 按 8。§295 新版 1v1 也拿这一项当观众上限，11-15 起不用了：新版 1v1 的观众 = 房间人数 − 2
+-- 11-18 用户"现在的房间设置里有些选项是旧版 1v1 专用的，重新整理一版分类"：下面这几项（我观战时 / 观战人数上限 /
+-- 主机只观战 / 打完换人 / 不准备算放弃 / 连赢强制换）只对旧版 1v1 有意义。多人房 / 对决有自己的"只看不上场"
+-- （房间面板 + 玩法设置），这里不再混显示；联机省流三种玩法都用，挪到 main.lua 的"联机"分类（不依赖观战 mod）。
+local function classicOnly()
+    local s = MATCH.session
+    if not s then return true end
+    if not s.role or s.role == "" or s.role == "none" then return true end     -- 不在房间里：按旧版 1v1 的默认设置显示
+    return not (s.mp == "1" or s.duel == "1")
+end
 function SP.Q.items(items, T, notHost, flash, lb, cmd)
+    if not classicOnly() then return end
     local c = SP.Q.cfg
     if lb and cmd then
         -- §141 我自己观战时：排队上场 / 只观战（个人设置，不是房间规矩，谁都能改）
@@ -1318,29 +1328,6 @@ function SP.Q.items(items, T, notHost, flash, lb, cmd)
                                   local n = nextOf(SP.Q.MAXSPEC, m)
                                   cmd("maxspec", "n=" .. n .. "\n")
                                   out("联机面板：观战人数上限设为 %s", n == 0 and "不让观战" or tostring(n))
-                              end }
-        -- §223.4 联机省流（主机的房间设置，默认开）：对战 / 观战的状态包只发变了的字段。对方是旧版时自动发完整包。
-        -- 客机显示主机的设置（lobby.txt dzhost=），后面带这次连接实际用的；没连着（role=none）不写"现在"
-        -- 观战者：看最近 3 秒收没收到省流包（SP.unpack 记的 SP.dzAt）；客机：主机说的（-1 = 主机旧版或还没收到主机的包）
-        local spec = lb.role == "spec"
-        local val = notHost and lb.dzhost or lb.dz
-        local state
-        if spec then
-            local on = SP.dzAt and now() - SP.dzAt < 3.0
-            state = on and T("开（现在收的是省流包）", "ON (RECEIVING SAVED PACKETS)") or T("现在收的是完整包", "RECEIVING FULL PACKETS")
-        elseif val == "-1" then
-            state = T("未知（主机是旧版，或还没收到主机的包）", "UNKNOWN (OLD HOST OR NOT YET HEARD)")
-        else
-            state = (val ~= "0" and T("开", "ON") or T("关", "OFF"))
-                    .. (lb.role and lb.role ~= "" and lb.role ~= "none" and (lb.dzact == "1" and T("（现在：省流中）", " (NOW: ON)") or T("（现在：完整包）", " (NOW: FULL)")) or "")
-        end
-        local dzOn = val ~= "0"
-        items[#items + 1] = { label = T("联机省流：", "SAVE BANDWIDTH: ") .. state
-                                      .. (notHost and T("（主机设置）", " (HOST'S SETTING)") or T("（主机设置）", " (HOST)")),
-                              act = function()
-                                  if notHost then flash(T("联机省流由主机设置", "THE HOST DECIDES THIS")); return end
-                                  cmd("dz", "on=" .. (dzOn and "0" or "1") .. "\n")
-                                  out("联机面板：联机省流设为 %s", dzOn and "关" or "开")
                               end }
         local hs = (lb.hostspec == "1")
         items[#items + 1] = { label = T("主机只观战（解说模式）：", "HOST SPECTATE ONLY (CASTER): ") .. (hs and T("开", "ON") or T("关", "OFF"))
@@ -1428,7 +1415,7 @@ function SP.Q.panel(items, T, lb, cmd, flash)
     if lb.role == "host" and ses and ses.relay == "1" then
         items[#items + 1] = { label = T("我回来打（第二位回去观战）", "I'M BACK (SECOND PLAYER WATCHES)"), act = function() cmd("hostup") end }
     elseif lb.role == "host" and specs > 0 and (lb.connected == "1") then
-        items[#items + 1] = { label = T("我也下场（让对手和排队第一位对打，我观战）", "STEP DOWN (OPPONENT VS NEXT IN QUEUE)"),
+        items[#items + 1] = { label = T("我也下场（排队第一位上场，我观战）", "STEP DOWN (OPPONENT VS NEXT IN QUEUE)"),
                               act = function() cmd("hostdown"); flash(T("你下场观战了", "YOU ARE WATCHING NOW")) end }
     end
     if lb.role == "host" and specs > 0 then
@@ -1436,10 +1423,10 @@ function SP.Q.panel(items, T, lb, cmd, flash)
                               act = function() SP.Q.streak = 0; cmd("rotate", "why=房主换人\n") end }
     elseif lb.role == "client" and lb.connected == "1" then     -- 还在"正在连接"时没有主机可下，不给这个按钮
         -- §141 自己下去 = 观战开关自动切成"只观战"，想再打自己切回"排队"（房主换人 / 补位不碰这个开关）
-        items[#items + 1] = { label = T("我下去观战（之后只观战，想打再切回排队）", "STEP DOWN AND WATCH (SWITCH BACK TO QUEUE TO PLAY AGAIN)"),
+        items[#items + 1] = { label = T("我下去观战（想打再切回排队）", "STEP DOWN AND WATCH (SWITCH BACK TO QUEUE TO PLAY AGAIN)"),
                               act = function() cmd("tospec"); flash(T("下去观战了（只观战）", "YOU ARE WATCHING NOW (WATCH ONLY)")) end }
     elseif lb.role == "spec" then
-        items[#items + 1] = { label = T("换视角：面板关着时 PgUp / PgDn（或小键盘 *）", "CAMERA: PGUP / PGDN WITH THE PANEL CLOSED (OR NUMPAD *)") }
+        items[#items + 1] = { label = T("换视角：PgUp / PgDn（或小键盘 *）", "CAMERA: PGUP / PGDN WITH THE PANEL CLOSED (OR NUMPAD *)") }
         local qp = ses and tonumber(ses.qpos)
         local noq = lb.specnoq == "1"
         items[#items + 1] = { label = noq and T("只观战（不排队）", "WATCHING ONLY (NOT IN QUEUE)")

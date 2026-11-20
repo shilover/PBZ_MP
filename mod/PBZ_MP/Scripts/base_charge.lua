@@ -242,6 +242,7 @@ end
 -- 替身放出对方的蓄力招（AIR.fire 放成功时）
 function CHG.onFire(pup, e, tn)
     CHG.fired[e.id] = { at = tn, name = e.name, mon = {} }
+    if not (CHG.SPIN_SKIP and CHG.SPIN_SKIP[e.name]) then CHG.fired[e.id].spin = {} end   -- §407/§409 按住持续类：记状态，pupStep 里补中段动作
     CHG.fired[e.id - 300] = nil
 end
 
@@ -802,11 +803,157 @@ function CHG.releaseTo(pup, id, f, tn, secs)
     if not ok and PRETRY then PRETRY.push(pup, rel.name, (NET and NET.sub) or {}, "蓄力松手 远端#" .. id, 0.15, "释放招等标签") end
 end
 
+-- ============================================================ §407 / §409 按住持续类：对方屏幕上看不到后续动作
+-- 11-19 伊格尼斯："在线 PVP 用特殊攻击（防御+重攻击）只显示前 3 次攻击旋转的动作，后续按住不在对方屏幕上显示动作，但实际生效"。
+-- 收方日志（mp_probe (34).log）证实：08:21:17 对方按下特殊攻击，替身放出来 → 1 秒后动作就从
+--   Hun_YanYueDao_Skill_01_A_Montage 跳到 Hun_YanYueDao_Skill_01_End_Montage，整段 8.03 秒里 Loop 一次都没出现；
+-- 自己放同一招（07:59:24–29）是 A → Loop → End，由 IsHolding 决定停多久。替身是 AIController、没有输入组件（§92 / §140 实验 3），
+-- 所以只播开招段就自己收招，后面只剩"平移"。
+-- 做法：收方自己把中间那段补上——只播动作，不动技能本身（判定窗口 / 伤害 / 杀气都不碰）。
+--   ① 有循环段（Loop）的招：替身动作进了收招 / 空了 / 开招段停太久 → playNamed(Loop)；松手到点补一次 End。
+--   ② 没有循环段、中段是几个动作轮着放的（偃月刀大招 = Start → Dodge_L / Dodge_R → End）→ 按 seq 顺序轮播。
+--   ③ 表里没有的按住招：只在整段动作真的空了时重播一次开招段（兜底，别乱插）。
+--   ④ 显式表没有、但开招段名字能推出 _Loop_Montage 且资产真的在（推导一次、缓存）→ 按 ① 处理。
+-- 名字来源：偃月刀两条来自玩家日志；其余带 Start / Loop / End(Stop) 三段的来自资产表
+--   `_tools/gasgraph/按住松手招_全表.csv`（GA_JinGua_RoAttack / GA_Hun_Lute_SKill / GA_TanLang_Normal / GA_Hun_ShachiHook_HookMove）。
+CHG.SPIN_MAX = 9.0          -- 对方按住的上限（游戏自己 8.02 秒就"按太久"）
+CHG.SPIN_A = 1.2            -- 开招段最多停留这么久还没换动作，就当游戏没换、补下一段
+CHG.SPIN_TRY = 0.2          -- 补动作 / 补收招的最小间隔
+CHG.SPIN_SEQ_GAP = 0.9      -- seq 模式每个动作轮播多久
+CHG.SPIN = {
+    -- a = 开招段，loop = 按住循环段，endm = 收招段（三段都是独立蒙太奇资产）
+    GA_Hun_YanYueDao_SpecialSkill_C = { a = "Hun_YanYueDao_Skill_01_A_Montage",
+                                        loop = "Hun_YanYueDao_Skill_01_Loop_Montage",
+                                        endm = "Hun_YanYueDao_Skill_01_End_Montage" },
+    -- 大招没有循环段：中段是左右闪身突进两个动作交替（自己放：08:00:42 Start → :44 Dodge_L → :44 Dodge_R → :45 End）
+    GA_Hun_YanYueDao_C_C = { a = "Hun_YanYueDao_Skill_03_Start_Montage", after = 2.2,
+                             seq = { "Hun_YanYueDao_Skill_03_Dodge_L_Montage", "Hun_YanYueDao_Skill_03_Dodge_R_Montage" },
+                             endm = "Hun_YanYueDao_Skill_03_End_Montage" },
+    -- 资产表里带 Start / Loop / End(Stop) 三段的按住招
+    GA_JinGua_RoAttack = { a = "Hun_ShaChi_JinGua_Skill_06_Start_Montage",
+                           loop = "Hun_ShaChi_JinGua_Skill_06_Loop_Montage",
+                           endm = "Hun_ShaChi_JinGua_Skill_06_Stop_Montage" },
+    GA_Hun_Lute_SKill = { a = "Hun_ShaChi_Lute_Skill_01_Start_Montage",
+                          loop = "Hun_ShaChi_Lute_Skill_01_Loop_Montage",
+                          endm = "Hun_ShaChi_Lute_Skill_01_End_Montage" },
+    GA_TanLang_Normal = { a = "Hun_LangYa_Skill_01_Start_Montage",
+                          loop = "Hun_LangYa_Skill_01_Loop_Montage",
+                          endm = "Hun_LangYa_Skill_01_End_Montage" },
+    GA_Hun_ShachiHook_HookMove = { a = "ShaChi_Hook_Skill_02_Start_Montage",
+                                   loop = "ShaChi_Hook_Skill_02_Loop_Montage",
+                                   endm = "ShaChi_Hook_Skill_02_End_Montage" },
+}
+-- 这些按住招已经有画面同步，不要抢：紫冥剑召唤（§111 sub= 播召唤循环）、独眼弓激光（§139 一段一段续放）
+CHG.SPIN_SKIP = { GA_Hun_ZiMingJian_New_DB_C = true, GA_DuYan_Bow_Laser_C = true }
+CHG.SPIN_DERIVED = {}
+CHG.spinN, CHG.SPIN_LOGS = 0, 30
+function CHG.spinLog(fmt, ...)
+    CHG.spinN = CHG.spinN + 1
+    if CHG.spinN <= CHG.SPIN_LOGS then out(fmt, ...) end
+end
+-- 开招段名字 → { loop, endm }（推导一次缓存；循环段资产不在内存里就当不认识，返回 nil）
+function CHG.spinDerive(a)
+    if not a or a == "" then return nil end
+    local c = CHG.SPIN_DERIVED[a]
+    if c ~= nil then return (c ~= false) and c or nil end
+    local function rep(s, from, to) return (s:gsub(from, to)) end
+    local loop = rep(rep(rep(a, "_Start_ForBlocker_Montage$", "_Loop_Montage"), "_Start_Montage$", "_Loop_Montage"), "_A_Montage$", "_Loop_Montage")
+    local endm = rep(rep(rep(a, "_Start_ForBlocker_Montage$", "_End_Montage"), "_Start_Montage$", "_End_Montage"), "_A_Montage$", "_End_Montage")
+    if loop == a or not (G and G.montageByName and G.montageByName(loop, true)) then
+        CHG.SPIN_DERIVED[a] = false
+        return nil
+    end
+    c = { a = a, loop = loop, endm = (endm ~= a) and endm or nil }
+    CHG.SPIN_DERIVED[a] = c
+    return c
+end
+-- 受击 / 格挡 / 破防这些动作盖在上面时不抢（那是真的在挨打 / 防御）
+function CHG.spinBusy(m)
+    return m ~= "" and (m:find("_Hit_", 1, true) or m:find("Deflect", 1, true) or m:find("MoTian_Dodge", 1, true)
+        or m:find("BreakEscape", 1, true) or m:find("Break_", 1, true))
+end
+-- 播一个动作。循环段可能还没被加载过（替身从没播到过它）→ 让 montage 表重扫一次再试
+function CHG.spinPlay(pup, name)
+    if not name or name == "" then return false end
+    local ok, r = pcall(playNamed, pup, name)
+    if ok and r then return true end
+    if G and G.montageByName then pcall(G.montageByName, name, true) end
+    local ok2, r2 = pcall(playNamed, pup, name)
+    return (ok2 and r2) and true or false
+end
+-- 每帧：替身放的这一招还在按住期，就保证一直有动作
+function CHG.spinStep(pup, id, f, tn)
+    local s = f.spin
+    if not s or not valid(pup) or s.done then return end
+    local m = montageOf(pup)
+    -- 开招段：放出来之后第一次读到的动作（只在这招真的在跑时认，免得拿到上一招的收尾动作）
+    if not s.a then
+        if m == "" or (LO and LO.activeInstance and not LO.activeInstance(pup, f.name)) then return end
+        s.a = m
+    end
+    local sp = CHG.SPIN[f.name] or CHG.spinDerive(s.a)
+    local secs = CHG.rel[id]
+    local over = (secs and tn >= f.at + secs) or (tn - f.at >= CHG.SPIN_MAX)
+    if over then
+        s.done = true
+        if sp and sp.endm and (s.loop or s.seqI) then
+            -- 松手：替身那边早就进过收招了，这里再补一次让它收得干净（技能本身不用管）
+            CHG.spinPlay(pup, sp.endm)
+            CHG.spinLog("§407 续转：远端#%d %s %s → 补播收招 %s（按了 %.2f 秒，补了 %d 次）", id, f.name,
+                secs and "对方松手" or string.format("按住超过 %.0f 秒", CHG.SPIN_MAX), sp.endm, secs or (tn - f.at), s.n or 0)
+        end
+        return
+    end
+    if CHG.spinBusy(m) then return end                    -- 真在挨打：不抢
+    if not sp then
+        -- 不认识的按住招：只有动作真的空了才补一下开招段（别的都不碰）
+        if m == "" and tn - f.at > 0.8 and tn >= (s.fbAt or 0) then
+            s.fbAt = tn + 1.2
+            local okA = CHG.spinPlay(pup, s.a)
+            if okA then s.n = (s.n or 0) + 1 end
+            CHG.spinLog("§407 续转：远端#%d %s 没动作了（没有循环段可补）→ %s开招段 %s（第 %d 次）", id, f.name,
+                okA and "重播" or "也没播成", s.a, s.n or 0)
+        end
+        return
+    end
+    if sp.seq then
+        -- 没有循环段：中段几个动作按顺序轮播（等开招段放完 after 秒再开始）
+        if m == sp.a and (tn - f.at) < (sp.after or CHG.SPIN_A) then return end
+        if tn < (s.seqAt or 0) then return end
+        local i = ((s.seqI or 0) % #sp.seq) + 1
+        local name = sp.seq[i]
+        if CHG.spinPlay(pup, name) then
+            s.seqI, s.seqAt, s.n = i, tn + CHG.SPIN_SEQ_GAP, (s.n or 0) + 1
+            CHG.spinLog("§407 续转：远端#%d %s 替身%s → 补播中段 %s（+%.2f 秒，第 %d 次）", id, f.name,
+                (m == sp.a) and "还在开招段" or ((m == "" and "没动作了") or ("进了收招（" .. m .. "）")), name, tn - f.at, s.n)
+        end
+        return
+    end
+    if s.loop and m == sp.loop then return end            -- 已经在转
+    -- 该补 Loop 的时机：游戏自己进了收招、动作空了、或开招段停太久没换
+    local need = (m == sp.endm) or (m == "") or (m == sp.a and (tn - f.at) > CHG.SPIN_A)
+    if not need or tn < (s.tryAt or 0) then return end
+    s.tryAt = tn + CHG.SPIN_TRY
+    if CHG.spinPlay(pup, sp.loop) then
+        s.loop, s.n = true, (s.n or 0) + 1
+        CHG.spinLog("§407 续转：远端#%d %s 替身%s → 补播循环 %s（+%.2f 秒，第 %d 次）", id, f.name,
+            (m == "" and "没动作了") or ("进了收招（" .. m .. "）"), sp.loop, tn - f.at, s.n)
+    elseif tn >= (s.fbAt or 0) then
+        -- 循环段加载不到：退回每秒重播一次开招段，至少别是"站着平移"
+        s.fbAt = tn + 1.0
+        local okA = CHG.spinPlay(pup, sp.a)
+        CHG.spinLog("§407 续转：远端#%d %s 循环段播不了 → %s开招段 %s（第 %d 次）", id, f.name,
+            okA and "重播" or "也没播成", sp.a, (s.fbN or 0) + 1)
+        if okA then s.fbN = (s.fbN or 0) + 1 end
+    end
+end
+
 -- 每帧：替身按对方的秒数松手；"一直等松手"的招还在蓄力动作上就停掉
 function CHG.pupStep(pup, tn)
     for id, f in pairs(CHG.fired) do
         CHG.selfStep(pup, id, f, tn)
         CHG.laserStep(pup, id, f, tn)       -- §139
+        CHG.spinStep(pup, id, f, tn)        -- §407
         if f.shot then SHOT.pupStep(pup, id, f, tn) end   -- §377
         local secs = CHG.rel[id]
         if CHG.VEHICLE.names[f.name] and valid(pup) then
@@ -816,7 +963,8 @@ function CHG.pupStep(pup, tn)
         if not f.done and secs and tn >= f.at + secs then
             f.done = true
             if CHG.WAIT[f.name] and valid(pup) then CHG.releaseTo(pup, id, f, tn, secs) end
-        elseif f.at and tn - f.at > CHG.maxAge(f.name) + 2 then CHG.fired[id] = nil end
+        elseif f.at and tn - f.at > ((f.spin and math.max(CHG.maxAge(f.name), CHG.SPIN_MAX) or CHG.maxAge(f.name))) + 2 then
+            CHG.fired[id] = nil end        -- §407 按住旋转类的记录留到 SPIN_MAX（判定窗口仍按 maxAge，不改）
     end
 end
 
