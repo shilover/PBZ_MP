@@ -626,6 +626,7 @@ activateOnPuppet = function(pup, n, sub, how)
         local okL, q = pcall(CHR.lead, pup, use, how, map, fire, n, sub)
         if okL and q then return true, false, true end
         if not okL then out("  §255 混沌切形态出错：%s", tostring(q)) end
+        if CHR.unmute then pcall(CHR.unmute, pup) end      -- §255.1 原招要放了：中间步的 0 攻击恢复
     end
     -- §242 刺骨混沌的形态招：先把替身就绪成这一招要的形态（Buff + 特效 + 这一形态的 Hold 升级）再放。
     -- 以前只在放不出之后才补形态（B 链 / B_Hold 的 IceHold 不到位 → 一次都放不出）；现在放之前就挂好。
@@ -849,6 +850,9 @@ activateOnPuppet = function(pup, n, sub, how)
             okFire, real = true, true
             ST.dressForSwt = (ST.dressForSwt or 0) + 1
             if ST.dressForSwt <= 10 then out("  切刀斩 %s 先换装再放，放出来了（第 %d 次）", use, ST.dressForSwt) end
+        elseif valid(p1) and not tostring(how):find("等前摇", 1, true) then
+            -- SetCurrentWeapon/SetSlotWeapon 往往要到下一帧才让 CanActivate 看到新武器；同帧失败不能直接记落空。
+            pending = PRETRY.push(pup, n, sub, how, 0.20, "切刀斩等换装生效") or pending
         end
     end
     -- §230 冲刺版切刀斩（GA_Hun_Tang_SWT_Dash / GA_Hun_Long_SWT_Dash，标签 Ability.Action.Hun.Weapon.Switch.Dash）：日志里替身放了 48 次全 false，

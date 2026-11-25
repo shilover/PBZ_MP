@@ -7,11 +7,68 @@
 --                     → AI 这段时间不出招、不喝药、不举架势，被打中也防不了（真人挨打硬直里一样动不了）
 --   psq=<杀气>        §353 替身在我游戏里的实际杀气。联机程序回 sqp=1 时，交手中不再把替身杀气补满（main.lua 每 10 帧那段），
 --                     挨打掉、放技能花、打中涨都是游戏自己算；打空了替身在我这边真的破防（不掐，pst=1 让 AI 停手）
+--   tbrk=<招式号,...> / tbrkon=0/1  木桩用（用户 11-23"普通格挡开了就无敌"）：哪几招把替身打破防了（*Break* 动作，KEEP 秒内）、
+--                     替身现在是不是在播破防动作。木桩"普通格挡（按住）"据此把破防那一刀和破防后的刀判中招，不再一律普防
 -- 旧版联机程序不认这几个键 → 照旧。发包这一帧顺带算，不额外轮询：动作每帧本来就在读，异常标签每 EVERY 帧读一次。
 return function(ctx)
 local out, NET, ST, G = ctx.out, ctx.NET, ctx.ST, ctx.G
 local A = { KEEP = 10.0, EVERY = 3, mine = {}, pst = "0", why = nil, LOG_MAX = 60, logs = 0, n = { busy = 0, brk = 0 }, psq = nil,
             BREAK = { "Break", "MoTian_Dodge" } }
+
+-- Offline gasgraph attack_alert.csv: Players/Hun assets with alert == red.
+-- Mixed red+blue assets are deliberately excluded: not every phase is red.
+A.RED = {}
+for asset in ([[GA_Hun_GuiTouBlade_BBB GA_Hun_GuiTouBlade_C GA_Hun_FengLeiJian_C
+GA_Hun_BaiYing_C GA_Hun_BronzeSword_C GA_Hun_Chaos_C GA_Hun_ChiZheCanJian_C
+GA_Hun_ChiZheCanJian_C_Zui GA_Hun_Double_C GA_Hun_YuuBlade_C GA_Hun_DualHook_C
+GA_Hun_HeiMoShang_C1 GA_Hun_Horizontal_C GA_Hun_Iron_C GA_Hun_Jade_C_Range
+GA_Hun_Double_JueYing_C GA_Hun_Double_JueYing_C_Air GA_Hun_Long_C GA_Hun_Jigsaw_C
+GA_Hun_LuanYing_CA GA_Hun_LuanYing_P2_CA GA_Hun_PoJun_C GA_Hun_ShuangYue_C
+GA_Hun_SlitheringSword_C GA_Hun_SnakeDual_C GA_Hun_Tang_C
+GA_Hun_TempMaleThugClub_Ultimate GA_Hun_TempMaleThugTwinAxe_Ultimate
+GA_Hun_WoodenSword_C GA_Hun_Young_C GA_Hun_XieShan_C GA_Hun_YanYueDao_C
+GA_Hun_ZhanMa_C GA_Hun_ZiMingJian_New_C]]):gmatch("%S+") do A.RED[asset .. "_C"] = true end
+function A.isRed(n)
+    if type(n) ~= "string" then return false end
+    if A.RED[n] then return true end
+    -- GEx is an execution, not a red counter (HANDOVER 249 / PDX.NAMES).
+    return n:match("^GA_Hun_.*PerfectDodge") ~= nil and not n:find("_GEx", 1, true)
+end
+function A.wireRed(tn)
+    if type(G.trainingRedEpoch) == "function" and type(G.getP1) == "function" then
+        local ok, epoch = pcall(function() return G.trainingRedEpoch(G.getP1()) end)
+        if ok and type(epoch) == "number" and epoch >= 0 then
+            if A.redEpoch ~= nil and epoch > 0 and epoch ~= A.redEpoch then A.redPending, A.redPendingAt = true, tn end
+            A.redEpoch = epoch
+        end
+    end
+    if A.redPendingAt and tn - A.redPendingAt > 0.5 then A.redPending = nil end
+    if A.redPending then
+        local newest
+        for id, r in pairs(A.mine) do
+            if tn - r.at <= A.KEEP and NET.prevAbs and NET.prevAbs[r.n] and (not newest or id > newest) then newest = id end
+        end
+        if newest then A.redIds = A.redIds or {}; A.redIds[newest] = true; A.redPending = nil end
+    end
+    local latest = {}
+    for id, r in pairs(A.mine) do
+        if tn - r.at <= A.KEEP and NET.prevAbs and NET.prevAbs[r.n] and (A.isRed(r.n) or (A.redIds and A.redIds[id]))
+            and (not latest[r.n] or id > latest[r.n]) then latest[r.n] = id end
+    end
+    local ids = {}
+    for _, id in pairs(latest) do ids[#ids + 1] = id end
+    table.sort(ids)
+    return table.concat(ids, ",")
+end
+function A.trainingBusy()
+    if type(G.activeAbilities) ~= "function" then return false end
+    local pup = G.puppet()
+    if not G.valid(pup) then return false end
+    local ok, active = pcall(G.activeAbilities, pup, ctx.isAttackAbility)
+    if not ok or type(active) ~= "table" then return false end
+    for name, on in pairs(active) do if on and ctx.isAttackAbility(name) then return true end end
+    return false
+end
 
 function A.log(...)
     if A.logs < A.LOG_MAX then A.logs = A.logs + 1; out(...) end
@@ -33,7 +90,9 @@ function A.wireAct(tn)
     local abs = NET.prevAbs
     local latest = {}
     for id, r in pairs(A.mine) do
-        if tn - r.at > A.KEEP then A.mine[id] = nil
+        if tn - r.at > A.KEEP then
+            A.mine[id] = nil
+            if A.redIds then A.redIds[id] = nil end
         elseif abs and abs[r.n] and (not latest[r.n] or id > latest[r.n]) then latest[r.n] = id end
     end
     local ids = {}
@@ -44,7 +103,8 @@ end
 
 -- §353 交手中、对手是本地 AI、联机程序说了 sqp=1、不是木桩：替身杀气按游戏自己的（不补满、破防照播）
 function A.ownShachi()
-    if not (A.on() and NET.rsqp and not NET.rdummy) then return false end
+    if not (A.on() and NET.rsqp) or NET.rtrainAiChi then return false end
+    if NET.rdummy and (not NET.rtrainChi or NET.rtrainChi == "locked" or NET.rtrainAiChi) then return false end
     if NET.fighting then return NET.fighting() == true end
     return false
 end
@@ -55,6 +115,29 @@ function A.noteBreak(name)
     A.brkM = name
     A.n.brk = A.n.brk + 1
     A.log("§353 替身杀气打空、在你这边破防了（%s，第 %d 次）→ 照播，本地 AI 这段时间停手", tostring(name), A.n.brk)
+end
+
+-- 木桩：我第 id 招把替身打破防了（TOUCH.markBreak 调，只认 Break 动作，挣脱 MoTian_Dodge 不算）
+function A.noteBreakId(id, tn)
+    if type(id) ~= "number" or id <= 0 then return end
+    A.brkIds = A.brkIds or {}
+    A.brkIds[id] = tn
+end
+
+-- 替身这一帧是不是在播破防动作（不含挣脱）
+function A.inBreak(pup)
+    if not G.valid(pup) then return false end
+    local m = LAT and LAT.activeMontage and select(3, LAT.activeMontage(pup)) or nil
+    return type(m) == "string" and m:find("Break", 1, true) ~= nil and not m:find("BreakEscape", 1, true)
+end
+
+function A.wireBreak(tn)
+    local ids = {}
+    for id, at in pairs(A.brkIds or {}) do
+        if tn - at > A.KEEP then A.brkIds[id] = nil else ids[#ids + 1] = id end
+    end
+    table.sort(ids)
+    return "tbrk=" .. table.concat(ids, ",") .. "\ntbrkon=" .. (A.inBreak(G.puppet()) and "1" or "0") .. "\n"
 end
 
 -- 替身现在为什么动不了（nil = 能动）
@@ -93,6 +176,13 @@ end
 function A.wire(tn)
     if not A.on() then return "" end
     local s = "act=" .. A.wireAct(tn) .. "\npst=" .. A.wirePst(tn) .. "\n"
+    if ST.ticks % A.EVERY == 0 or A.trainBusy == nil then A.trainBusy = A.trainingBusy() end
+    s = s .. "tred=" .. A.wireRed(tn) .. "\ntrainBusy=" .. (A.trainBusy and "1" or "0") .. "\n"
+    if NET.rdummy then s = s .. A.wireBreak(tn) end
+    if NET.rdummy and NET.rtrainReturn == false and type(G.trainingPosition) == "function" then
+        local ok, pos = pcall(G.trainingPosition, G.puppet())
+        if ok and type(pos) == "string" then s = s .. "trainPos=" .. pos .. "\n" end
+    end
     if ST.ticks % A.EVERY == 0 or A.psq == nil then
         local v = ctx.attrOf and ctx.attrOf(G.puppet(), "Shachi")
         A.psq = type(v) == "number" and v or A.psq
@@ -104,6 +194,9 @@ end
 -- 换对手 / 对局结束时清掉
 function A.reset()
     A.mine, A.pst, A.why, A.psq, A.brkM = {}, "0", nil, nil, nil
+    A.trainBusy = nil
+    A.brkIds = nil
+    A.redEpoch, A.redPending, A.redPendingAt, A.redIds = nil, nil, nil, nil
 end
 
 return A

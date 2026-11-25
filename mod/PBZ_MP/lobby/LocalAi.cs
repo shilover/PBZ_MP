@@ -102,6 +102,23 @@ namespace ForNet
             // §354 AI 跟随你（玩家反馈 11-16："AI 会自动瞬移到我脸上"，木桩测攻击距离 / 对战练习拉开身位打远程都要能关）：
             // 开（默认）= 照旧走到你面前、离你超过 30 米瞬移到你面前；关 = 原地不动、不瞬移（第一次出现 / 换图 / 回合开战点照旧摆）。存 netcfg aifol=
             public bool Follow = true;
+            public Dictionary<string, string> Training = TrainingDefaults();
+            static Dictionary<string, string> TrainingDefaults()
+            {
+                return new Dictionary<string, string> { { "trainAction", "none" }, { "trainGuard", "none" }, { "trainDodge", "0" }, { "trainInterval", "2" }, { "trainRepeat", "1" }, { "trainReturn", "1" }, { "trainHpRegen", "1" }, { "trainChi", "normal" }, { "trainAiHp", "0" }, { "trainAiChi", "0" } };
+            }
+            public string Train(string key) { return Training[key]; }
+            public bool SetTraining(string k, string v)
+            {
+                if (!Training.ContainsKey(k)) return false;
+                double n;
+                if (k == "trainAction") { if (Array.IndexOf(TrainingActions, v) < 0) return false; }
+                else if (k == "trainGuard") { if (v != "none" && v != "hold" && v != "perfect") return false; }
+                else if (k == "trainChi") { if (v != "normal" && v != "empty" && v != "locked" && v != "refill") return false; }
+                else if (k == "trainInterval") { if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out n) || double.IsNaN(n) || n < 0.1 || n > 30) return false; }
+                else if (v != "0" && v != "1") return false;
+                Training[k] = v; return true;
+            }
 
             static readonly Regex PathRe = new Regex(@"^/PBZCombatAsset/[A-Za-z0-9_/]+\.[A-Za-z0-9_]+$");
             static readonly Regex WordRe = new Regex(@"^[A-Za-z0-9_]+$");
@@ -142,29 +159,31 @@ namespace ForNet
             public bool SetFollow(string v) { v = (v ?? "").Trim(); if (v != "0" && v != "1") return false; Follow = v == "1"; return true; }
             public string AccWire() { return Acc ?? "-"; }
             public string WeaponWire() { return Fam + "|" + Wc; }
-            public Loadout Clone() { return (Loadout)MemberwiseClone(); }
+            public Loadout Clone() { var c = (Loadout)MemberwiseClone(); c.Training = new Dictionary<string, string>(Training); return c; }
 
             // F5：基底经 IAiLoad 存取，键名 / 顺序和以前写死在联机程序里的一字不差
-            static readonly string[] Cmd = { "w", "e", "o", "med", "acc", "fol" };
+            static readonly string[] Cmd = { "w", "e", "o", "med", "acc", "fol", "trainAction", "trainGuard", "trainDodge", "trainInterval", "trainRepeat", "trainReturn", "trainHpRegen", "trainChi", "trainAiHp", "trainAiChi" };
             string[] IAiLoad.CmdKeys { get { return Cmd; } }
             bool IAiLoad.Set(string k, string v)
             {
                 switch (k) { case "w": return SetWeapon(v); case "e": return SetEdge(v); case "o": return SetOutfit(v); case "med": return SetPotions(v); case "acc": return SetAcc(v); case "fol": return SetFollow(v); }
-                return false;
+                return SetTraining(k, v);
             }
             bool IAiLoad.LoadCfg(string k, string v)
             {
                 switch (k) { case "aiw": return SetWeapon(v); case "aie": return SetEdge(v); case "aio": return SetOutfit(v); case "aimed": return SetPotions(v); case "aiacc": return SetAcc(v); case "aifol": return SetFollow(v); }
-                return false;
+                return SetTraining(k, v);
             }
             void IAiLoad.SaveCfg(StringBuilder sb)
             {
+                foreach (var kv in Training) sb.Append(kv.Key).Append('=').Append(kv.Value).Append('\n');
                 sb.Append("aiw=").Append(WeaponWire()).Append('\n').Append("aie=").Append(Edge).Append('\n')
                   .Append("aio=").Append(Outfit).Append('\n').Append("aimed=").Append(Potions).Append('\n')
                   .Append("aiacc=").Append(AccWire()).Append('\n').Append("aifol=").Append(Follow ? 1 : 0).Append('\n');
             }
             void IAiLoad.LobbyKv(Action<string, string> kv)
             {
+                foreach (var entry in Training) kv(entry.Key, entry.Value);
                 kv("aiw", Wc);               // §114 AI 装备（面板按这些值标出当前选的是哪个）。Clean 会把 | 换掉，武器拆成路径 + 族两项
                 kv("aiwf", Fam);
                 kv("aie", Edge);
@@ -176,8 +195,8 @@ namespace ForNet
             IAiLoad IAiLoad.Clone() { return Clone(); }
         }
 
-        internal class Ev { public int Id; public double T; public string Name; }
-        class Ans { public int Rid; public double Seen; public string Kind; public double Dmg, Paid, Last = -1; public bool Summon, Late, Linger, Sword; }   // §115 Dmg 这招累计伤害，Paid 已扣的血，Last 最后一次在 td= 里；§388 Sword 紫冥剑收尾招（等飞剑）
+        internal class Ev { public int Id; public double T, HoldSec; public string Name; }
+        class Ans { public int Rid; public double Seen; public string Kind, Name; public double Dmg, Paid, Last = -1; public bool Summon, Late, Linger, Sword, Broke; }   // §115 Dmg 这招累计伤害，Paid 已扣的血，Last 最后一次在 td= 里；§388 Sword 紫冥剑收尾招（等飞剑）
 
         readonly string abilFile;
         readonly GamePipe mb;       // §84 和 AI 那个 Session 的内存交接（GamePipe.StartVirtual）
@@ -196,6 +215,13 @@ namespace ForNet
         internal bool pupBusy;
         internal bool shGate;                            // §353 杀气以替身为准（psq=）：技能要看杀气够不够                           // §352 包里 pst=1：替身在你游戏里挨打 / 被控
         internal int busyN;                              // §352 停手过几次（测试 / 日志看）
+        // 木桩"普通格挡（按住）"（用户 11-23"开了这个就无敌了，都不用完美"）：以前每一刀都回普防，替身在你游戏里杀气被打空、播了破防
+        // （日志 13:23:22 杀气 800→27、AM_Hun_Break_H_F）也照样回普防、不掉血。现在：红光招（tred=）挡不住；替身破防的那一刀（tbrk=）
+        // 和破防后 BreakStun 秒内（tbrkon=1 期间 / 之后）碰到的刀、杀气见底时碰到的刀都算中招。杀气锁满 / 无限杀气时不破防（那是开关本意）
+        const double BreakStun = 1.5;
+        internal double dummyBrokeAt = -1;
+        internal readonly HashSet<int> dummyRedIds = new HashSet<int>(), dummyBrkIds = new HashSet<int>();
+        readonly HashSet<int> dummyBrkSeen = new HashSet<int>();
         internal double[] fpos;
         double stayZ = double.NaN;                       // §354 不跟随时站着的高度（摆到你面前 / 开战点那一刻的）
         string stayMap;                                  // §354 不跟随时换了图要重新摆
@@ -254,17 +280,51 @@ namespace ForNet
         static string F1(double v) { return Kv.F(v, "0.0"); }
 
         // 你的一刀碰到 AI 时的结果：按难度权重 中招 / 精防 / 普防；它举着架势时只有精防 / 普防
-        string Roll(Lv lv, double tnow)
+        string Roll(Lv lv, double tnow, int atk = 0)
         {
+            if (lv.Dummy)
+            {
+                if (Load.Train("trainChi") == "empty" && Load.Train("trainAiChi") != "1") return "hit";
+                if (Load.Train("trainGuard") == "perfect") return "parry";
+                if (Load.Train("trainGuard") == "hold") return DummyHoldFails(atk, tnow) ? "hit" : "block";
+                return "hit";
+            }
             if (pupBusy) return "hit";                   // §352 挨打硬直 / 冻住时防不了（真人一样）
             if (tnow < guardUntil) return rnd.NextDouble() < lv.GuardParry ? "parry" : "block";
             int w = rnd.Next(lv.Hit + lv.Parry + lv.Block);
             return w < lv.Hit ? "hit" : w < lv.Hit + lv.Parry ? "parry" : "block";
         }
 
-        // §367 和 main.lua 的 §249 ATK_EXTRA 一样：资产上会打人、但被下面的排除词挡住的 5 招
+        // 木桩普通格挡挡不住这一刀：红光招；或替身破防了（破防的那一刀 / 破防后 BreakStun 秒内 / 杀气见底）。杀气锁满 / 无限杀气不破防
+        internal bool DummyHoldFails(int atk, double tnow)
+        {
+            if (atk > 0 && dummyRedIds.Contains(atk)) return true;
+            if (Load.Train("trainAiChi") == "1" || Load.Train("trainChi") == "locked") return false;
+            if (atk > 0 && dummyBrkIds.Contains(atk)) return true;
+            if (dummyBrokeAt >= 0 && tnow - dummyBrokeAt < BreakStun) return true;
+            return shGate && sh < 1;
+        }
+
+        // 读包里的 tred= / tbrk= / tbrkon=（木桩用）
+        void ReadDummyGuard(Dictionary<string, string> me, double tnow)
+        {
+            dummyRedIds.Clear(); dummyBrkIds.Clear();
+            foreach (var t in Get(me, "tred").Split(',')) { int v; if (int.TryParse(t, out v)) dummyRedIds.Add(v); }
+            foreach (var t in Get(me, "tbrk").Split(','))
+            {
+                int v;
+                if (!int.TryParse(t, out v)) continue;
+                dummyBrkIds.Add(v);
+                if (dummyBrkSeen.Add(v)) dummyBrokeAt = tnow;
+            }
+            if (Get(me, "tbrkon") == "1") dummyBrokeAt = tnow;
+            if (dummyBrkSeen.Count > 1000) dummyBrkSeen.Clear();
+        }
+
+        // Keep the extra attacks, including QuickCharge, aligned with Lua ATK_EXTRA.
         static readonly HashSet<string> AttackExtra = new HashSet<string> {
             "GA_Hun_ChiZheCanJian_C_ToZui_C", "GA_Hun_YanYueDao_Stance_C", "GA_TieKuangQuanTao_GuardPoint_C",
+            "GA_TigerCannon_QuickCharge_C",
             "GA_XieShan_LightningIce_PerfectDeflect_C", "GA_XieShan_LightningIce_PerfectDeflect_FullCharge_C" };
 
         public static bool IsAttack(string n)
@@ -429,6 +489,145 @@ namespace ForNet
             if (combos.Count == 0 && skills.Count == 0) return Moves.DoubleDefault();    // 读不到这个族的招：退回双刃（日志会说）
             if (combos.Count == 0) combos.AddRange(skills);
             return new Moves { Combos = combos.ToArray(), Skills = skills.Count > 0 ? skills.ToArray() : combos.ToArray(), Air = air.ToArray(), Stance = stance };
+        }
+
+        // HANDOVER 185.1: [Stance]+[HeavyAttack] is weapon-specific, not the C ultimate.
+        static readonly Dictionary<string, string> TrainingSpecial = new Dictionary<string, string> {
+            { "Tang", "Buff" }, { "HeiMoShang", "Buff" }, { "Double", "Buff" },
+            { "ChiZheCanJian", "DrinkBase" }, { "LuanYing", "Buff" }, { "Iron", "Buff" },
+            { "Chaos", "SwitchFormFire" }, { "BaiYing", "BuffAtk" }, { "SlitheringSword", "DB4" },
+            { "FengLeiJian", "FengLeiState_SpecailAttack_02" }, { "ZiMingJian", "DB" },
+            { "Long", "BSup" }, { "ChiRen", "BSup" }, { "ZhanMa", "DB" }, { "PoJun", "DB" },
+            { "Horizontal", "BladeWave" }, { "YanYueDao", "SpecialSkill" }, { "ShuangYue", "DB" },
+            { "SnakeDual", "DB" }, { "DualHook", "DB" }, { "Jade", "DB" }, { "XieShan", "DB" }
+        };
+        public static string TrainingDodgeMove(string text, string fam)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            string generic = null, baseFam;
+            if (FamBase.TryGetValue(fam, out baseFam)) fam = baseFam;
+            if (Array.IndexOf(new[] { "Long", "ZhanMa", "GuiTouBlade", "Horizontal", "Jigsaw", "PoJun", "YanYueDao", "BaiYing" }, fam) >= 0) generic = "Long";
+            else if (Array.IndexOf(new[] { "Tang", "Young", "WoodenSword", "ZiMingJian", "SlitheringSword", "Iron", "Chaos", "ChiZheCanJian", "BronzeSword", "LuanYing" }, fam) >= 0) generic = "Tang";
+            else if (Array.IndexOf(new[] { "Double", "DualHook", "SnakeDual", "Jade", "ShuangYue", "XieShan", "FengLeiJian" }, fam) >= 0) generic = "Double";
+            var candidates = new List<string>();
+            if (fam == "Jade") candidates.Add("GA_Hun_AdvancedDash_Double_Jade_C");
+            if (fam == "Young" || fam == "WoodenSword") candidates.Add("GA_Hun_Young_AdvancedDash_C");
+            candidates.Add("GA_Hun_AdvancedDash_" + fam + "_C");
+            if (generic != null) candidates.Add("GA_Hun_AdvancedDash_" + generic + "_C");
+            foreach (var n in candidates)
+                if (Regex.IsMatch(text, @"^\s*" + Regex.Escape(n) + @"\s*=", RegexOptions.Multiline)) return n;
+            return null;
+        }
+
+        public static readonly string[] TrainingActions = { "none", "light", "light_hold", "heavy", "heavy_hold", "lh", "llh", "lllh", "llllh", "hl", "hll", "hlll", "hllll", "sprint_l", "sprint_lh", "sprint_h", "sprint_h_hold", "sprint_hl", "special", "special_hold", "advanced", "chi", "jump", "jump_l", "jump_h" };
+
+        // Resolve only assets in the selected family. Missing derivatives truncate the chain,
+        // never substitute another weapon's combo (notably B-start weapons).
+        public static List<string> TrainingMoves(string text, string fam, string action, bool continuous = false)
+        {
+            var result = new List<string>();
+            if (action == "none" || string.IsNullOrEmpty(text)) return result;
+            var names = new HashSet<string>();
+            foreach (Match m in Regex.Matches(text, @"^\s*(GA_\w+_C)\s*=", RegexOptions.Multiline)) names.Add(m.Groups[1].Value);
+            string pre = "GA_Hun_" + fam + "_";
+            Func<string, string> find = rest => {
+                foreach (var p in new[] { "", "New_", "Normal_" })
+                    foreach (var s in new[] { "", "_New", "_Physics", "_Fire", "_Ice" })
+                        if (names.Contains(pre + p + rest + s + "_C")) return pre + p + rest + s + "_C";
+                return null;
+            };
+            Func<string[], string> first = options => { foreach (var r in options) { var n = find(r); if (n != null) return n; } return null; };
+            string letters = null, single = null;
+            switch (action)
+            {
+                case "light": letters = "A"; break;
+                case "heavy": letters = "B"; break;
+                case "lh": letters = "AB"; break; case "llh": letters = "AAB"; break;
+                case "lllh": letters = "AAAB"; break; case "llllh": letters = "AAAAB"; break;
+                case "hl": letters = "BA"; break; case "hll": letters = "BAA"; break;
+                case "hlll": letters = "BAAA"; break; case "hllll": letters = "BAAAA"; break;
+                case "light_hold": single = first(new[] { "A_Draw", "A_Hold", "A" }); break;
+                case "heavy_hold": single = first(new[] { "B_Hold", "B_Hold_Start", "BCharge", "B_Draw", "B" }); break;
+                case "sprint_l": case "sprint_lh": single = first(new[] { "A_Dash", "A_Dash_Short", "DashA" }); break;
+                case "sprint_h": case "sprint_hl": single = find("B_Dash"); break;
+                case "sprint_h_hold": single = first(new[] { "B_DashDraw", "B_Dash_Hold" }); break;
+                case "special": case "special_hold":
+                    string special;
+                    if (TrainingSpecial.TryGetValue(fam, out special))
+                        single = action == "special_hold" ? first(new[] { special + "_Draw", special + "_Hold", special }) : find(special);
+                    break;
+                case "advanced": case "chi":
+                    // HANDOVER 19.12 / 183 / 211: Stance+Execution is shared by weapon type.
+                    string global = null;
+                    if (Array.IndexOf(new[] { "Long", "ChiRen", "ZhanMa", "GuiTouBlade", "Horizontal", "Jigsaw", "PoJun", "YanYueDao", "BaiYing" }, fam) >= 0) global = "LieZhan";
+                    else if (Array.IndexOf(new[] { "Tang", "HeiMoShang", "Young", "WoodenSword", "ZiMingJian", "SlitheringSword", "Iron", "Chaos", "ChiZheCanJian", "BronzeSword", "LuanYing" }, fam) >= 0) global = "ShunSha";
+                    else if (Array.IndexOf(new[] { "Double", "DualHook", "SnakeDual", "Jade", "ShuangYue", "XieShan", "FengLeiJian" }, fam) >= 0) global = "YingSha";
+                    if (global != null)
+                    {
+                        string start = (global == "YingSha" ? "GA_GlobalActionAbilities_" : "GA_GlobalActionAbility_") + global + "_C_C";
+                        if (names.Contains(start))
+                        {
+                            result.Add(start);
+                            string finish = "GA_GlobalActionAbility_" + global + "_CB_C";
+                            if (action == "chi" && names.Contains(finish)) result.Add(finish);
+                        }
+                    }
+                    break;
+                case "jump": case "jump_l": case "jump_h":
+                    result.Add("GA_Hun_Jump_C");
+                    if (action != "jump") single = first(new[] { action == "jump_l" ? "Air_A" : "Air_B", action == "jump_l" ? "Air_A_Double" : "Air_B_Double" });
+                    break;
+            }
+            if (continuous && (action == "light" || action == "heavy")) letters = new string(action == "light" ? 'A' : 'B', 12);
+            if (letters != null)
+                for (int i = 1; i <= letters.Length; i++) { var n = find(letters.Substring(0, i)); if (n == null) break; result.Add(n); }
+            if (single != null) result.Add(single);
+            if (action == "sprint_lh" || action == "sprint_hl")
+            {
+                var n = first(action == "sprint_lh" ? new[] { "ATB", "AB" } : new[] { "BTA", "BA" });
+                if (result.Count > 0 && n != null) result.Add(n);
+            }
+            return result;
+        }
+
+        string trainingSignature, trainingUnsupported = "";
+        bool? previousDummy;
+        double lastHpLoss = -1, lastChiLoss = -1, previousChi = -1;
+        int trainChiEpoch;
+        internal string AdvanceTraining(double now, bool hold, bool busy, Loadout ld, string text, out double height, out double vz)
+        {
+            string signature = ld.Fam + ":" + ld.Train("trainAction") + ":" + ld.Train("trainRepeat");
+            if (signature != trainingSignature || hold) { trainingSignature = signature; trainingUnsupported = ""; combo.Clear(); events.Clear(); nextHit = now + 0.3; }
+            if (!hold && !busy && dead == 0 && now >= nextHit)
+            {
+                if (combo.Count == 0)
+                {
+                    combo = TrainingMoves(text, ld.Fam, ld.Train("trainAction"), ld.Train("trainRepeat") == "1");
+                    if (combo.Count == 0)
+                    {
+                        trainingUnsupported = ld.Train("trainAction") == "none" ? "" : ld.Train("trainAction");
+                        if (trainingUnsupported.Length > 0) Log("AI training: unsupported action " + trainingUnsupported + " for " + ld.Fam);
+                        nextHit = now + 30;
+                    }
+                }
+                if (combo.Count > 0)
+                {
+                    var n = combo[0]; combo.RemoveAt(0);
+                    double held = ld.Train("trainAction").EndsWith("_hold", StringComparison.Ordinal) ? 1.5 : 0;
+                    events.Add(new Ev { Id = ++evId, T = now, Name = n, HoldSec = held });
+                    if (n == "GA_Hun_Jump_C") hopT0 = now;
+                    double interval = double.Parse(ld.Train("trainInterval"), CultureInfo.InvariantCulture);
+                    nextHit = now + (combo.Count > 0 ? (n == "GA_Hun_Jump_C" ? HopLead : 0.9) : Math.Max(ld.Train("trainRepeat") == "1" ? 1.2 : interval, ld.Train("trainAction").StartsWith("jump") ? 3.0 : (held > 0 ? held + 1.2 : 1.2)));
+                }
+            }
+            height = 0; vz = 0;
+            if (hopT0 >= 0) { double t = now - hopT0; height = HopVz * t - HopG * t * t / 2; vz = HopVz - HopG * t; if (height <= 0 && t > 0.05) { height = 0; vz = 0; hopT0 = -1; } }
+            events.RemoveAll(e => now - e.T >= Math.Max(2, e.HoldSec + 2));
+            if (!hold && !busy && dead == 0 && (ld.Train("trainChi") != "empty" || ld.Train("trainAiChi") == "1") && ld.Train("trainGuard") == "hold" && mv.Stance != null && combo.Count == 0 && events.Count == 0)
+                events.Add(new Ev { Id = ++evId, T = now, Name = mv.Stance });
+            var sb = new StringBuilder();
+            foreach (var e in events) if (now - e.T < 2) sb.Append(sb.Length > 0 ? "," : "").Append(e.Id).Append(':').Append(e.Name);
+            return sb.ToString();
         }
 
         // §114 喝药动作按武器（§103 实测：双刃 / 长刀 / 唐刀各一个；白蟒赤练有自己的；其余用通用的）
@@ -648,11 +847,30 @@ namespace ForNet
             bool hold = mstate == "cd";
             var lv = LevelOf(Level);
             bool dummy = lv.Dummy;                           // §342 木桩：一直按"倒计时站着不动"走（离你超过 30 米 / 换图才挪到你面前）
-            double[] spot = hold ? AspGuest(Get(me, "asp")) : null;
+            if (previousDummy.HasValue && previousDummy.Value != dummy)
+            {
+                combo.Clear(); events.Clear(); nextHit = tnow + 0.3; trainingSignature = null;
+            }
+            previousDummy = dummy;
+            double[] spot = hold && (!dummy || Load.Train("trainReturn") == "1") ? AspGuest(Get(me, "asp")) : null;
             double vx, vy, holdZ;
-            bool follow = Load.Follow;                       // §354
+            bool follow = Load.Follow && (!dummy || Load.Train("trainReturn") == "1");                       // §354
             string map = Get(me, "map");
             if (!follow && map.Length > 0 && map != stayMap) { if (stayMap != null) fpos = null; stayMap = map; }     // 换图：重新摆到你面前
+            if (dummy && !follow && map.Length > 0 && fpos != null)
+            {
+                var actual = Get(me, "trainPos").Split(':');
+                double ax, ay, az;
+                if (actual.Length == 3 && double.TryParse(actual[0], NumberStyles.Float, CultureInfo.InvariantCulture, out ax)
+                    && double.TryParse(actual[1], NumberStyles.Float, CultureInfo.InvariantCulture, out ay)
+                    && double.TryParse(actual[2], NumberStyles.Float, CultureInfo.InvariantCulture, out az)
+                    && !double.IsNaN(ax) && !double.IsNaN(ay) && !double.IsNaN(az)
+                    && Math.Abs(ax) < 1e9 && Math.Abs(ay) < 1e9 && Math.Abs(az) < 1e9)
+                {
+                    fpos[0] = ax; fpos[1] = ay;
+                    if (hopT0 < 0) stayZ = az; // Air feedback includes our hop; do not add it twice.
+                }
+            }
             var fpos0 = fpos;
             StepApproach(dt, px, py, yaw, spot, hold || dummy, out vx, out vy, out holdZ, follow);
             if (!follow)
@@ -670,7 +888,7 @@ namespace ForNet
             if (hpm <= 0) hpm = 3085.5;
             double shm = Num(me, "shm", 800);
             if (shm <= 0) shm = 800;
-            shGate = !dummy && me.ContainsKey("psq");                                  // §353
+            shGate = me.ContainsKey("psq");                                  // §353
             if (shGate) sh = Math.Max(0, Math.Min(shm, Num(me, "psq", sh < 0 ? shm : sh)));
             else sh = sh < 0 ? shm : Math.Min(shm, sh + 150 * dt);
             var ld = Load;
@@ -679,7 +897,18 @@ namespace ForNet
             {
                 hp = hpm; dead = 0; curRound = mround; medLeft = dummy ? 0 : ld.Potions;
             }
-            if (dummy) { dead = 0; sh = shm; }
+            if (dummy)
+            {
+                if (previousChi >= 0 && sh < previousChi - 0.5) lastChiLoss = tnow;
+                previousChi = sh;
+                if (ld.Train("trainAiHp") == "1") { hp = hpm; dead = 0; }
+                else if (ld.Train("trainHpRegen") == "1" && lastHpLoss >= 0 && tnow - lastHpLoss >= 5) { hp = hpm; dead = 0; }
+                if (ld.Train("trainAiChi") == "1" || ld.Train("trainChi") == "locked") sh = shm;
+                else if (ld.Train("trainChi") == "empty") sh = 0;
+                else if (ld.Train("trainChi") == "refill" && lastChiLoss >= 0 && tnow - lastChiLoss >= 5) { sh = shm; trainChiEpoch++; lastChiLoss = -1; }
+            }
+            if (ld.Train("trainAiHp") == "1") { hp = hpm; dead = 0; }
+            if (ld.Train("trainAiChi") == "1") sh = shm;
             string wcs;
             SyncWeaponAndEdge(ld, me, abilText, out wcs);
             bool near = Math.Sqrt((px - x) * (px - x) + (py - y) * (py - y)) <= Reach;
@@ -691,11 +920,16 @@ namespace ForNet
                 pupBusy = busyNow;
                 if (busyNow) { guardUntil = Math.Min(guardUntil, tnow); busyN++; }
             }
-            string evStr = AdvanceCombat(tnow, hold, near, dead == 0 && !dummy && !pupBusy, dead == 0 && !dummy && !pupBusy, mstate, Get(me, "medok"), hpm, ld, out hopH, out hopV);
+            string evStr = dummy
+                ? AdvanceTraining(tnow, hold, Get(me, "pst") == "1" || Get(me, "trainBusy") == "1" || (dummyBrokeAt >= 0 && tnow - dummyBrokeAt < BreakStun), ld, abilText, out hopH, out hopV)
+                : AdvanceCombat(tnow, hold, near, dead == 0 && !pupBusy, dead == 0 && !pupBusy, mstate, Get(me, "medok"), hpm, ld, out hopH, out hopV);
+            if (dummy && ld.Train("trainGuard") == "hold" && dead == 0 && (ld.Train("trainChi") != "empty" || ld.Train("trainAiChi") == "1")) guardUntil = tnow + 0.2;
 
             // 你的每一刀：按难度的权重随机回报 中招 / 精防 / 普防（举着架势时只有精防 / 普防），晚 ResDelay 秒。
             // §107 模组发了 tc=（你哪几招在游戏里真的碰到了 AI 的身体）：只有碰到的招才掷结果，TouchWait 秒内没碰到 = 落空；
             // 旧版模组没有 tc= → 照旧每招都掷（以前对着空气砍 AI 也掉血就是这个）
+            if (dummy) ReadDummyGuard(me, tnow);
+            bool dummyHold = dummy && ld.Train("trainGuard") == "hold";
             bool touchInfo = me.ContainsKey("tc");
             var touched = new HashSet<int>();
             foreach (var tid in Get(me, "tc").Split(',')) { int v; if (int.TryParse(tid, out v)) touched.Add(v); }
@@ -711,19 +945,33 @@ namespace ForNet
                 if (!summon && !IsAttack(evn)) continue;
                 // §350 召唤招：没有 tc= 的旧版模组照旧不掷（召唤招本身不出刀）；碰到了一律算中招（召出来的东西不按难度防）
                 if (summon && !touchInfo) continue;
-                answered[atk] = new Ans { Rid = ++resId, Seen = tnow, Kind = touchInfo ? null : Roll(lv, tnow), Summon = summon, Linger = IsLingerCast(evn), Sword = IsSwordCast(evn) };
+                answered[atk] = new Ans { Rid = ++resId, Name = evn, Seen = tnow, Kind = touchInfo ? null : Roll(lv, tnow, atk), Summon = summon, Linger = IsLingerCast(evn), Sword = IsSwordCast(evn) };
             }
+            var redAttacks = new HashSet<string>(Get(me, "tred").Split(','));
             foreach (var kv in answered)
             {
                 var a = kv.Value;
+                if (dummy && ld.Train("trainDodge") == "1" && redAttacks.Contains(kv.Key.ToString(CultureInfo.InvariantCulture)))
+                {
+                    if (a.Kind == null && touched.Contains(kv.Key))
+                    {
+                        var dodge = TrainingDodgeMove(abilText, ld.Fam);
+                        if (dodge != null)
+                        {
+                            a.Kind = "miss"; a.Seen = tnow - ResDelay; a.Late = false;
+                            events.Add(new Ev { Id = ++evId, T = tnow, Name = dodge });
+                        }
+                    }
+                    if (a.Kind == "miss") continue;
+                }
                 if (a.Kind == "miss" && a.Late && touched.Contains(kv.Key))     // §351 落空后又碰到：改判，结果号不变
                 {
-                    a.Late = false; a.Kind = a.Summon || a.Linger || a.Sword ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay;   // §378 石蒜花晚炸 = 中招；§388 飞剑晚到 = 中招
+                    a.Late = false; a.Kind = a.Summon || a.Linger || a.Sword ? "hit" : Roll(lv, tnow, kv.Key); a.Seen = tnow - ResDelay + TouchDelay;   // §378 石蒜花晚炸 = 中招；§388 飞剑晚到 = 中招
                     Log(L.T("AI：你的第 " + kv.Key + " 招先判落空、后来碰到了，改判 " + a.Kind, "AI: your move #" + kv.Key + " hit late, now " + a.Kind));
                     continue;
                 }
                 if (a.Kind != null) continue;
-                if (touched.Contains(kv.Key)) { a.Kind = a.Summon ? "hit" : Roll(lv, tnow); a.Seen = tnow - ResDelay + TouchDelay; }
+                if (touched.Contains(kv.Key)) { a.Kind = a.Summon ? "hit" : Roll(lv, tnow, kv.Key); a.Seen = tnow - ResDelay + TouchDelay; }
                 else if (a.Summon ? tnow - a.Seen >= SummonTouchWait
                          : a.Sword ? ((tnow - a.Seen >= SwordTouchWait && (!actInfo || !acting.Contains(kv.Key))) || tnow - a.Seen >= ActMax)   // §388 等飞剑
                          : actInfo ? (tnow - a.Seen >= TouchWait && !acting.Contains(kv.Key)) || tnow - a.Seen >= ActMax     // §352
@@ -756,12 +1004,22 @@ namespace ForNet
             {
                 var a = kv.Value;
                 if (a.Kind == null || tnow - a.Seen < ResDelay) continue;
+                // 木桩普通格挡：判了普防、还没回报的，回报前再看一眼（破防动作 / 杀气常比碰到晚一两帧到）
+                if (dummyHold && a.Kind == "block" && !counted.Contains(a.Rid) && DummyHoldFails(kv.Key, tnow)) a.Kind = "hit";
+                if (dummyHold && a.Kind == "hit" && dummyBrkIds.Contains(kv.Key) && !dummyRedIds.Contains(kv.Key)) a.Broke = true;   // 记住：之后 tbrk= 里没了也不退回 400
+                bool brkHit = a.Broke;
                 if (a.Kind == "hit" && a.Dmg <= 0)
                 {
                     if (a.Summon) continue;                                           // §350 召唤物只按 td= 报的真实掉血，不退回 400
+                    if (brkHit)                                                       // 破防的那一刀：游戏掉多少算多少，没掉 = 中招 -0（同 §347），不退回 400
+                    {
+                        if (dmgInfo && tnow - a.Seen < ResDelay + DmgWait) continue;
+                        goto Emit;
+                    }
                     if (dmgInfo && tnow - a.Seen < ResDelay + DmgWait) continue;     // §115 等 td= 报伤害
                     a.Dmg = dmg;                                                      // 旧版模组 / 等不到：400
                 }
+                Emit:
                 res.Append(res.Length > 0 ? "," : "").Append(a.Rid).Append(':').Append(kv.Key).Append(':').Append(a.Kind).Append(':')
                    .Append(a.Kind == "hit" ? Kv.F(a.Dmg, "0") : "0");
                 if (counted.Add(a.Rid) && !shGate && (a.Kind == "block" || a.Kind == "parry")) sh = Math.Max(0, sh - (a.Kind == "block" ? 300 : 100));   // §353 杀气以替身为准时不自己扣
@@ -769,12 +1027,14 @@ namespace ForNet
                 {
                     if (dummy && mstate != "cd")
                     {
-                        // §342 木桩不死：扣到 0 就回满。回报的 res= 照旧是这招的完整累计伤害 a.Dmg（不按剩的血截，用户 11-16
-                        // "剩 10 血、100 伤害的招按 100 算"）；这里只管血条
-                        hp -= a.Dmg - a.Paid;
-                        if (hp <= 0) { hp = hpm; Log(L.T("AI：木桩空血，回满", "AI: dummy emptied, refilled")); }
+                        lastHpLoss = tnow;
+                        if (ld.Train("trainAiHp") != "1") hp = Math.Max(0, hp - (a.Dmg - a.Paid));
+                        if (hp <= 0)
+                        {
+                            if (ld.Train("trainHpRegen") != "1") dead = Math.Max(1, mround);
+                        }
                     }
-                    else if (mstate == "fight" && dead == 0)
+                    else if (mstate == "fight" && dead == 0 && ld.Train("trainAiHp") != "1")
                     {
                         hp = Math.Max(0, hp - (a.Dmg - a.Paid));
                         if (hp <= 0) { dead = mround; Log(L.T("AI：第 " + mround + " 回合被打倒", "AI: knocked down in round " + mround)); }
@@ -786,8 +1046,15 @@ namespace ForNet
 
             if (dummy && ld.Acc == null) { ld = ld.Clone(); ld.Acc = ""; }      // §342 木桩默认不带饰品（AI 装备里自选了饰品就用自选的）
             var body = BuildPacketBody(me, x, y, (double.IsNaN(holdZ) ? pz : holdZ) + hopH, face, vx, vy, ld, evStr, hpm, res.ToString(), dead, shm, hopV, wcs);
-            if (dummy) body += "dummy=1\n";
-            else body += "sqp=1\n";                         // §353 交手中替身杀气按游戏自己的（模组别补满）                 // §342 游戏据此：不按回合时限判负、替身本机一直留伤害余量、面板写木桩
+            if (dummy)
+            {
+                body += "dummy=1\nsqp=1\ntrainChiEpoch=" + trainChiEpoch + "\ntrainUnsupported=" + trainingUnsupported + "\n";
+                foreach (var entry in ld.Training) body += entry.Key + "=" + entry.Value + "\n";
+                var releases = new List<string>();
+                foreach (var e in events) if (e.HoldSec > 0 && tnow >= e.T + e.HoldSec) releases.Add(e.Id + ":" + Kv.F(e.HoldSec, "0.0"));
+                body += "rel=" + string.Join(",", releases) + "\n";
+            }
+            else body += "sqp=1\ntrainAiHp=" + ld.Train("trainAiHp") + "\ntrainAiChi=" + ld.Train("trainAiChi") + "\n";                         // §353 交手中替身杀气按游戏自己的（模组别补满）                 // §342 游戏据此：不按回合时限判负、替身本机一直留伤害余量、面板写木桩
             if (mb != null) mb.SetLocal(body);
         }
     }
@@ -825,6 +1092,7 @@ namespace ForNet
         volatile bool stop;
         Thread th;
         int hostPid = 1;
+        int memberResourceMask; // MP host-owned only; never read the 1v1 loadout's training flags.
         string hostMatchSt = "idle";
         string hostMode = "elim";
         int hostLives = 3;
@@ -879,7 +1147,7 @@ namespace ForNet
         {
             lock (mpLock)
             {
-                if (host > 0) hostPid = host;
+                if (host > 0 && host != hostPid) { hostPid = host; memberResourceMask = 0; }
                 aiPids.Clear();
                 if (ais != null) foreach (var id in ais) aiPids.Add(id);
             }
@@ -892,6 +1160,7 @@ namespace ForNet
             lock (mpLock)
             {
                 peers.Remove(pid);
+                if (pid == hostPid) memberResourceMask = 0;
                 foreach (var k in mtdSeen.Keys) if (k.StartsWith(prefix, StringComparison.Ordinal)) deadKeys.Add(k);
                 foreach (var k in deadKeys) mtdSeen.Remove(k);
                 deadKeys.Clear();
@@ -917,6 +1186,26 @@ namespace ForNet
                 int k, v;
                 if (p.Length >= 2 && int.TryParse(p[0], out k) && int.TryParse(p[1], out v)) dst[k] = v;
             }
+        }
+
+        internal static bool TryMemberResources(string csv, int selfPid, out int mask)
+        {
+            mask = 0;
+            if (string.IsNullOrEmpty(csv)) return true;
+            if (csv.Length > 8192) return false;
+            var seen = new HashSet<int>();
+            int selected = 0;
+            foreach (var entry in csv.Split(','))
+            {
+                var pair = entry.Split(':');
+                int pid, value;
+                if (pair.Length != 2 || !int.TryParse(pair[0], NumberStyles.None, CultureInfo.InvariantCulture, out pid) || pid <= 0
+                    || !int.TryParse(pair[1], NumberStyles.None, CultureInfo.InvariantCulture, out value) || value > 15
+                    || !seen.Add(pid) || seen.Count > 256) return false;
+                if (pid == selfPid) selected = value;
+            }
+            mask = selected;
+            return true;
         }
 
         void ResetForNewMatchLocked(int newMid)
@@ -957,6 +1246,8 @@ namespace ForNet
 
                 if (pid == hostPid)
                 {
+                    int resourceMask;
+                    memberResourceMask = TryMemberResources(LocalAi.Get(kv, "trainMembers"), Pid, out resourceMask) ? resourceMask : 0;
                     double hm = LocalAi.Num(kv, "hpm", 0);
                     if (hm > 0) lastHpm = hm;
                     string mpm = LocalAi.Get(kv, "mpm");
@@ -1136,7 +1427,7 @@ namespace ForNet
             if (hostMatchSt != "fight" || myDown || myOut) return;
             double hpmRef = lastHpm > 0 ? lastHpm : DefaultHpm;
             if (core.hp < 0) core.hp = hpmRef;
-            core.hp = Math.Max(0, core.hp - delta);
+            core.hp = (memberResourceMask & 1) != 0 ? hpmRef : Math.Max(0, core.hp - delta);
             if (core.hp <= 0)
             {
                 fatal = true;
@@ -1224,6 +1515,7 @@ namespace ForNet
             {
                 PeerSnapshot hostSnap;
                 peers.TryGetValue(hostPid, out hostSnap);
+                if (hostSnap == null || tnow - hostSnap.LastRx > AliveTimeout) memberResourceMask = 0;
                 var tgt = PickTargetLocked(tnow);
                 var refKv = tgt != null ? tgt.Kv : (hostSnap != null && hostSnap.Kv != null ? hostSnap.Kv : new Dictionary<string, string>());
 
@@ -1271,8 +1563,9 @@ namespace ForNet
                 lastHpm = hpm;
                 double shm = LocalAi.Num(refKv, "shm", DefaultShm);
                 if (shm <= 0) shm = DefaultShm;
-                core.sh = core.sh < 0 ? shm : Math.Min(shm, core.sh + 150 * dt);
+                core.sh = (memberResourceMask & 2) != 0 || core.sh < 0 ? shm : Math.Min(shm, core.sh + 150 * dt);
                 var ld = core.Load;
+                if ((memberResourceMask & 1) != 0 && !myDown && !myOut) core.hp = hpm;
                 if (core.hp < 0 || hostMatchSt == "idle" || hostMatchSt == "cd")
                 {
                     core.hp = hpm;
@@ -1293,6 +1586,8 @@ namespace ForNet
                 var sb = new StringBuilder(body);
                 sb.Append("nm=").Append(Name).Append('\n');
                 sb.Append("mt3=1\n");
+                sb.Append("trainAiHp=").Append((memberResourceMask & 1) != 0 ? 1 : 0).Append('\n');
+                sb.Append("trainAiChi=").Append((memberResourceMask & 2) != 0 ? 1 : 0).Append('\n');
                 // §335 我在打谁（游戏里替身照它对准出招；以前游戏猜，猜的时候不算 AI，队友 AI 没候选就对着真人砍）
                 sb.Append("atg=").Append(hasTgt && tgt != null ? tgt.Pid : 0).Append('\n');
                 sb.Append("hr=").Append(hrN).Append(':').Append(hrAnim).Append('\n');

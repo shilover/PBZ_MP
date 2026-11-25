@@ -499,6 +499,21 @@ local function tagsOf(actor)
     return nil
 end
 
+-- Training position report; only a validated actor and finite world coordinates.
+-- 【适配】AActor:K2_GetActorLocation() returns FVector X/Y/Z, in UE centimeters.
+function E.trainingPosition(actor)
+    if not valid(actor) then return nil end
+    local ok, pos = pcall(function() return actor:K2_GetActorLocation() end)
+    if not ok or not pos then return nil end
+    local okXYZ, x, y, z = pcall(function() return pos.X, pos.Y, pos.Z end)
+    if not okXYZ then return nil end
+    for _, v in ipairs({ x, y, z }) do
+        if type(v) ~= "number" or v ~= v or math.abs(v) >= 1e9 then return nil end
+    end
+    if x == nil or y == nil or z == nil then return nil end
+    return string.format("%.2f:%.2f:%.2f", x, y, z)
+end
+
 -- ============================================================ 观察用：哪些技能处于激活状态
 
 -- v0.6 实测 GameplayTag 三种取法都拿不到（恒为 0 个），改看哪些技能处于激活状态：
@@ -514,13 +529,15 @@ end
 -- 缓存按 角色 + want 分开存（发包看招式、编码被动看天赋 / 饰品，各一份，不互相顶掉）
 local SPEC = { cache = {}, TTL = 30.0, CHUNK = 12, logs = 0 }
 -- 【适配】ASC.ActivatableAbilities.Items 里 ActiveCount > 0 的技能类短名（want 给了就只看 want 为真的）
-local function activeAbilities(actor, want)
+local function activeAbilities(actor, want, requireComplete)
+    if requireComplete and want then return nil end -- Filtered/cached lists cannot establish absence.
     local asc = ascOf(actor)
     local items = asc and rawProp(rawProp(asc, "ActivatableAbilities"), "Items")
     if not items then return nil end
-    local act, moved = {}, false
+    local act, moved, incomplete = {}, false, false
     local function check(spec)
         local n = rawProp(spec, "ActiveCount")
+        if requireComplete and (type(n) ~= "number" or n ~= n or n < 0 or n % 1 ~= 0) then incomplete = true end
         if type(n) == "number" and n > 0 then
             local ab = rawProp(spec, "Ability")
             -- v0.27.7 先查有效：技能正在加 / 删的格 Ability 可能是空对象，空对象调 GetClass 读 [0x10] 直接崩（pcall 拦不住），
@@ -528,12 +545,14 @@ local function activeAbilities(actor, want)
             local okC, cls = false, nil
             if valid(ab) then okC, cls = pcall(function() return ab:GetClass() end) end
             local name = okC and shortName(full(cls)) or "?"
+            if requireComplete and (not valid(cls) or type(name) ~= "string" or name == "?" or name == "") then incomplete = true end
             if want and okC and not want(name) then moved = true      -- §82.5 看的格里冒出不该看的 → 位置挪了，不报
             else act[name] = true end
         end
     end
     if not want then
-        eachArr(items, function(_, spec) check(spec) end)
+        local ok = eachArr(items, function(_, spec) check(spec) end)
+        if requireComplete and (not ok or incomplete) then return nil end
         return act
     end
     local key, t = pathOf(actor) .. "|" .. tostring(want), os.clock()
@@ -1167,7 +1186,7 @@ function LO.applyGE(actor, path, label, lv)
     if not (cls and valid(asc)) then out("  %s：%s", label, cls and "没有 ASC" or "找不到 GE"); return false end
     local ok, r = pcall(function() return asc:BP_ApplyGameplayEffectToSelf(cls, lv or 1, asc:MakeEffectContext()) end)
     out("  %s：BP_ApplyGameplayEffectToSelf %s", label, ok and "成功" or ("失败 " .. tostring(r)))
-    return ok
+    return ok, r
 end
 
 -- 【适配】ASC:RemoveActiveGameplayEffectBySourceEffect(GE 类, nil, -1)。label 为 nil 时不记日志（§159 冲刺冷却每次都清）；返回调用成没成功
@@ -1396,6 +1415,35 @@ function LO.activeInstance(actor, clsName)
         end
     end)
     return found
+end
+
+-- §449 只读：角色身上某个技能（不管在不在放）的实例上几个变量。返回 "名=值 …" 或说明
+-- 【适配】ASC.ActivatableAbilities.Items[i].{ActiveCount, Ability:GetClass(), NonReplicatedInstances, ReplicatedInstances}
+function LO.instVars(actor, clsName, names)
+    local asc = ascOf(actor)
+    local items = asc and rawProp(rawProp(asc, "ActivatableAbilities"), "Items")
+    if not items then return "读不到技能列表" end
+    local found, act
+    eachArr(items, function(_, spec)
+        if found then return end
+        local ab = rawProp(spec, "Ability")
+        if not valid(ab) then return end
+        local okC, cls = pcall(function() return ab:GetClass() end)
+        if not (okC and shortName(full(cls)) == clsName) then return end
+        act = rawProp(spec, "ActiveCount")
+        for _, key in ipairs({ "NonReplicatedInstances", "ReplicatedInstances" }) do
+            eachArr(rawProp(spec, key), function(_, inst) if not found and valid(inst) then found = inst end end)
+        end
+        if not found then found = false end
+    end)
+    if found == nil then return "没有这个技能" end
+    if not found then return string.format("技能在（ActiveCount %s），没有实例（每次放才建）", tostring(act)) end
+    local t = { "ActiveCount=" .. tostring(act) }
+    for _, k in ipairs(names or {}) do
+        local ok, v = pcall(function() return found[k] end)
+        t[#t + 1] = k .. "=" .. (ok and tostring(v) or "读不到")
+    end
+    return table.concat(t, " ")
 end
 
 -- §119 对象的类（含父类）里名字匹配 pat 的函数和参数名（只反射不调用）。返回 { "TrySummonHuoQiang()", … }
@@ -1686,7 +1734,32 @@ local function alertName(c)
     return nil
 end
 -- 【适配】NiagaraComponent.RelativeScale3D / SetRelativeScale3D / GetAddress：出招提示组件三个轴 ×E.ALERT.mult，同一个组件只放大一次
-local function alertScaleComp(c)
+-- 【适配】GetAttachParent():GetOwner() identifies the actor owning a red Niagara alert.
+-- No UObject references are retained; post-spawn events also recognize pooled reuse.
+E.TRAIN_RED = { seq = 0, actors = {}, comps = {}, count = 0, actorCount = 0 }
+-- 【适配】Niagara GetAttachParent/GetOwner, validated actor path and finite scalar cache only.
+local function trainingRedObserve(c, key, name, x, y, z, fresh)
+    if not name:find("NS_AttackAlertHun_Red", 1, true) then return end
+    local tr = E.TRAIN_RED
+    local old = tr.comps[key]
+    if not fresh and old and old[1] == x and old[2] == y and old[3] == z then return end
+    local ok, actor = pcall(function() return c:GetAttachParent():GetOwner() end)
+    if not ok or not valid(actor) then return end
+    local actorKey = pathOf(actor)
+    if tr.count >= 400 or tr.actorCount >= 400 then tr.comps, tr.actors, tr.count, tr.actorCount = {}, {}, 0, 0 end
+    if not tr.comps[key] then tr.count = tr.count + 1 end
+    if not tr.actors[actorKey] then tr.actorCount = tr.actorCount + 1 end
+    tr.comps[key] = { x, y, z }
+    tr.seq = tr.seq + 1
+    tr.actors[actorKey] = tr.seq
+end
+-- 【适配】Read the bounded red-alert epoch cache by validated actor path.
+function E.trainingRedEpoch(actor)
+    if not valid(actor) then return 0 end
+    return E.TRAIN_RED.actors[pathOf(actor)] or 0
+end
+-- 【适配】Niagara RelativeScale3D/SetRelativeScale3D/GetAddress; observe before scale deduplication.
+local function alertScaleComp(c, observe, fresh)
     local AL = E.ALERT
     local name = alertName(c)
     if not name then return end
@@ -1697,6 +1770,8 @@ local function alertScaleComp(c)
     local okK, key = pcall(function() return c:GetAddress() end)
     if not okK or key == nil then key = tostring(c) end
     local t = AL.done[key]
+    if observe then trainingRedObserve(c, key, name, x, y, z, fresh) end
+    if not AL.on then return end
     if t and math.abs(t[1] - x) < 1e-3 and math.abs(t[2] - y) < 1e-3 and math.abs(t[3] - z) < 1e-3 then return end
     local m = AL.mult
     local nx, ny, nz = x * m, y * m, z * m
@@ -1714,15 +1789,23 @@ local function alertScaleComp(c)
     end
 end
 -- 【适配】GAAction_WeaponParticle_C 生成函数的钩子回调：只读 ctx 自己的 "Niagara Comps" / NiagaraEffect（不读蓝图参数）
-local function alertHookCb(hctx)
+local function alertHookCb(hctx, observe, fresh)
     local AL = E.ALERT
     AL.calls = AL.calls + 1
-    if not AL.on then return nil end
     pcall(function()
         local self = hctx:get()
         if self == nil or dead(self) then return end
-        eachArr(rawProp(self, "Niagara Comps"), function(_, c) alertScaleComp(c) end)
-        alertScaleComp(rawProp(self, "NiagaraEffect"))
+        local seen = {}
+        local function visit(c)
+            if c == nil then return end
+            local ok, key = pcall(function() return c:GetAddress() end)
+            key = ok and key or tostring(c)
+            if seen[key] then return end
+            seen[key] = true
+            alertScaleComp(c, observe, fresh)
+        end
+        eachArr(rawProp(self, "Niagara Comps"), function(_, c) visit(c) end)
+        visit(rawProp(self, "NiagaraEffect"))
     end)
     return nil
 end
@@ -1748,7 +1831,12 @@ function E.alertScaleHook()
     for _, fn in ipairs(AL.FNS) do
         if have[fn] then
             -- pre / post 都跑同一个回调：不管 UE4SS 哪个先调，生成后那次都能看到新组件；已放大的会跳过
-            local ok, e = pcall(function() RegisterHook(AL.CLS .. ":" .. fn, alertHookCb, alertHookCb) end)
+            local fresh = fn ~= "Received_ActionBegin"
+            local ok, e = pcall(function()
+                RegisterHook(AL.CLS .. ":" .. fn,
+                    function(hctx) return alertHookCb(hctx, false, false) end,
+                    function(hctx) return alertHookCb(hctx, true, fresh) end)
+            end)
             got[#got + 1] = fn .. (ok and " 成功" or (" 失败 " .. tostring(e)))
             if ok then AL.hooked = true end
         end
@@ -1883,6 +1971,60 @@ end
 local function emitterList()
     local ok, l = pcall(function() return FindAllOf("BP_PBZ_ProjectileEmitter_C") end)
     return ok and l or {}
+end
+
+-- §441 角色带着的另一个骨骼网格（泥头车的车：骨架 HorseCart_Skeleton）。先找角色自己的组件，找不到再在场上
+-- 所有骨骼网格里挑名字 / 网格资产带 key、离角色最近（8 米内）的。返回 组件, 说明
+-- 【适配】Actor:K2_GetComponentsByClass(SkeletalMeshComponent) / FindAllOf("SkeletalMeshComponent") /
+--         组件.SkeletalMeshAsset（旧名 SkeletalMesh）/ K2_GetComponentLocation
+function E.vehicleMesh(actor, key)
+    if not valid(actor) then return nil, "角色无效" end
+    local own = rawProp(actor, "Mesh")
+    local function hit(c)
+        if not valid(c) or sameObj(c, own) then return false end
+        local s = full(c)
+        local m = rawProp(c, "SkeletalMeshAsset") or rawProp(c, "SkeletalMesh")
+        if valid(m) then s = s .. " " .. full(m) end
+        return s:find(key, 1, true) ~= nil
+    end
+    local cls = StaticFindObject("/Script/Engine.SkeletalMeshComponent")
+    local ok, comps = pcall(function() return actor:K2_GetComponentsByClass(cls) end)
+    local found
+    if ok and comps then eachArr(comps, function(_, c) if not found and hit(c) then found = c end end) end
+    if found then return found, "角色自己的组件 " .. (shortName(full(found)) or "?") end
+    local okL, al = pcall(function() return actor:K2_GetActorLocation() end)
+    if not okL or not al then return nil, "读不到角色位置" end
+    local okA, all = pcall(function() return FindAllOf("SkeletalMeshComponent") end)
+    local best, bd2, n = nil, 800 * 800, 0
+    if okA and all then
+        for _, c in pairs(all) do
+            if hit(c) then
+                n = n + 1
+                local okP, p = pcall(function() return c:K2_GetComponentLocation() end)
+                if okP and p then
+                    local d2 = (p.X - al.X) ^ 2 + (p.Y - al.Y) ^ 2
+                    if d2 < bd2 then best, bd2 = c, d2 end
+                end
+            end
+        end
+    end
+    if best then
+        local okO, outer = pcall(function() return best:GetOuter() end)
+        if not okO then outer = nil end
+        return best, string.format("场上第 %d 个里最近的 %s（%.0f 厘米，属于 %s）", n, shortName(full(best)) or "?",
+            math.sqrt(bd2), valid(outer) and (shortName(full(outer)) or "?") or "?")
+    end
+    return nil, string.format("场上带 %s 的骨骼网格 %d 个，8 米内没有", key, n)
+end
+
+-- §441 在指定骨骼网格组件上播动作（组件的 AnimInstance:Montage_Play）。返回 时长 或 nil, 说明
+function E.playOnMesh(comp, asset)
+    if not valid(comp) or not valid(asset) then return nil, "组件或动作无效" end
+    local okA, an = pcall(function() return comp:GetAnimInstance() end)
+    if not okA or not valid(an) then return nil, "组件没有 AnimInstance" end
+    local ok2, r2 = pcall(function() return an:Montage_Play(asset, 1.0, 0, 0.0, true) end)
+    if ok2 and type(r2) == "number" and r2 > 0 then return r2, "Montage_Play 成功" end
+    return nil, "Montage_Play " .. (ok2 and ("返回 " .. tostring(r2)) or ("出错 " .. tostring(r2):sub(-80)))
 end
 
 -- §139.7 10:56 探针：子弹接口 BulletInterface 有 Initialize(Parent, OwnerAvatar, SourceAbility, Data, bDebug) / Start()。
@@ -2144,14 +2286,21 @@ function E.hitSources(victim, owner, seen, payOnly)
         for _, p in ipairs(ok and l or {}) do
             if valid(p) then
                 local key = full(p)
-                r.seen[key] = true
-                if not (seen and seen[key]) and sameObj(rawProp(p, "TargetActor"), victim) then
-                    local src = rawProp(p, "DamageSource")
-                    if src ~= nil and not valid(src) then
-                        local okO, o = pcall(function() return src:GetObject() end)     -- 接口属性万一包了一层
-                        if okO and valid(o) then src = o end
-                    end
+                local src = rawProp(p, "DamageSource")
+                if src ~= nil and not valid(src) then
+                    local okO, o = pcall(function() return src:GetObject() end)     -- 接口属性万一包了一层
+                    if okO and valid(o) then src = o end
+                end
+                -- 11.22 实机：载荷是池化对象，每一下都是同一个 DamageTakenPayload_xxx，只有 DamageSource（子弹模块）换了。
+                -- 只按载荷名记"见过"，第二下起永远当旧的（11.21 分件倍率一次都没生效）→ 按"载荷 + 这一下的来源"记
+                local sig = key .. "|" .. (valid(src) and full(src) or "?")
+                r.seen[key] = sig
+                if not (seen and seen[key] == sig) and sameObj(rawProp(p, "TargetActor"), victim) then
                     local n = valid(src) and (bdName(src) or ("?" .. (shortName(full(src):match("^(%S+)")) or "?"))) or "?来源读不到"
+                    -- §438 绝影分身（BP_Monster_Hun_Summon_Double）打的：分身的普通招判定名和本体同名、没有 _Summon 后缀
+                    -- （11-24 23:32 双开：分身 10 秒十几下全按原值），按出手者认，记成伪判定名 JueYingClone（平衡表 segments 有它）
+                    local ownr = valid(src) and rawProp(src, "LastOwnerAvatar") or nil
+                    if valid(ownr) and (full(ownr) or ""):find("Summon_Double", 1, true) then n = "JueYingClone" end
                     r.pay[#r.pay + 1] = n
                 end
             end
@@ -2169,6 +2318,123 @@ function E.hitSources(victim, owner, seen, payOnly)
             end
         end
     end
+    return r
+end
+
+-- Exact effect snapshots for reversible, session-scoped passive suppression.
+-- 【适配】只读ActiveGameplayEffects.Spec，精确匹配类路径并保留永久单栈升级的等级。
+function E.snapshotEffects(actor, paths)
+    local result = { complete = false, effects = {} }
+    local asc = ascOf(actor)
+    local arr = valid(asc) and rawProp(rawProp(asc, 'ActiveGameplayEffects'), 'GameplayEffects_Internal') or nil
+    if arr == nil then return result end
+    for _, path in ipairs(paths or {}) do result.effects[path] = { active = false, count = 0 } end
+    local complete = true
+    local ok = eachArr(arr, function(_, age)
+        local spec = rawProp(age, 'Spec')
+        local def = rawProp(spec, 'Def')
+        if not valid(def) then complete = false; return end
+        local path = pathOf(def):gsub('%.Default__', '.')
+        local e = result.effects[path]
+        if not e then return end
+        e.active, e.count = true, e.count + 1
+        e.level, e.stacks = tonumber(rawProp(spec, 'Level')), tonumber(rawProp(spec, 'StackCount'))
+        e.duration, e.inhibited = tonumber(rawProp(spec, 'duration')), rawProp(age, 'bIsInhibited')
+        e.safeRemoval = true
+        -- This upgrade grants an active passive. Read its actual runtime policy, never guess the C++ default.
+        if path:find('GE_ShachiWeapon_YouLongCha_UpgradeAttack_1.', 1, true) then
+            local count, safe = 0, true
+            local read = eachArr(rawProp(def, 'GEComponents'), function(_, component)
+                local okC, cls = pcall(function() return component:GetClass() end)
+                if okC and valid(cls) and shortName(pathOf(cls)) == 'GrantAndActivateAbilities' then
+                    local readConfigs = eachArr(rawProp(component, 'GrantAbilityConfigs'), function(_, config)
+                        count = count + 1
+                        local policy = tonumber(rawProp(config, 'RemovalPolicy'))
+                        e.removalPolicy = policy
+                        if policy ~= 0 then safe = false end
+                    end)
+                    if not readConfigs then safe = false end
+                end
+            end)
+            e.safeRemoval = read and count > 0 and safe
+        end
+        if e.count ~= 1 or type(e.level) ~= 'number' or not (e.level > 0 and e.level <= 100)
+            or e.stacks ~= 1 or not (e.duration and e.duration < 0) or e.inhibited ~= false then complete = false end
+    end)
+    result.complete = ok and complete
+    return result
+end
+
+-- Diagnostic snapshot, not an event stream: pooled payloads have no reflected event ID.
+-- 【适配】只读载荷 TargetActor / DamageSource / BulletData / LastOwnerAvatar；不代表事件身份。
+function E.damagePartSnapshot(victim, owner)
+    local r = { records = {}, complete = true, eventIdentity = false }
+    if not valid(victim) or not valid(owner) then r.complete = false; return r end
+    r.victim, r.owner = full(victim), full(owner)
+    for _, cls in ipairs({ 'DamageTakenPayload', 'DamagePreTakePayload' }) do
+        local ok, list = pcall(function() return FindAllOf(cls) end)
+        if not ok then r.complete = false end
+        for _, p in ipairs(ok and list or {}) do
+            if valid(p) and sameObj(rawProp(p, 'TargetActor'), victim) then
+                if #r.records >= 128 then r.complete = false; break end
+                local src = rawProp(p, 'DamageSource')
+                if src ~= nil and not valid(src) then
+                    local okO, obj = pcall(function() return src:GetObject() end)
+                    if okO and valid(obj) then src = obj end
+                end
+                local bd = valid(src) and rawProp(src, 'BulletData') or nil
+                local actual = valid(src) and rawProp(src, 'LastOwnerAvatar') or nil
+                local ownership = 'unknown'
+                if valid(actual) then ownership = sameObj(actual, owner) and 'match' or 'mismatch' end
+                r.records[#r.records + 1] = {
+                    key = cls .. ':' .. full(p), phase = cls,
+                    source = valid(src) and full(src) or '',
+                    bd = valid(bd) and shortName(pathOf(bd)) or '',
+                    ownership = ownership,
+                    actualOwner = valid(actual) and full(actual) or '',
+                    status = valid(src) and tonumber(rawProp(src, 'BulletStatus')) or nil,
+                }
+            end
+        end
+    end
+    table.sort(r.records, function(a, b) return a.key < b.key end)
+    return r
+end
+
+-- §425.5 游戏自己记的防御结果（只读）：张力系统按"boss"开会话，TensionWorldSubsystem.SessionsByBoss[角色].BossState.RecentEvents
+--   是 OutcomeRecord（OutcomeTag = Outcome.Defense.PerfectDeflect / NormalBlock / GuardBreak / HitWhileBlocking / NoResponseHit …，Time = 游戏时间）。
+--   11-23 打 boss 实测：精防 → Defense.PerfectDeflect、普防 → Defense.NormalBlock，和操作对得上。
+--   只用 Find(角色) 单次查：表的键是 WeakObject，ForEach 推键会报 "GetParam is not supported"，别遍历。
+--   返回 nil, 原因（没会话等）或 { now = 游戏时间, n = 条数, ev = { {tag=, t=}, … 最后 max 条 } }
+-- 【适配】FindFirstOf("TensionWorldSubsystem").SessionsByBoss:Find(actor)；TensionSession.BossState.RecentEvents；FGameplayTag.TagName
+function E.tensionLast(actor, max)
+    if not valid(actor) then return nil, "没有角色" end
+    local sub = E.tensionSub
+    if not valid(sub) then sub = FindFirstOf("TensionWorldSubsystem"); E.tensionSub = sub end
+    if not valid(sub) then return nil, "没有张力子系统" end
+    local m = rawProp(sub, "SessionsByBoss")
+    if m == nil then return nil, "读不到会话表" end
+    local okF, v = pcall(function() return m:Find(actor) end)
+    if not okF or v == nil then return nil, "没有会话" end
+    local okG, sv = pcall(function() return v:get() end)
+    if okG and sv ~= nil then v = sv end
+    local ev = rawProp(rawProp(v, "BossState"), "RecentEvents")
+    if ev == nil then return nil, "读不到事件" end
+    local cnt = 0
+    pcall(function() cnt = #ev end)
+    local r = { n = cnt, ev = {} }
+    for i = math.max(1, cnt - (max or 3) + 1), cnt do
+        local okE, e = pcall(function()
+            local x = ev[i]
+            local okX, xv = pcall(function() return x:get() end)
+            if okX and xv ~= nil then x = xv end
+            local tn = rawProp(rawProp(x, "OutcomeTag"), "TagName")
+            local s = type(tn) == "string" and tn or (tn and tn:ToString()) or "?"
+            return { tag = (s:gsub("^Outcome%.", "")), t = tonumber(rawProp(x, "Time")) or -1 }
+        end)
+        if okE and e then r.ev[#r.ev + 1] = e end
+    end
+    pcall(function() r.now = UEHelpers.GetGameplayStatics():GetTimeSeconds(actor) end)
     return r
 end
 
@@ -3136,11 +3402,64 @@ end
 -- ForSeq_UpdateHealth / ForSeq_UpdateShachi（参数是 0~1 百分比）、ForSeq_SetNameText（FText）。
 -- 注册接口参考 Phantom Pact（它给对方那台机器的 Boss 显示血条）；只借思路，没抄代码。
 
--- 【适配】FindFirstOf("PBZHUDLayout")（W_FrontEndHUDLayout_C 的 C++ 父类）
-local function hudLayout()
-    local h = FindFirstOf("PBZHUDLayout")
-    return valid(h) and h or nil
+-- 【适配】FindAllOf("PBZHUDLayout")（W_FrontEndHUDLayout_C 的 C++ 父类）、UserWidget:IsInViewport
+-- 11.23 mp_probe(40)：换图后旧 HUD 挂在 GameInstance 下还没回收，以前 FindFirstOf 拿到的是旧的（不在屏幕上）→
+-- RegisterBossHPBar"成功"但血条注册在看不见的 HUD 上（多人房 6 次）。改成挑在屏幕上的那个，都不在屏幕上就取最后一个（最新）；
+-- 挑中的缓存在 E.HUDPICK，还在屏幕上就直接用，不每次 FindAllOf（helper 挂在 E 上，不占顶层 local）
+-- 11.23 线上复测 mp_probe(41) 16:58:20：两个 HUD 的 IsInViewport 都是 false（HUD 不是直接加到视口上的），只能凭顺序猜，
+-- 用户仍说换图后不行 → 改成打分：在屏幕上 +4、属于当前本地玩家控制器（GetOwningPlayer = 当前 PC）+2、可见 +1；
+-- 同分取后面那个。多个 HUD 时把每个的打分依据写进日志，下次能直接看出挑的对不对
+E.HUDPICK = { obj = nil }
+function E.hudInView(h)
+    local ok, v = pcall(function() return h:IsInViewport() end)
+    return ok and v == true
 end
+-- 【适配】UserWidget:IsInViewport / GetOwningPlayer / GetVisibility
+function E.hudScore(h, pc)
+    local inv = E.hudInView(h)
+    local okO, owner = pcall(function() return h:GetOwningPlayer() end)
+    if okO and not valid(owner) then owner = nil end
+    local mine = owner ~= nil and pc ~= nil and sameObj(owner, pc)
+    local okV, vis = pcall(function() return h:GetVisibility() end)
+    local shown = okV and (vis == 0 or vis == 3 or vis == 4)
+    local sc = (inv and 4 or 0) + (mine and 2 or 0) + (shown and 1 or 0)
+    return sc, string.format("屏幕上=%s 控制器=%s 可见性=%s", tostring(inv),
+        mine and "当前" or (owner and "别的" or (okO and "空" or "?")), okV and tostring(vis) or "?")
+end
+-- §443 11-25 16:15 对决：游戏在 16:04–16:15 之间重建了一个 HUD（…_2147396979），旧的（…_2147402142）分数照样 3（屏幕上都读成 false、
+-- 控制器都是当前），以前"缓存的还 ≥ 2 分就一直用" → 开局注册到看不见的旧 HUD、4 次重试都打在旧的上，40 秒后旧 HUD 被回收才换过去，
+-- 新 HUD 上留着一条没人写的血条（无名血条）。现在：缓存的最多用到这一秒结束，每秒重扫一次；同分取最新建的
+-- （对象名后缀越小越新：2147404768 → 2147402142 → 2147396979 依次建出来），名字读不到再按出现顺序取后面的
+function E.hudSuffix(h)
+    local ok, p = pcall(pathOf, h)
+    return ok and tonumber(tostring(p or ""):match("_(%d+)$") or "") or nil
+end
+local function hudLayout()
+    local P = E.HUDPICK
+    local pc = getP1PC()
+    local sec = os.time()
+    if valid(P.obj) and P.at == sec and E.hudScore(P.obj, pc) >= 2 then return P.obj end
+    P.at = sec
+    local pick, best, bestSuf, n, rows = nil, -1, nil, 0, {}
+    for _, h in pairs(FindAllOf("PBZHUDLayout") or {}) do
+        if valid(h) then
+            n = n + 1
+            local sc, why = E.hudScore(h, pc)
+            local suf = E.hudSuffix(h)
+            rows[#rows + 1] = string.format("  [%d] %s 分 %d（%s）", n, short(pathOf(h)), sc, why)
+            local newer = suf == nil or bestSuf == nil or suf <= bestSuf
+            if sc > best or (sc == best and newer) then pick, best, bestSuf = h, sc, suf end
+        end
+    end
+    if pick and valid(P.obj) and not sameObj(pick, P.obj) then P.prev = P.obj end
+    if pick and n > 1 and not sameObj(pick, P.obj) then
+        out("HUD：内存里有 %d 个 HUD，用分最高的 %s（%d 分）", n, short(pathOf(pick)), best)
+        for _, r in ipairs(rows) do out("%s", r) end
+    end
+    P.obj = pick
+    return pick
+end
+E.hudLayout = hudLayout
 
 E.HUDVIS = { obj = nil, saved = nil }     -- 挂在 E 上（不占顶层 local，test_gun212 ⑥ 盯着数量）
 -- §314（移植 0.33 §269.26）界面三态：整个游戏 HUD 藏 / 显示
@@ -3172,10 +3491,55 @@ local function bossBarShow(actor)
 end
 
 -- 【适配】PBZHUDLayout:UnRegisterBossHPBar(Actor)
-local function bossBarHide(actor)
-    local hud = hudLayout()
+-- §443 hud 可以指定：换 HUD 时对记下的旧 HUD 撤（以前撤的是新挑出来的 HUD，旧 HUD 上的注册从来没撤过）
+local function bossBarHide(actor, hud)
+    if hud ~= nil and not valid(hud) then return false end
+    hud = hud or hudLayout()
     if not (hud and valid(actor)) then return false end
     return (pcall(function() hud:UnRegisterBossHPBar(actor) end))
+end
+
+-- §443 无名血条：11-25 16:16 换 HUD 后，新 HUD 上除了我们新注册的那条，还挂着一条 HUD 建出来时就有的 WB_BossHPBar（…_2147396702），
+-- 没人写名字 / 血量，就是截图左上那条空血条（游戏里读到两条都在显示、Character 都读成空）。认领到自己的血条后扫一遍：
+-- 同一个 HUD 里、不是我们认领的（keep）、没绑真角色（真 Boss 的条 Character 有值）、还挂在界面上的 → 收起（Collapsed）。
+-- 收起过的记在 E.BARSWEPT，之后谁认领到它就放回来（多人房几个替身先后认领，后认领的那条可能刚被前一次扫过）
+-- 【适配】FindAllOf("WB_BossHPBar_C")、Widget:GetParent / GetVisibility / SetVisibility（1 = Collapsed，3 = HitTestInvisible）
+E.BARSWEPT = {}
+function E.bossBarSweep(hud, keep)
+    hud = hud or hudLayout()
+    if not valid(hud) then return 0 end
+    local hp = tostring(pathOf(hud) or "")
+    if hp == "" then return 0 end
+    local function kept(w)
+        if type(keep) ~= "table" then return keep ~= nil and sameObj(w, keep) end
+        for _, k in pairs(keep) do if valid(k) and sameObj(w, k) then return true end end
+        return false
+    end
+    local n = 0
+    for _, w in pairs(FindAllOf("WB_BossHPBar_C") or {}) do
+        local wp = valid(w) and tostring(pathOf(w) or "") or ""
+        if wp:sub(1, #hp + 1) == hp .. "." and not kept(w) and not valid(rawProp(w, "Character")) then
+            local okP, par = pcall(function() return w:GetParent() end)
+            local okV, vis = pcall(function() return w:GetVisibility() end)
+            local shown = (not okP or valid(par)) and not (okV and (vis == 1 or vis == 2))
+            if shown and pcall(function() w:SetVisibility(1) end) then
+                E.BARSWEPT[wp] = true
+                n = n + 1
+                out("§443 收起没人认领的 Boss 血条 %s（可见性原来 %s）", short(wp), okV and tostring(vis) or "?")
+            end
+        end
+    end
+    return n
+end
+-- 认领到的血条要是之前被收起过，放回来
+function E.bossBarUnsweep(bar)
+    if next(E.BARSWEPT) == nil or not valid(bar) then return end
+    local wp = tostring(pathOf(bar) or "")
+    if E.BARSWEPT[wp] then
+        E.BARSWEPT[wp] = nil
+        pcall(function() bar:SetVisibility(3) end)
+        out("§443 认领到之前收起的血条 %s，放回来", short(wp))
+    end
 end
 
 -- 刚注册、Init 还没跑时血条的 Character 是空的，allowBlank = true 时也认这种。
@@ -3209,7 +3573,19 @@ local function bossBarOf(actor, allowBlank, skip)
             end
         end
     end
-    return found or (allowBlank and blank or nil)
+    local got = found or (allowBlank and blank or nil)
+    if got then E.bossBarUnsweep(got) end
+    return got
+end
+
+-- §450 这条血条绑的角色（Character；刚注册、Init 还没跑时是空的 → nil）。多人对决观众两条血条认领到同一个控件时，
+-- 按它判断这条到底是谁的（11-25 mp_probe(43)：先认领的人拿到的是对方那条空血条，Init 之后对方按 Character 也认领它）
+-- 【适配】WB_BossHPBar_C.Character
+function E.bossBarChar(bar)
+    if not valid(bar) then return nil end
+    local c = rawProp(bar, "Character")
+    if valid(c) then return c end
+    return nil
 end
 
 -- §276（移植 0.33 分支 §269.2）这条血条还在 HUD 的实例表里吗（观战两条血条每秒核对：被 HUD 收走 / 换掉了就重新注册认领）。拿不到实例表 = 不知道，按在
@@ -4553,7 +4929,7 @@ end
 -- 组件按角色缓存；找不到时 5 秒内不再 FindAllOf。容器类型不知道（TArray / TSet / TMap），ForEach 两个参数里取不是下标的那个
 local HOLDC = {}
 -- 【适配】FindAllOf("SGameInputComponent") + GetOwner 挑出角色 / 控制器的；读 HoldingInputs，ForEach 取元素（RemoteUnrealParam:get）的名字
-local function holdingInputs(actor)
+local function holdingInputs(actor, requireComplete)
     if not valid(actor) then return nil, "没有角色" end
     local key = pathOf(actor)
     local c = HOLDC[key]
@@ -4572,16 +4948,30 @@ local function holdingInputs(actor)
     if #c.comps == 0 then return nil, "没有输入组件" end
     local names, read = {}, false
     local function add(o)
-        if o == nil or type(o) == "number" then return end
+        if o == nil or type(o) == "number" then return false end
         local okG, v = pcall(function() return o:get() end)
         if okG and v ~= nil then o = v end
-        if valid(o) then names[shortName(full(o)) or "?"] = true end
+        if not valid(o) then return false end
+        if not requireComplete then names[shortName(full(o)) or "?"] = true; return true end
+        local n = shortName(full(o))
+        if type(n) ~= "string" or n == "" or n == "?" or n == "<invalid>" then return false end
+        names[n] = true
+        return true
     end
     for _, comp in ipairs(c.comps) do
-        local h = rawProp(comp, "HoldingInputs")
-        if h ~= nil and pcall(function() h:ForEach(function(a, b) if type(a) == "number" then add(b) else add(a) end end) end) then
-            read = true
+        if requireComplete and not valid(comp) then
+            HOLDC[key] = nil -- Rebuild ownership after controller/component replacement.
+            return nil, "输入组件已失效"
         end
+        local h = rawProp(comp, "HoldingInputs")
+        local elementBad = false
+        local ok = h ~= nil and pcall(function()
+            h:ForEach(function(a, b)
+                if not add(type(a) == "number" and b or a) then elementBad = true end
+            end)
+        end)
+        if requireComplete and (not ok or elementBad) then return nil, "HoldingInputs 读取不完整" end
+        if ok then read = true end
     end
     if not read then return nil, "HoldingInputs 读不到 / 遍历失败" end
     return names
@@ -5262,15 +5652,241 @@ end
 -- GetOwnedGameplayTags 实测拿不到（§14），只能拿已知的标签名逐个问。父标签也算命中。
 -- 探针只在"格挡中掉血"那一刻调、最多 20 次（15:32 崩溃后不再每帧调）
 -- 【适配】ASC:HasMatchingGameplayTag({TagName=FName(标签)}) 逐个查 → 命中的标签名数组；没有 ASC → nil
-local function tagsMatching(actor, list)
+local function tagsMatching(actor, list, requireComplete)
     local asc = ascOf(actor)
     if not valid(asc) then return nil end
     local hit = {}
     for _, t in ipairs(list) do
         local ok, h = pcall(function() return asc:HasMatchingGameplayTag({ TagName = FName(t) }) end)
+        if requireComplete and (not ok or type(h) ~= "boolean") then return nil end
         if ok and h == true then hit[#hit + 1] = t end
     end
     return hit
+end
+
+-- 格挡残留恢复：只观察精确的 InSpecialPerform 标签及授予它的活动 GE；写操作仅调用一次原生移除 helper。
+do
+local GR_TAG = "CharacterState.AbilityState.InSpecialPerform"
+-- 【适配】FGameplayTag.TagName（FName:ToString）
+local function grTagName(t)
+    local n = rawProp(t, "TagName")
+    if n == nil then return nil end
+    local ok, s = true, n
+    if type(n) ~= "string" then ok, s = pcall(function() return n:ToString() end) end
+    if not ok or type(s) ~= "string" or not s:match("^[%w_]+[%w_%.]*$") or s == "None" then return nil end
+    return s
+end
+-- 【适配】GameplayTag 名字串比较（InSpecialPerform 及子标签），不碰游戏对象
+local function grMatch(s)
+    return s == GR_TAG or (type(s) == "string" and s:sub(1, #GR_TAG + 1) == GR_TAG .. ".")
+end
+-- 【适配】FGameplayTagContainer.GameplayTags（TArray<FGameplayTag>，ForEach/get）
+local function grContainerHas(c)
+    if c == nil then return nil end
+    local a = rawProp(c, "GameplayTags")
+    if a == nil then return nil end
+    local bad, hit = false, false
+    local function check(x)
+        local s = grTagName(x)
+        if not s then bad = true elseif grMatch(s) then hit = true end
+    end
+    local ok = pcall(function()
+        if type(a) == "table" then
+            for k, x in pairs(a) do
+                if type(k) ~= "number" or k < 1 or k % 1 ~= 0 or k > #a then bad = true else check(x) end
+            end
+        else
+            a:ForEach(function(_, e)
+                local decoded, x = pcall(function() return e:get() end)
+                if not decoded or x == nil then bad = true else check(x) end
+            end)
+        end
+    end)
+    if not ok or bad then return nil end
+    return hit
+end
+-- 【适配】UE4SS TArray:ForEach / 元素 get（借用结构，只在回调里用）
+local function grArray(arr, fn)
+    if arr == nil then return false end
+    if type(arr) == "table" then
+        for i, x in pairs(arr) do
+            if type(i) ~= "number" or i < 1 or i % 1 ~= 0 or i > #arr or not fn(i, x) then return false end
+        end
+        return true
+    end
+    local complete = true
+    local ok = pcall(function()
+        arr:ForEach(function(i, e)
+            local decoded, x = pcall(function() return e:get() end)
+            if not decoded or x == nil then complete = false; return end
+            if not fn(i, x) then complete = false end
+        end)
+    end)
+    return ok and complete
+end
+-- 【适配】UGameplayEffectComponent:GetClass / UStruct:GetSuperStruct（TargetTagsGameplayEffectComponent 等精确类名）
+local function grComponentIsTarget(c)
+    local ok, cls = pcall(function() return c:GetClass() end)
+    for depth = 1, 8 do
+        if not (ok and valid(cls)) then return nil end
+        local n = shortName(full(cls)) or ""
+        if n == "TargetTagsGameplayEffectComponent" then return true end
+        -- Exact schema-reviewed types only; unknown subclasses may add other tag providers.
+        if depth == 1 and (n == "AssetTagsGameplayEffectComponent"
+            or n == "AbilitiesGameplayEffectComponent"
+            or n == "TargetTagRequirementsGameplayEffectComponent"
+            or n == "PreTakeModificationGameplayEffectComponent"
+            or n == "AdditionalEffectsGameplayEffectComponent"
+            or n == "SendGameplayEventGameplayEffectComponent"
+            or n == "ChangeWeaponCooldownReductionGameplayEffectComponent"
+            or n == "GrantAndActivateAbilities"
+            or n == "PreCalculationModificationGameplayEffectComponent") then return false end
+        if n == "GameplayEffectComponent" or n == "Object" then return nil end
+        ok, cls = pcall(function() return cls:GetSuperStruct() end)
+    end
+    return nil
+end
+-- 【适配】UGameplayEffect.InheritableOwnedTagsContainer.CombinedTags、GEComponents、TargetTags 组件 InheritableGrantedTagsContainer
+local function grDefHas(def)
+    local hit = false
+    local owned = rawProp(def, "InheritableOwnedTagsContainer")
+    if owned == nil then return nil end
+    local inherited = grContainerHas(rawProp(owned, "CombinedTags"))
+    if inherited == nil then return nil end
+    hit = inherited
+    local comps = rawProp(def, "GEComponents")
+    local reason
+    local good = grArray(comps, function(_, comp)
+        if not valid(comp) then return false end
+        local isTarget = grComponentIsTarget(comp)
+        if isTarget == nil then reason = "unknown component " .. full(comp); return false end
+        if isTarget then
+            local ic = rawProp(comp, "InheritableGrantedTagsContainer")
+            if ic == nil then return false end
+            local h = grContainerHas(rawProp(ic, "CombinedTags"))
+            if h == nil then return false end
+            hit = hit or h
+        end
+        return true
+    end)
+    if not good then return nil, reason end
+    return hit
+end
+-- 【适配】UAbilitySystemComponent:GetGameplayTagCount(CharacterState.AbilityState.InSpecialPerform)
+function E.guardRecoveryCount(actor)
+    local asc = ascOf(actor)
+    if not valid(asc) then return nil end
+    local ok, n = pcall(function() return asc:GetGameplayTagCount({ TagName = FName(GR_TAG) }) end)
+    return ok and type(n) == "number" and n == n and n >= 0 and n % 1 == 0 and n or nil
+end
+-- 【适配】ACharacter.Mesh:GetAnimInstance():GetCurrentActiveMontage()（空蒙太奇 = 零地址）
+function E.guardRecoveryIdleMontage(actor)
+    if not valid(actor) then return nil end
+    local mesh = rawProp(actor, "Mesh")
+    if not valid(mesh) then return nil end
+    local okA, an = pcall(function() return mesh:GetAnimInstance() end)
+    if not (okA and valid(an)) then return nil end
+    local okM, mt = pcall(function() return an:GetCurrentActiveMontage() end)
+    if not okM then return nil end
+    if mt == nil then return "" end
+    if not valid(mt) then
+        local okAddress, address = pcall(function() return mt:GetAddress() end)
+        if okAddress and address == 0 then return "" end
+        return nil
+    end
+    local okName, name = pcall(function() return mt:GetFullName() end)
+    if not okName or type(name) ~= "string" or name == "" or name == "<invalid>" then return nil end
+    local s = shortName(name)
+    if type(s) ~= "string" or s == "" then return nil end
+    return s
+end
+-- 【适配】ASC.ActiveGameplayEffects.GameplayEffects_Internal[].Spec.Def / Spec.DynamicGrantedTags
+function E.guardRecoveryEffects(actor)
+    local asc = ascOf(actor)
+    if not valid(asc) then return nil, "没有 ASC" end
+    local ages = rawProp(rawProp(asc, "ActiveGameplayEffects"), "GameplayEffects_Internal")
+    if ages == nil then return nil, "活动 GE 不可读" end
+    local found, reason = false, nil
+    local good = grArray(ages, function(_, age)
+        local spec = rawProp(age, "Spec")
+        local def = rawProp(spec, "Def")
+        if spec == nil or not valid(def) then reason = "GE Spec/Def 不可读"; return false end
+        local h, detail = grDefHas(def)
+        if h == nil then reason = "GE 授予标签不可读: " .. full(def) .. " / " .. tostring(detail); return false end
+        local dyn = rawProp(spec, "DynamicGrantedTags")
+        local dh = grContainerHas(dyn)
+        if dh == nil then reason = "GE 动态标签不可读"; return false end
+        h = h or dh
+        if h then found = true end
+        return true
+    end)
+    if not good then return nil, reason or "活动 GE 遍历失败" end
+    return not found
+end
+-- 【适配】GetDeflectComponent().ReceiveFrames（TMap<int, {HitGameTime, IsDodge, DeflectStrength}>）、世界时间
+function E.guardRecoveryReceiveFrames(actor)
+    if not valid(actor) then return nil end
+    local world = E.worldTime(actor)
+    if type(world) ~= "number" or world ~= world or math.abs(world) == math.huge then return nil end
+    local ok, dc = pcall(function() return actor:GetDeflectComponent() end)
+    if not ok or not valid(dc) then return nil end
+    local map = rawProp(dc, "ReceiveFrames")
+    if map == nil then return nil end
+    local MAX_FRAMES = 64
+    local rows, complete, seen = {}, true, 0
+    local iterated = pcall(function()
+        map:ForEach(function(k, e)
+            seen = seen + 1
+            if seen > MAX_FRAMES then complete = false; return end
+            local id, fr = k, e
+            if type(id) ~= "number" then
+                local decoded, n = pcall(function() return k:get() end)
+                if not decoded then complete = false; return end
+                id = n
+            end
+            local decoded, value = pcall(function() return e:get() end)
+            if decoded and value ~= nil then fr = value end
+            local t, dodge = rawProp(fr, "HitGameTime"), rawProp(fr, "IsDodge")
+            local strength = grTagName(rawProp(fr, "DeflectStrength"))
+            if type(id) ~= "number" or id < 0 or id % 1 ~= 0 or type(t) ~= "number"
+                or t ~= t or math.abs(t) == math.huge or type(dodge) ~= "boolean" or not strength then
+                complete = false; return
+            end
+            -- Only Lua primitives escape this borrowed map callback.
+            rows[id] = { time = t, strength = strength, dodge = dodge }
+        end)
+    end)
+    if not iterated or not complete then return nil end
+    return { world = world, frames = rows }
+end
+-- §421 给角色挂 / 撤一个松散标签（替身的闪避方向 Ability.Action.Hun.Dash.Direction.*）。add=true 挂、false 撤；成功返回 true
+-- 【适配】/Script/SGameUtils.Default__AbilityUtils:AddLooseGameplayTagForSystem / RemoveLooseGameplayTagForSystem(ASC, {TagName}, false)
+--   （11-23 游戏里对自己角色试过：挂上后 HasMatchingGameplayTag=true，撤掉后 false）
+function E.looseTag(actor, tag, add)
+    local asc = ascOf(actor)
+    if not valid(asc) then return false end
+    return pcall(function()
+        local lib = StaticFindObject("/Script/SGameUtils.Default__AbilityUtils")
+        if not valid(lib) then error("AbilityUtils unavailable") end
+        if add then lib:AddLooseGameplayTagForSystem(asc, { TagName = FName(tag) }, false)
+        else lib:RemoveLooseGameplayTagForSystem(asc, { TagName = FName(tag) }, false) end
+    end) == true
+end
+-- 【适配】/Script/SGameUtils.Default__AbilityUtils:RemoveLooseGameplayTagForSystem(ASC, InSpecialPerform, false)
+function E.guardRecoveryRemove(actor)
+    local before = E.guardRecoveryCount(actor)
+    local p1 = getP1()
+    if before ~= 1 or not valid(p1) or not sameObj(actor, p1) then return false, before, E.guardRecoveryCount(actor) end
+    if E.guardRecoveryEffects(actor) ~= true then return false, before, E.guardRecoveryCount(actor) end
+    local asc = ascOf(actor)
+    local ok = pcall(function()
+        local lib = StaticFindObject("/Script/SGameUtils.Default__AbilityUtils")
+        if not valid(lib) then error("AbilityUtils unavailable") end
+        lib:RemoveLooseGameplayTagForSystem(asc, { TagName = FName(GR_TAG) }, false)
+    end)
+    local after = E.guardRecoveryCount(actor)
+    return ok and after == 0, before, after
+end
 end
 
 -- §162 替身"放不出招"诊断（11-08 内测：重连后新建的替身整场放招全返回 false、锁不上、刀碰不到）：
@@ -5464,14 +6080,18 @@ end
 return {
     nameTagNew = NAMETAG.new, nameTagSet = NAMETAG.set, nameTagBar = NAMETAG.bar, nameTagBarColor = NAMETAG.barColor, nameTagStyle = NAMETAG.style, nameTagPlace = NAMETAG.place, nameTagRemove = NAMETAG.remove,
     hudShow = E.hudShow,      -- §314 界面三态
+    hudLayout = E.hudLayout,  -- 11.23 当前在屏幕上的 HUD（多人房血条认 HUD 换没换）
     tagsMatching = tagsMatching, puppetDiag = puppetDiag, discardPuppet = discardPuppet, stashAway = stashAway,
+    guardRecoveryCount = E.guardRecoveryCount, guardRecoveryIdleMontage = E.guardRecoveryIdleMontage, guardRecoveryEffects = E.guardRecoveryEffects, guardRecoveryReceiveFrames = E.guardRecoveryReceiveFrames, guardRecoveryRemove = E.guardRecoveryRemove, looseTag = E.looseTag,
     montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, flushInput = HOLDC.flushRun, gameInputBlock = E.gameInputBlock, inputFlushMsg = function() return E.flushMsg end, uiCtxStrip = E.uiCtxStrip, uiCtxRestore = E.uiCtxRestore, unpause = E.unpause, capsuleSize = E.capsuleSize, spawnFxAt = E.spawnFxAt, fxActive = E.fxActive, worldFx = E.worldFx, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = E.holdTaskProbe, inputEnsure = E.inputEnsure, worldTime = E.worldTime, linkAbilityInput = E.linkAbilityInput, inputHold = E.inputHold, inputHoldDump = E.inputHoldDump,
-    teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, hitSources = E.hitSources, hitOwnerOf = E.hitOwnerOf, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
-    laserEmitterSpawn = E.laserEmitterSpawn, emitterInfo = E.emitterInfo, moveEmitter = E.moveEmitter, destroyActor = E.destroyActor, stopBullets = E.stopBullets,
+    teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, hitSources = E.hitSources, snapshotEffects = E.snapshotEffects, damagePartSnapshot = E.damagePartSnapshot, hitOwnerOf = E.hitOwnerOf, tensionLast = E.tensionLast, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
+    laserEmitterSpawn = E.laserEmitterSpawn, vehicleMesh = E.vehicleMesh, playOnMesh = E.playOnMesh, emitterInfo = E.emitterInfo, moveEmitter = E.moveEmitter, destroyActor = E.destroyActor, stopBullets = E.stopBullets,
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,
     short = short, sameObj = sameObj, fnameStr = fnameStr, eachArr = eachArr, getP1PC = getP1PC, getP1 = getP1,
     puppet = puppet, gstat = gstat, now = now, attrSetOf = attrSetOf, attrOf = attrOf, hpOf = hpOf,
     rootMotionScale = rootMotionScale,
+    trainingPosition = E.trainingPosition,
+    trainingRedEpoch = E.trainingRedEpoch,
     setAttr = setAttr, setAttrBase = E.setAttrBase, setAttrCur = E.setAttrCur, ascOf = ascOf, factionComp = factionComp, factionActors = factionActors, factionValue = factionValue, factionName = factionName, anyToStr = anyToStr,
     montageOf = montageOf, montageByName = montageByName, playOn = playOn, tagNames = tagNames, tagsOf = tagsOf, activeAbilities = activeAbilities, cancelMoves = cancelMoves, cancelAbilities = cancelAbilities,
     yawTo = yawTo, setYaw = setYaw, facePlayer = E.facePlayer, placeInFront = placeInFront, setBraking = E.setBraking, equipWeapon = E.equipWeapon,
@@ -5482,7 +6102,7 @@ return {
     montages = montages, isStoryMap = isStoryMap, travelTo = travelTo, airOf = airOf, launch = launch, hover = hover, unhide = unhide,
     activeMontage = activeMontage, montageSetPos = E.montageSetPos, montageNotifies = E.montageNotifies, attrAll = attrAll,
     bossBarShow = bossBarShow, bossBarHide = bossBarHide, bossBarOf = bossBarOf, bossBarSet = bossBarSet, bossBarDiag = bossBarDiag,
-    bossBarShachiShow = bossBarShachiShow, bossBarListed = E.bossBarListed, weaponUiRefresh = E.weaponUiRefresh, attrModProbe = E.attrModProbe, attrModSet = attrModSet, attrDiff = E.attrDiff,
+    bossBarShachiShow = bossBarShachiShow, bossBarListed = E.bossBarListed, bossBarSweep = E.bossBarSweep, bossBarChar = E.bossBarChar, weaponUiRefresh = E.weaponUiRefresh, attrModProbe = E.attrModProbe, attrModSet = attrModSet, attrDiff = E.attrDiff,
     weaponLevel = E.weaponLevel, saveVeto = E.saveVeto, difficultyMode = E.difficultyMode, combatConfig = E.combatConfig, configCopy = E.configCopy, configRestore = E.configRestore, geSet = E.geSet, geCounts = E.geCounts, geTags = E.geTags, arrCounts = E.arrCounts, geMods = geMods, cleanse = cleanse,
     geFind = E.geFind, geRemoveCls = E.geRemoveCls, geApplyCls = E.geApplyCls,
     forcedApply = E.forcedApply, forcedRestore = E.forcedRestore, forcedActive = forcedActive, weaponSnapped = E.weaponSnapped,

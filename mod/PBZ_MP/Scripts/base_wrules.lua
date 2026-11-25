@@ -29,7 +29,7 @@ function GCD.log(...)
     if GCD.logs < GCD.LOGS then GCD.logs = GCD.logs + 1; out(...) end
 end
 function GCD.sec()            -- 冷却秒数：不在对局里 / 房间设置"紫冥剑火枪冷却"关着（§216）= 0（不管）；平衡表 cooldown 里没写 = 0
-    if (MATCH.role == nil and not BASEHOOK.inMp()) or not (BAL.on and NET.flagNow("gcd")) then return 0 end
+    if (MATCH.role == nil and not BASEHOOK.inMp()) or not BAL.on then return 0 end     -- §426 用户 11-24：火枪冷却回到武器平衡里（不再看房间设置 gcd）
     return BAL.COOLDOWN[GCD.KEY] or 0
 end
 function GCD.reset(why)
@@ -922,6 +922,264 @@ function HLFX.step(tn)
     HLFX.fxStep(tn)
 end
 
+-- 11.21: use fresh damage payload identity, never the ordinal of a landed hit.
+-- 11.22 用户定（狮头拿出冲击波）：挨打方干不干净看"这一下打中之前"——上一帧结束时记的（cleanPrev / cleanAiPrev），
+-- 同一帧这一下自己挂上的积累不算。只在交手中 + 武器平衡开着（SEG1121.active）时每帧读一次，读不到按不干净。
+SEG1121 = { hp = nil, seen = nil, seenAi = nil, aiOn = false, cleanPrev = false, cleanAiPrev = false }
+function SEG1121.active() return NET.fighting() and BAL.active() end
+-- 11.23 我打本地 AI：对局外的木桩 / 自由陪练也算（整招系数 TOUCH.scale 那里本来就照乘，分段不乘会让泥头车力荡这种分段很小的一下满额；
+-- 用户截图：木桩上 HorseCart_Charge 一招 6382）。对局里仍只算交手阶段（倒计时 / 结算不算，和 TOUCH.counts 一致）
+function SEG1121.activeAi()
+    if not BAL.active() then return false end
+    if NET.fighting() then return true end
+    return MATCH.role == nil and not (BASEHOOK and BASEHOOK.inMp and BASEHOOK.inMp())   -- 对局外（多人房没开打不算）
+end
+function SEG1121.reset()
+    SEG1121.hp, SEG1121.seen, SEG1121.seenAi, SEG1121.aiOn = nil, nil, nil, false
+    SEG1121.cleanPrev, SEG1121.cleanAiPrev = false, false
+    SEG1121.accPrev, SEG1121.accAiPrev, SEG1121.dirtyWhy, SEG1121.dirtyAiWhy = nil, nil, nil, nil
+end
+function SEG1121.tag(actor, name)
+    if not G.tagsMatching then return nil end
+    local ok, tags = pcall(G.tagsMatching, actor, { name }, true)
+    if not ok or type(tags) ~= "table" then return nil end
+    return #tags > 0
+end
+function SEG1121.sourceFactor(bd, attacker, name)
+    local f = BAL.SEGMENTS[bd]
+    if f then return f end
+    if type(bd) ~= "string" then return 1 end
+    if bd:find("ChiZheCanJian", 1, true) then
+        local drunk = SEG1121.tag(attacker, "CharacterState.AbilityState.HuaQianXiao.ZuiJian")
+        if drunk == nil then return 1 end
+        local tipsy = not drunk and SEG1121.tag(attacker, "CharacterState.AbilityState.HuaQianXiao.PreZui")
+        if tipsy == nil then return 1 end
+        if (tipsy and bd:match("^BulletData_Hun_ChiZheCanJian_Normal_A+_%d+$"))
+            or ((tipsy or drunk) and bd == "BulletData_Hun_ChiZheCanJian_Drunk_A_Snap_01") then
+            return BAL.SEGMENTS.TipsyLight or 1
+        end
+        local sharedHeavy = bd:match("^BulletData_Hun_ChiZheCanJian_Drunk_B_Snap_%d+$")
+            or (name == "GA_Hun_ChiZheCanJian_Normal_B_DashChild_C" and bd == "BulletData_Hun_ChiZheCanJian_Normal_B_01")
+        if sharedHeavy then
+            if drunk then return BAL.SEGMENTS.DrunkHeavy or 1 end
+            if tipsy then return BAL.SEGMENTS.TipsyHeavy or 1 end
+        end
+    end
+    local shared = name == "GA_Hun_Chaos_B_Dash_C" or name == "GA_Hun_Chaos_B_DashDraw_C" or name == "GA_Hun_Chaos_B_Draw_C"
+    if shared and (bd == "B_Hun_Chaos_B_Dash_01" or bd == "B_Hun_Chaos_B_Dash_02"
+        or bd == "B_Hun_Chaos_B_01" or bd == "B_Hun_Chaos_B_FireBall_BurstLocation")
+        and SEG1121.tag(attacker, "CharacterState.AbilityState.ChaosBlade.Fire") then
+        return BAL.SEGMENTS.ChaosFireHeavy or 1
+    end
+    return 1
+end
+-- Whole-frame HP deltas cannot separate a DOT tick from direct damage.
+-- Unknown status reads fail closed, as does any active (ticking) abnormal status.
+-- 11.23 在线狮头偏高（用户报"狮头 / 独眼弓 / 血滴子在线打真人比本地 AI 高"）：多人房 15:19:21 / 17:09:02 狮头喷火的拿出冲击波一下 -535
+-- （木桩上同一下 -108），分段 B_LionHead_Start ×0.1667 没乘。原因：以前"任何积累 > 0 = 不干净"，可积累（感电 / 雷 / 血爆 / 水…）
+-- 交手中不会自己消，挨过一下就整场 > 0（同一天对局结束清状态：感电 1819、雷 1199、血爆 1150、水 791 → 0），真人挨打方一场下来
+-- 分段几乎全不乘；本地 AI 的替身积累跟着 AI 回报压回 0（§160.5），一直干净，所以只有在线偏高。
+-- 改成只挡会在同一帧掉血的：正在生效的异常（INF.levels：点燃 / 中毒 / 感电 / 流血 / 混沌 / 冻住，会跳伤）、跳伤标签、
+-- 冰冻积累（冰缓按积累跳伤，§206）。别的积累本身不掉血（HANDOVER §160.5：雷 / 血爆攒满是瞬发，水不挂状态），
+-- 只要这一帧没有被清零（= 这一下刚好攒满瞬发 / 挂上状态，SEG1121.burst）就不挡。读不到仍按不干净。
+SEG1121.TICK_TAGS = { "CharacterState.StatusInfliction.Frost.HasAccumulation", "CharacterState.StatusInfliction.IgniteTickDamage",
+                      "CharacterState.StatusInfliction.BleedTickDamage", "CharacterState.StatusInfliction.GreenFire" }
+SEG1121.TICK_ACC = { Frost_Accumulation = true }
+SEG1121.ACC_DROP = 0.5
+-- 返回 干净, 积累表（干净时，给下一帧 burst 比）, 不干净的原因
+function SEG1121.cleanVictim(victim)
+    if not (G.tagsMatching and INF and INF.levels and INF.TYPES) then return false, nil, "读不到异常状态" end
+    local ok, tags = pcall(G.tagsMatching, victim, SEG1121.TICK_TAGS, true)
+    if not (ok and type(tags) == "table") then return false, nil, "读不到跳伤标签" end
+    if #tags > 0 then return false, nil, "身上有 " .. tostring(tags[1]) end
+    local okLv, levels = pcall(INF.levels, victim)
+    if not (okLv and type(levels) == "table") then return false, nil, "读不到异常状态" end
+    for k, v in pairs(levels) do
+        if type(v) ~= "number" or v > 0 then return false, nil, "正在生效的异常 " .. tostring(k) end
+    end
+    local acc = {}
+    for _, ty in ipairs(INF.TYPES) do
+        if ty.acc then
+            local okAcc, a = pcall(attrOf, victim, ty.acc)
+            if not (okAcc and type(a) == "number") then return false, nil, "读不到 " .. ty.acc end
+            if SEG1121.TICK_ACC[ty.acc] and a ~= 0 then return false, nil, string.format("%s %.0f（会跳伤）", ty.acc, a) end
+            acc[ty.acc] = a
+        end
+    end
+    return true, acc
+end
+-- 这一帧有没有积累被清零 / 掉了一截（这一下刚好攒满：瞬发伤害或挂上状态，和这一下同一帧）。before = 上一帧结束时记的积累表
+function SEG1121.burst(victim, before)
+    if type(before) ~= "table" then return true, "上一帧没记积累" end
+    for key, b in pairs(before) do
+        local ok, a = pcall(attrOf, victim, key)
+        if not (ok and type(a) == "number") then return true, "读不到 " .. key end
+        if a < b - SEG1121.ACC_DROP then return true, string.format("%s %.0f→%.0f（这一帧攒满瞬发 / 挂上状态）", key, b, a) end
+    end
+    return false
+end
+-- 11.23 同一帧混了几个判定、但每个判定的资产伤害倍率已知时，按资产倍率加权折算（泥头车：冲撞每 0.3 秒一下，
+-- 处决键最后一击 TurnAttack 打中那一帧常常同时有冲撞判定；以前整帧不改，木桩上最后一击满额）。
+-- 资产 PhysicalDamage：Weapon_NiTouChe 的 GA_HorseCart_Charge 默认对象（docs/SHADOW_1120_MAPPING_EVIDENCE.md）
+SEG1121.WEIGHT = { BD_NiTouChe_Overlap = 0.274, BD_NiTouChe_OverlapUpgrade = 0.3288, BD_NiTouChe_Overlap_TurnAttack = 6.576 }
+function SEG1121.classify(src, attacker, name)
+    local factor
+    if not src or not src.pay or #src.pay == 0 then return nil end
+    local mixed, wsum, fsum = false, 0, 0
+    for _, bd in ipairs(src.pay) do
+        local f = SEG1121.sourceFactor(bd, attacker, name)
+        local w = SEG1121.WEIGHT[bd]
+        if w and wsum >= 0 then wsum, fsum = wsum + w, fsum + w * f else wsum = -1 end
+        -- A frame containing differently scaled sources cannot be apportioned exactly (unless every source has a known weight).
+        if factor and factor ~= f then mixed = true end
+        factor = f
+    end
+    if mixed then
+        if not (wsum > 0) then return nil end
+        factor = fsum / wsum
+    end
+    return factor ~= 1 and factor or nil
+end
+-- 11.22 影武实机：放影武期间掉血了、分段却没改的，记下这一帧的判定名和原因（核对分段键名用；最多 SEG1121.WHY_MAX 行）
+SEG1121.whyN, SEG1121.WHY_MAX = 0, 60
+function SEG1121.why(src, attacker, f, tn, dirty)
+    local last = BAL.last
+    local clone = false                                                     -- §438 分身打的也记（核对分身判定 / 出手者）
+    for _, bd in ipairs(src and src.pay or {}) do if bd == "JueYingClone" or tostring(bd):find("_Summon", 1, true) then clone = true end end
+    if not clone and not (last and tn - BAL.lastAt < BAL.holdOf(last) and LO.isEdgeAttack(last)) then return end
+    if SEG1121.whyN >= SEG1121.WHY_MAX then return end
+    SEG1121.whyN = SEG1121.whyN + 1
+    local pay = src and src.pay or {}
+    local parts, scaled = {}, false
+    for _, bd in ipairs(pay) do
+        local x = SEG1121.sourceFactor(bd, attacker, last)
+        if x ~= 1 then scaled = true end
+        parts[#parts + 1] = string.format("%s×%g", tostring(bd), x)
+    end
+    local reason = #pay == 0 and "这一帧读不到新判定" or (f and ("挨打方这一下之前不干净（" .. tostring(dirty or "读不到") .. "），不改"))
+        or (scaled and "同一帧混了不同倍率") or "不在分段表"
+    out("11.22 分段没改（%s，第 %d 次）：%s 判定 %s", reason, SEG1121.whyN, last, #parts > 0 and table.concat(parts, "，") or "-")
+end
+function SEG1121.fix(p1, pup, tn)
+    if not SEG1121.active() then
+        -- 11.23 "分段没改"日志每段交手各记 WHY_MAX 行（以前整场共用 60 行，在线 14:31 就记满，后面狮头那几下看不到原因）
+        if SEG1121.fixOn then SEG1121.whyN = 0 end
+        SEG1121.fixOn = false
+        SEG1121.reset(); return nil
+    end
+    SEG1121.fixOn = true
+    local cleanBefore = SEG1121.cleanPrev == true
+    local r = SEG1121.fixFrame(p1, pup, tn, cleanBefore, SEG1121.accPrev, SEG1121.dirtyWhy)
+    local c, acc, why = SEG1121.cleanVictim(p1)               -- 给下一帧用：这一帧结束时干不干净 + 积累
+    SEG1121.cleanPrev, SEG1121.accPrev, SEG1121.dirtyWhy = c == true, acc, why
+    return r
+end
+function SEG1121.fixFrame(p1, pup, tn, cleanBefore, accBefore, dirty)
+    local hp = attrOf(p1, "Health")
+    if type(hp) ~= "number" then return nil end
+    local previous = SEG1121.hp
+    SEG1121.hp = hp
+    if previous == nil then
+        SEG1121.seen = (G.hitSources(p1, pup, nil, true) or {}).seen
+        return nil
+    end
+    if hp >= previous - 0.5 then return nil end
+    local src = G.hitSources(p1, pup, SEG1121.seen, true)
+    SEG1121.seen = src and src.seen
+    local name = BAL.last and tn - BAL.lastAt < BAL.HOLD and BAL.last or nil
+    local f = SEG1121.classify(src, pup, name)
+    if f and cleanBefore then
+        local b, bwhy = SEG1121.burst(p1, accBefore)
+        if b then cleanBefore, dirty = false, bwhy end
+    end
+    if not f or not cleanBefore then pcall(SEG1121.why, src, pup, f, tn, dirty); return nil end
+    local target = math.max(0, previous - (previous - hp) * f)
+    if not setAttr(p1, "Health", target) then return nil end
+    SEG1121.hp = target
+    out("11.21 分段伤害：-%.3f ×%g → -%.3f", previous - hp, f, previous - target)
+    return target
+end
+-- 每帧末尾调（main：本地 AI 时 watchHp 之后）：记底 + 记替身这一帧结束时干不干净，给下一帧的 mine 用
+function SEG1121.minePrime(p1, pup)
+    local on = NET.rai and SEG1121.activeAi() or false
+    if on and not SEG1121.aiOn then SEG1121.seenAi = (G.hitSources(pup, p1, nil, true) or {}).seen end
+    if not on then SEG1121.seenAi = nil end
+    SEG1121.aiOn = on
+    local c, acc, why = false, nil, nil
+    if on then c, acc, why = SEG1121.cleanVictim(pup) end
+    SEG1121.cleanAiPrev, SEG1121.accAiPrev, SEG1121.dirtyAiWhy = c == true, acc, why
+end
+function SEG1121.mine(p1, pup, tn, d, name, id)
+    if not (d and d > 0 and SEG1121.activeAi()) then return d end
+    local src = G.hitSources(pup, p1, SEG1121.seenAi, true)
+    SEG1121.seenAi = src and src.seen
+    local f = SEG1121.classify(src, p1, name)
+    local dirty = SEG1121.dirtyAiWhy
+    if f and SEG1121.cleanAiPrev == true then
+        local b, bwhy = SEG1121.burst(pup, SEG1121.accAiPrev)
+        if not b then return d * f end
+        dirty = bwhy
+    end
+    local cart = SEG1121.cartTurn(name, id, d, src)
+    if cart then return d * cart end
+    pcall(SEG1121.whyMine, src, p1, f, name, d, dirty)
+    return d
+end
+-- 11.23 泥头车处决键最后一击（力荡 BD_NiTouChe_Overlap_TurnAttack）：马车撞人的伤害读不到判定名（实机 12:18:58 起
+-- "这一帧读不到新判定"，载荷名单空），按判定名的分段挑不出来。改按大小认：同一招里这一下的原始伤害 ≥ 已出现过最小一下的
+-- CART_RATIO 倍 = 最后一击。实测原始：刚撞上 800、冲撞每下 1200（一帧两下 2400）、力荡 8002 / 12003（10–15 倍）。
+-- 这一招的第一下就是力荡（还没见过小的）认不出，按整招系数。只管我打本地 AI（PvP 里替身放不出力荡，HANDOVER §143）
+-- CART_FLOOR：比它小的（燃烧 / 混沌跳伤记到马车招号上，几到几十）不算"最小一下"，免得把每下 1200 的冲撞也当成最后一击（balance1121 会话提醒）
+-- 11.23 13:19:22 实机：一招开头那下撞击不一定经过这里，这一招第一下经过这里的就是最后一击（-12003），没参照认不出 →
+-- "最小一下"跨招记（SEG1121.cartRef）；一次参照都没有时原始 ≥ CART_ABS 直接认（冲撞一帧最多约 2400，最后一击 8000–12000）
+SEG1121.CART_NAME, SEG1121.CART_RATIO, SEG1121.CART_KEY, SEG1121.CART_FLOOR = "GA_HorseCart_Charge_C", 5, "BD_NiTouChe_Overlap_TurnAttack", 200
+SEG1121.CART_ABS = 4000
+function SEG1121.cartTurn(name, id, d, src)
+    if name ~= SEG1121.CART_NAME or id == nil then return nil end
+    -- 11.23 用户实测（13:10:25 / 13:11:00）：读得到一些判定名的帧也有（木桩刚被撞飞、身上不干净，classify 那条不乘），
+    -- 以前这里"名单不空就不管"→ 最后一击 2881 满额。改成不看名单，只看大小
+    if d < SEG1121.CART_FLOOR then return nil end
+    local c = SEG1121.cart
+    if not c or c.id ~= id then c = { id = id }; SEG1121.cart = c end
+    local base = c.min or SEG1121.cartRef
+    local big = (base and d >= base * SEG1121.CART_RATIO) or (not base and d >= SEG1121.CART_ABS)
+    if not big then
+        c.min = math.min(c.min or d, d)
+        SEG1121.cartRef = math.min(SEG1121.cartRef or d, d)
+        return nil
+    end
+    c.min = c.min or base
+    local f = BAL.SEGMENTS and BAL.SEGMENTS[SEG1121.CART_KEY]
+    if not f or f == 1 then return nil end
+    if (SEG1121.cartN or 0) < 30 then
+        SEG1121.cartN = (SEG1121.cartN or 0) + 1
+        local pay = src and src.pay or {}
+        out("11.23 泥头车最后一击：我的第 #%s 招这一下 -%.0f（参照最小一下 -%.0f 的 %.1f 倍）→ ×%g；判定 %s", tostring(id), d, c.min or 0, d / (c.min or d), f,
+            #pay > 0 and table.concat(pay, "，") or "读不到")
+    end
+    return f
+end
+-- 11.23 我打本地 AI（木桩）：放影武掉了血、分段没改的，记下原因（泥头车最后一击在木桩上没削到，那台机器的日志要能看出为什么）
+function SEG1121.whyMine(src, attacker, f, name, d, dirty)
+    if not name or d < 5 then return end
+    local edge = name:find("^GA_HorseCart") or (LO and LO.isEdgeAttack and LO.isEdgeAttack(name))   -- 马车不在影武路径下
+    if SEG1121.whyN >= SEG1121.WHY_MAX then return end
+    local pay = src and src.pay or {}
+    local parts, scaled = {}, false
+    for _, bd in ipairs(pay) do
+        local x = SEG1121.sourceFactor(bd, attacker, name)
+        if x ~= 1 then scaled = true end
+        parts[#parts + 1] = string.format("%s×%g", tostring(bd), x)
+    end
+    if (#pay > 0 and not scaled) or (#pay == 0 and not edge) then return end   -- 本来就不在分段表 / 不是影武，不记
+    SEG1121.whyN = SEG1121.whyN + 1         -- 和挨打方那条共用 WHY_MAX（见上）；泥头车另有 cartN
+    local reason = #pay == 0 and "这一帧读不到新判定" or (f and ("木桩这一下之前不干净（" .. tostring(dirty or "读不到") .. "），不改"))
+        or "同一帧混了不同倍率"
+    out("11.23 木桩分段没改（%s，第 %d 次）：我的 %s 这一下 -%.0f 判定 %s", reason, SEG1121.whyN, name, d,
+        #parts > 0 and table.concat(parts, "，") or "-")
+end
+
+
 -- ============================================================ §200 闪避冷却 / 闪避扣杀气（武器平衡的一部分：平衡表 cooldown.ShunYingDodge、cost.Dodge / SnakeDodge）
 -- 用户（11-10）先要了"瞬影结束后 10 秒 cd、普通闪避一套结束后 5 秒 cd"（§200–§200.9），后来改成（§200.10）：
 --   "能给普通的闪避增加杀气消耗么 但是不给他冷却限制了"——普通闪避（AdvancedDash / Continuous_02 / 03，灵蛇剑架势闪避 StanceDash）
@@ -981,6 +1239,7 @@ function DCD.reset(why)
     local had = DCD.me.exp > 0 or DCD.me.sy.on or DCD.op.sy.at
     DCD.me, DCD.op = { sy = {}, exp = 0, lastAt = -100 }, { sy = {} }
     DCD.hintTill, DCD.muteTill, DCD.opMuteTill, DCD.debit = 0, 0, 0, 0
+    if MCD then MCD.reset(why) end      -- §426 招式冷却跟着清零
     if had then DCD.log("瞬影冷却清零（%s）", why or "-") end
 end
 -- 本机瞬影冷却还剩几秒（没在冷却 = nil）
@@ -1121,6 +1380,8 @@ end
 function DCD.muted(tn) return tn < DCD.muteTill end
 -- 屏幕提示（对局 HUD，交手中）：拦了之后 HINT 秒内显示瞬影冷却还剩几秒。普通闪避不提示（不冷却了；杀气不足也照样闪，不提示）
 function DCD.hintRows(tn)
+    local mr = MCD and MCD.hintRows(tn)          -- §426 招式冷却的提示也走这里
+    if mr and tn >= DCD.hintTill then return mr end
     if tn >= DCD.hintTill then return nil end
     local l = DCD.left(tn)
     if not l then return nil end
@@ -1145,6 +1406,85 @@ function DCD.puppet(e, tn)
 end
 -- dg= 照播前问：刚挡掉对方一下瞬影就不照播
 function DCD.opMuted(tn) return tn < DCD.opMuteTill end
+
+-- ============================================================ §426 招式冷却（武器平衡的一部分：平衡表 cooldown 行里 GA_ 开头的键 = 那一招的冷却秒数）
+-- 用户（11-24）：对手双刃"第四段 BBBB → 闪避取消 → 再 BBBB"循环（14:27 那局 18 秒 24 次、打中 98 下，被连到死），
+-- "这招也像紫冥的火枪一样加个cd"——定 5 秒、跟武器平衡走（不加房间设置）。
+-- 规则：放出来那一刻起算 N 秒，冷却里再放：
+--   出手方（本机，netSend 看到我新出现的这招）→ K2_CancelAbility 只取消这一个、动作停掉、这招扣的杀气写回、不发给对方，屏幕提示；
+--   挨打方（替身，AIR.fire）→ 按收到的事件算对方的冷却（留 TOL），还剩 > TOL 秒就不放（对方是旧版也挡得住）。
+-- 只在对局交手中、武器平衡开着时管（DCD.on()）；清零跟着 DCD.reset（每回合倒计时 / 对局结束 / 换对手 / 换世界）。
+-- 多人房的对手替身走 PEER（观战式重放），对方那一侧不挡，只靠出手方这一侧拦（同 §184 火枪）。
+MCD = { TOL = 0.3, HINT = 1.5, LOGS = 60, logs = 0, me = {}, op = {}, hintTill = 0, hintName = nil, n = { me = 0, op = 0 } }
+function MCD.log(...)
+    if MCD.logs < MCD.LOGS then MCD.logs = MCD.logs + 1; out(...) end
+end
+-- §435 冷却组（用户 11-24："绝影 轻重重 / 轻轻轻重重（用户说的"轻轻重重重"，资产里没有 AABBB）/ 重重重重 最后一下重击触发的追踪攻击
+-- 冷却 1 秒、这几招统一"；追踪 = 判定 BD_GA_Hun_Double_JueYing_Shadow_Slash_v3，只在这几招里，挡不了单独一下 → 用户定挡整招）。
+-- 组里任一招放出就整组进冷却；平衡表 cooldown 行写组名（JueYingTrack = 1），组名不是 GA_ 开头。原来 BBBB 单独 5 秒撤掉（用户定）。
+MCD.GROUP = { GA_Hun_Double_ABB_C = "JueYingTrack", GA_Hun_Double_AAABB_C = "JueYingTrack", GA_Hun_Double_BBBB_C = "JueYingTrack" }
+function MCD.key(n) return MCD.GROUP[n] or n end      -- 计时 / 查表用的键：组里的招用组名
+function MCD.sec(n)         -- 这一招冷却几秒：不是表里的招 / 不在交手里 / 武器平衡关着 = 0
+    if type(n) ~= "string" or n:sub(1, 3) ~= "GA_" then return 0 end
+    local v = BAL.COOLDOWN and (BAL.COOLDOWN[n] or (MCD.GROUP[n] and BAL.COOLDOWN[MCD.GROUP[n]]))
+    if not v or v <= 0 or not BAL.on or not DCD.on() then return 0 end
+    return v
+end
+function MCD.reset(why)
+    local had = next(MCD.me) or next(MCD.op)
+    MCD.me, MCD.op, MCD.hintTill, MCD.hintName = {}, {}, 0, nil
+    if had then MCD.log("§426 招式冷却清零（%s）", why or "-") end
+end
+-- 招名 → 动作里找的那一截（GA_Hun_Double_BBBB_C → Double_BBBB）
+function MCD.core(n) return (n:gsub("^GA_Hun_", ""):gsub("^GA_", ""):gsub("_C$", "")) end
+-- 出手方：netSend 看到我新出现的技能时调；冷却里拦了返回 true（调用方不发这招）
+function MCD.check(p1, n, tn)
+    local sec = MCD.sec(n)
+    if sec <= 0 then return false end
+    local exp = MCD.me[MCD.key(n)]
+    if not exp or tn >= exp then
+        MCD.me[MCD.key(n)] = tn + sec
+        MCD.log("§426 招式冷却：我放了 %s，%g 秒内不能再放", n, sec)
+        return false
+    end
+    local gone = G.cancelAbilities(p1, function(x) return x == n end)
+    local m = montageOf(p1) or ""
+    local cut = m:find(MCD.core(n), 1, true) and cutMontage(p1)
+    local back = ""
+    local sh = attrOf(p1, "Shachi")
+    if sh and NET.prevSh and sh < NET.prevSh - 0.01 then
+        local ok = DCD.setSh(p1, NET.prevSh)
+        back = string.format("，杀气 %.0f→%.0f %s", sh, NET.prevSh, ok and "写回" or "没写回成")
+    end
+    MCD.hintTill, MCD.hintName = tn + MCD.HINT, n
+    MCD.n.me = MCD.n.me + 1
+    MCD.log("§426 招式冷却：%s 还剩 %.1f 秒 → %s%s%s，不发给对方（第 %d 次）", n, exp - tn,
+        #gone > 0 and ("已取消 " .. table.concat(gone, ",")) or "没取消到实例", cut and "，动作已停" or "", back, MCD.n.me)
+    return true
+end
+-- 挨打方：对方发来的这招在对方冷却里就不放，返回 true
+function MCD.puppet(e, tn)
+    local n = e and e.name
+    local sec = MCD.sec(n)
+    if sec <= 0 then return false end
+    local exp = MCD.op[MCD.key(n)]
+    if exp and tn < exp - MCD.TOL then
+        MCD.n.op = MCD.n.op + 1
+        MCD.log("§426 对方招式冷却中：远端#%s %s 还剩约 %.1f 秒 → 替身不放（第 %d 次）", tostring(e.id), n, exp - tn, MCD.n.op)
+        return true
+    end
+    MCD.op[MCD.key(n)] = tn + sec
+    return false
+end
+-- 屏幕提示（对局 HUD）：拦了之后 HINT 秒内显示还剩几秒
+function MCD.hintRows(tn)
+    if tn >= MCD.hintTill or not MCD.hintName then return nil end
+    local l = (MCD.me[MCD.key(MCD.hintName)] or 0) - tn
+    if l <= 0 then return nil end
+    local c = math.ceil(l)
+    local nm = MCD.core(MCD.hintName)
+    return { { string.format("%s 冷却中 还剩 %d 秒", nm, c), string.format("%s COOLDOWN %ds", nm, c) } }
+end
 
 -- ============================================================ §200.11 切武器保持杀气（武器平衡的一部分：平衡表 cost.SwitchKeepShachi）
 -- 用户（11-10）："原版的切换武器就回满杀气这一条，能改成切换武器继承当前杀气状态么"。
@@ -1544,6 +1884,7 @@ function UICH.rebind(p1, why, tn)
 end
 
 return {
+    SEG1121 = SEG1121,
     GCD = GCD,
     GDMG = GDMG,
     SUMD = SUMD,

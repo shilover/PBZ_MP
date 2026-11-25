@@ -22,12 +22,27 @@ local D = { PER_PAGE = 9, MAX_CASTS = 400, WIN = 5.0, CLEARED_SHOW = 1.5 }
 
 function D.reset(why, tn)
     D.casts, D.order, D.rows, D.recent = {}, {}, {}, {}
+    D.cycle, D.cuts = nil, {}
     D.total, D.segs, D.t0, D.tLast, D.page, D.last = 0, 0, nil, nil, 1, nil
     D.opp = NET.rnm
+    D.roundFloor = nil
     D.clearedAt = tn
     if why then out("§342 招式伤害统计清零（%s）", why) end
 end
 D.reset()
+
+-- Reset allocates fresh tables, preserving completed per-move data.
+function D.finishRound(id, tn)
+    if id ~= nil and D.completedId == id then return false end
+    local floor = D.roundFloor or 0
+    for atk in pairs(D.casts) do floor = math.max(floor, atk) end
+    D.previous = { id = id, total = D.total, segs = D.segs, casts = D.casts_n(),
+        dps = D.dps(), summary = D.summary(), rows = D.rows, last = D.last }
+    D.completedId = id
+    D.reset(nil, tn)
+    D.roundFloor = floor
+    return true
+end
 
 -- 技能名 → 面板上短一点的名字（GA_Hun_Long_AAB_C → Long_AAB；L1+圈 那几招带 L1+ 前缀）
 function D.pretty(n)
@@ -36,31 +51,73 @@ function D.pretty(n)
     return n
 end
 
+-- Bronze B_Hold can restart inside one active ability. Observe only the proven
+-- release -> charge-start transition, never split multi-hit damage by time gaps.
+D.REPEAT = "GA_Hun_BronzeSword_B_Hold_C"
+D.START = "Hun_QingTongJian_Attack_Hold_B_Montage"
+D.RELEASE = { Hun_QingTongJian_Attack_Hold_B_Attack_Montage = true,
+              Hun_QingTongJian_Attack_Hold_B_Attack_02_Montage = true }
+function D.observe(atk, mon, total)
+    if not NET.rdummy or not atk or not NET.evName or NET.evName[atk] ~= D.REPEAT then D.cycle = nil; return end
+    if NET.rnm ~= D.opp then D.reset() end
+    local s = D.cycle
+    if not s or s.atk ~= atk then s = { atk = atk }; D.cycle = s end
+    if D.RELEASE[mon] then s.released = true end
+    if mon == D.START and s.released then
+        s.released = false
+        -- Snapshot the local td cumulative value, NOT the last received result:
+        -- old results can arrive after the next cycle starts.
+        total = tonumber(total)
+        if not total then return end
+        total = tonumber(string.format("%.0f", total)) -- TOUCH.wire sends integer td values.
+        if D.casts[atk] and total < D.casts[atk].v then return end
+        local cuts = D.cuts[atk] or {}
+        if total > (cuts[#cuts] or 0) then cuts[#cuts + 1] = total; D.cuts[atk] = cuts end
+    end
+end
+function D.frame(p1)
+    if not NET.rdummy or not ctx.G or not ctx.touchTotal then return end
+    local atk = NET.myAtkId
+    if not atk or not NET.evName or NET.evName[atk] ~= D.REPEAT then D.cycle = nil; return end
+    local _, _, mon = ctx.G.activeMontage(p1)
+    D.observe(atk, mon, ctx.touchTotal(atk))
+end
+
 -- 对方回报我第 atk 招命中、这招累计 v（第一次 / 追加命中都调，v 是累计值）
 function D.hit(atk, v, tn)
     atk, v = tonumber(atk), tonumber(v)
     if not atk or not v or v <= 0 then return end
     if NET.rnm ~= D.opp then D.reset(string.format("对手换了：%s → %s", tostring(D.opp), tostring(NET.rnm))) end
+    if D.roundFloor and atk <= D.roundFloor then return end
     local c = D.casts[atk]
     if not c then
         local name = (NET.evName and NET.evName[atk]) or NET.lastMyAtk or "?"
-        c = { name = name, v = 0 }
+        c = { name = name, v = 0, part = 1, partV = 0 }
         D.casts[atk] = c
         D.order[#D.order + 1] = atk
-        if #D.order > D.MAX_CASTS then D.casts[table.remove(D.order, 1)] = nil end
+        if #D.order > D.MAX_CASTS then
+            local old = table.remove(D.order, 1)
+            D.casts[old], D.cuts[old] = nil, nil
+        end
         local r = D.rows[name]
         if not r then r = { name = name, n = 0, total = 0, max = 0, segs = 0 }; D.rows[name] = r end
-        r.n = r.n + 1
     end
     local add = v - c.v
     if add <= 0.5 then return end
-    c.v = v
     local r = D.rows[c.name]
+    local cuts = D.cuts[atk] or {}
+    while c.v < v do
+        if cuts[c.part] and c.v >= cuts[c.part] then c.part, c.partV = c.part + 1, 0 end
+        local finish = math.min(v, cuts[c.part] or v)
+        local delta = finish - c.v
+        if c.partV == 0 then r.n = r.n + 1 end
+        c.partV, c.v = c.partV + delta, finish
+        if c.partV > r.max then r.max = c.partV end
+    end
     r.total, r.segs = r.total + add, r.segs + 1
-    if v > r.max then r.max = v end
     D.total, D.segs = D.total + add, D.segs + 1
     D.t0, D.tLast = D.t0 or tn, tn
-    D.last = c
+    D.last = { name = c.name, v = c.partV }
     D.recent[#D.recent + 1] = { t = tn, v = add }
     D.prune(tn)
 end
@@ -96,6 +153,9 @@ function D.hudRows(tn)
     }
     if D.last then
         rows[#rows + 1] = { l = T("上一招：", "LAST:"), v = string.format("%s %.0f", D.pretty(D.last.name), D.last.v), side = true, nolog = true }
+    end
+    if D.previous then
+        rows[#rows + 1] = { l = T("上一局：", "PREVIOUS ROUND:"), v = D.previous.summary, side = true, nolog = true }
     end
     local cleared = D.clearedAt and tn - D.clearedAt < D.CLEARED_SHOW
     rows[#rows + 1] = { c = cleared and T("已清零", "CLEARED") or T("End 清零 · Home 看每招明细", "END: RESET · HOME: PER-MOVE TABLE"),

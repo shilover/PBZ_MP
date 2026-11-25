@@ -134,7 +134,10 @@ end
 function CHG.watched(n) return CHG.isHold(n) or CHG.PROBE[n] ~= nil end
 
 function CHG.reset()
+    if INP and INP.heldT then for id in pairs(INP.heldT()) do INP.release(id, "重置") end end
     CHG.out, CHG.rel, CHG.fired, CHG.peerRel = {}, {}, {}, false
+    CHG.stgOut, CHG.stg = {}, {}           -- §420.1
+    CHG.lastFire = nil
 end
 
 -- 开始记一条。who = "我" / "替身"；id = 招式号（我的 = 发出去的编号，大招压着还没发时是 nil，发的时候 CHG.onEmit 补；替身的 = 远端编号）
@@ -165,6 +168,10 @@ function CHG.watch(actor, who, name, tn, id)
         local h, why = G.holdingInputs(actor)
         w.h0 = CHG.trigger(h)                              -- 开始时按着的（去掉移动 / 视角）；空 / 读不到 → 退回看动作 / 技能
         CHG.diag(h, why, "开始 " .. name)
+        if CHG.STAGE[name] then
+            w.stg = CHG.STAGE[name]
+            if id then CHG.stgPush(id, 0, nil, tn) end      -- §420.1 先告诉对方"这招我会报档位"（大招压着的在 onEmit 补）
+        end
     end
     keep[#keep + 1] = w
     CHG.list = keep
@@ -199,6 +206,10 @@ function CHG.onEmit(n, id)
         if w.who == "我" and w.name == n and not w.id then
             w.id = id
             if w.relAt then CHG.out[#CHG.out + 1] = { id = id, secs = w.relAt - w.at, at = w.relAt } end    -- 发之前已经松手
+            if w.stg then                                      -- §420.1
+                CHG.stgPush(id, 0, nil, now())
+                if w.stgN then CHG.stgPush(id, w.stgN, w.stgC, now()) end
+            end
         end
     end
 end
@@ -211,17 +222,37 @@ function CHG.release(w, tn, why)
     if w.id then CHG.out[#CHG.out + 1] = { id = w.id, secs = tn - w.at, at = tn } end
 end
 
+-- §409.2 发送方：我按着蓄力时放了下一招（攻击 / 闪避 / 跳 / 切刀，别的武器族）→ 这一刻就算松手。
+-- 以前只有"蓄力 / 探针"类的招会走 CHG.watch 的"放了下一招"；闪避（AdvancedDash）不在里面，只能等按键读数 / 技能列表，
+-- 11-22 收方日志里闪避取消的钢形态蓄力重被报成"按了 13.10 秒""20.64 秒"（替身技能 0.8 秒就结束了）
+function CHG.onMyFire(n, tn, attack)
+    if not CHG.endsHold(n, attack) then return 0 end
+    local k = 0
+    for _, w in ipairs(CHG.list) do
+        if w.who == "我" and w.hold and not w.relAt and w.name ~= n and not CHG.VEHICLE.names[w.name]
+            and not CHG.sameFamily(w.name, n) then
+            CHG.release(w, tn, "放了下一招 " .. n)
+            k = k + 1
+        end
+    end
+    return k
+end
+
 -- 状态包字段（没有就空串）
 function CHG.wire(tn)
     while #CHG.out > 0 and tn - CHG.out[1].at > CHG.REL_KEEP do table.remove(CHG.out, 1) end
-    if #CHG.out == 0 then return "" end
-    local s = {}
-    for _, r in ipairs(CHG.out) do s[#s + 1] = string.format("%d:%.2f", r.id, r.secs) end
-    return "rel=" .. table.concat(s, ",") .. "\n"
+    local r1 = ""
+    if #CHG.out > 0 then
+        local s = {}
+        for _, r in ipairs(CHG.out) do s[#s + 1] = string.format("%d:%.2f", r.id, r.secs) end
+        r1 = "rel=" .. table.concat(s, ",") .. "\n"
+    end
+    return r1 .. CHG.stgWire(tn)
 end
 
 -- 收包：rel=<远端招式号>:<秒>,...（旧版没有这个字段 → 什么都不做）
 function CHG.onPacket(t, tn)
+    if t.chs then CHG.stgPacket(t.chs, tn) end      -- §420.1
     if not t.rel then return end
     CHG.peerRel = true
     for id, secs in t.rel:gmatch("(%d+):([%d%.]+)") do
@@ -244,6 +275,8 @@ function CHG.onFire(pup, e, tn)
     CHG.fired[e.id] = { at = tn, name = e.name, mon = {} }
     if not (CHG.SPIN_SKIP and CHG.SPIN_SKIP[e.name]) then CHG.fired[e.id].spin = {} end   -- §407/§409 按住持续类：记状态，pupStep 里补中段动作
     CHG.fired[e.id - 300] = nil
+    if SHIELD and SHIELD.onFire then SHIELD.onFire(pup, e, tn) end   -- 11-23 举盾：替身停在收盾第一帧等对方松手（不走 §407 续转）
+    if HJHC then HJHC.onFire(pup, e, tn) end                        -- §446 火铳连射第二发：替身没出子弹就补
 end
 
 -- §92.8 "自己马上松手"的蓄力招（18:47–18:50 实测替身 0.85–0.94 / 1.56–1.58 秒就出招，对方按 0.3 秒、2.0 秒都一样）：
@@ -265,6 +298,7 @@ end
 function CHG.selfStep(pup, id, f, tn)
     local sc = CHG.SELF[f.name]
     if not sc or f.selfOff or not CHG.peerRel or not valid(pup) then return end
+    if f.shot then return end                               -- §427 对方会发每一发（独眼弓）：§377 管停住和出箭
     local secs = CHG.rel[id]
     local due = secs and tn >= f.at + secs
     local _, _, m, pos = LAT.activeMontage(pup)
@@ -285,6 +319,140 @@ function CHG.selfStep(pup, id, f, tn)
             secs and string.format("按了 %.2f 秒", secs) or "还没松手")
     elseif m and m ~= sc.mon and f.first then
         f.selfOff = true                                    -- 已经自己出招了（对方松手早于 at 秒）
+    end
+end
+
+-- §420.1 巨凶斧蓄力档位（11-23 用户"巨凶斧的蓄力同步有问题，而且蓄力后应该不止 1 段攻击"）。
+-- 资产（GA_BrutalAxe_Normal 名字表 / 导出）：技能变量 Current Charge / Released；函数 Can Gain Charge / Gain Charge / Is Holding /
+--   To Release；技能自己的时间线（LGATimeline Main / SprintCharge，不跟动作走——蓄力动作里没有任何通知）在固定时刻发
+--   GameplayEvent.Ability.Action.BrutalAxe.GainCharge，到时 Can Gain Charge 问输入组件 IsHolding：按着就涨一档，没按着就 To Release。
+--   出手 Release1–3 = ShaChi_BrutalAxe_Release_01–03_Montage（01 一刀；02 两刀 + 冲击波；03 三刀 + 两道冲击波，子弹在技能里）；
+--   GA_BrutalAxe_Sprint 是它的子类（只多 Sprinting 标签），疾行 Sprint_Combo_01（一刀）/ Sprint_Release_03（蓄满，刀 + 冲击波）。
+-- 替身没有输入组件：1.40 秒第一次 GainCharge 就当"没按着"→ 永远一档（11-23 15:15 日志 5 次 Release_01；疾行 16:00 / 17:20 也是一下就出）。
+-- 第一版（82f8fae7）暂停蓄力动作等档位：拦不住技能自己的时间线；17:21:18 实测还被发送方 0.20 秒的假松手提前放了（下面 ① 修）。
+-- 现在：
+--   发：放这招先发 chs=<号>:0；动作换成出手动作 → 读 Current Charge，发 chs=<号>:<档>:<值>，同时算松手（rel=）。
+--       ① 这两招的松手只认出手动作：开始那一帧按住的往往只有点按键 IA_ShachiAbility（长按键 _Hold 还没触发），
+--          它一松就被当成松手 → 17:21 对方报"按了 0.20 秒"，实际 2.97 秒蓄满三档
+--   收：替身放之前按住影武键（INP.KEYS，同 72bae753 贪狼 / 金瓜旋转：给替身建输入组件、IsHolding 读回 true）→ 技能自己照常涨档；
+--       收到对方档位 → 写 Current Charge、松开键、调技能的 To Release 当场出手（调不动就等下一次 GainCharge 自己出）；
+--       对方旧版（没 chs=）/ 等太久 → 照 rel= / 超时松开
+-- 没进游戏验证（日志关键字 §420.1）：IsHolding 能不能让替身涨档、To Release 调不调得动
+CHG.AXE_HOLD = { "/PBZInput/InputActions/IA_ShachiAbility_Hold.IA_ShachiAbility_Hold", "/PBZInput/InputActions/IA_ShachiAbility.IA_ShachiAbility" }
+CHG.AXE_REL = { ShaChi_BrutalAxe_Release_01_Montage = 1, ShaChi_BrutalAxe_Release_02_Montage = 2, ShaChi_BrutalAxe_Release_03_Montage = 3,
+                  ShaChi_BrutalAxe_Sprint_Combo_01_Montage = 1, ShaChi_BrutalAxe_Sprint_Release_03_Montage = 2 }
+CHG.AXE = { rel = CHG.AXE_REL, var = "Current Charge", fn = "To Release", wait = 6.0, hold = CHG.AXE_HOLD,
+              probe = { "Current Charge", "Released", "No Input Counter" } }
+CHG.STAGE = { GA_BrutalAxe_Normal_C = CHG.AXE, GA_BrutalAxe_Sprint_C = CHG.AXE }
+CHG.HOLD.GA_BrutalAxe_Sprint_C = 1
+CHG.stgOut, CHG.stg, CHG.stgN, CHG.STG_LOGS = {}, {}, 0, 40
+
+function CHG.stgLog(fmt, ...)
+    CHG.stgN = CHG.stgN + 1
+    if CHG.stgN <= CHG.STG_LOGS then out(fmt, ...) end
+end
+
+-- 技能实例上几个变量（诊断）
+function CHG.stgProbe(actor, name, sc)
+    local inst = LO and LO.activeInstance and LO.activeInstance(actor, name)
+    if not inst then return "（没有技能实例）" end
+    local t = {}
+    for _, k in ipairs(sc.probe) do
+        local ok, v = pcall(function() return inst[k] end)
+        t[#t + 1] = k .. "=" .. (ok and tostring(v) or "读不到")
+    end
+    return table.concat(t, " ")
+end
+
+-- 发：记一条（同一号同一档只留一条）
+function CHG.stgPush(id, n, c, tn)
+    for _, r in ipairs(CHG.stgOut) do if r.id == id and r.n == n then return end end
+    CHG.stgOut[#CHG.stgOut + 1] = { id = id, n = n, c = c, at = tn or now() }
+end
+
+function CHG.stgWire(tn)
+    while #CHG.stgOut > 0 and tn - CHG.stgOut[1].at > CHG.REL_KEEP do table.remove(CHG.stgOut, 1) end
+    if #CHG.stgOut == 0 then return "" end
+    local s = {}
+    for _, r in ipairs(CHG.stgOut) do
+        s[#s + 1] = r.n == 0 and string.format("%d:0", r.id)
+            or string.format("%d:%d:%s", r.id, r.n, type(r.c) == "number" and string.format("%.3f", r.c) or "-")
+    end
+    return "chs=" .. table.concat(s, ",") .. "\n"
+end
+
+-- 发：我的动作换成了出手动作 → 报档位，同时算松手
+function CHG.stgMine(w, m, tn)
+    local n = w.stg.rel[m]
+    if not n then return end
+    w.stgN = n
+    local inst = LO and LO.activeInstance and LO.activeInstance(w.actor, w.name)
+    local okV, v = false, nil
+    if inst then okV, v = pcall(function() return inst[w.stg.var] end) end
+    w.stgC = (okV and type(v) == "number") and v or nil
+    if w.id then CHG.stgPush(w.id, w.stgN, w.stgC, tn) end
+    CHG.release(w, tn, "出手 " .. m)
+    CHG.stgLog("§420.1 我 %s%s 出手 %s → 第 %d 档，按了 %.2f 秒（%s；%s）", w.name, w.id and ("（本机#" .. w.id .. "）") or "（还没发）", m, w.stgN,
+        tn - w.at, w.stgC and string.format("%s = %.3f", w.stg.var, w.stgC) or ("读不到 " .. w.stg.var), CHG.stgProbe(w.actor, w.name, w.stg))
+end
+
+-- 收：chs=<号>:0,<号>:<档>:<值>
+function CHG.stgPacket(str, tn)
+    for id, rest in str:gmatch("(%d+):([^,]+)") do
+        id = tonumber(id)
+        local n, c = rest:match("^(%d+):?(.*)$")
+        n = tonumber(n)
+        if id and n then
+            local cur = CHG.stg[id]
+            if n == 0 then
+                if not cur then CHG.stg[id] = { n = 0 } end
+            elseif not (cur and cur.n > 0) then
+                CHG.stg[id] = { n = n, c = tonumber(c), at = tn }
+                local f = CHG.fired[id]
+                CHG.stgLog("§420.1 对方 远端#%d %s 出手第 %d 档（%s）%s", id, f and f.name or "?", n,
+                    tonumber(c) and string.format("Current Charge = %s", c) or "对方读不到档位变量",
+                    f and string.format("，替身放出 %.2f 秒", tn - f.at) or "，替身没放这招")
+            end
+        end
+    end
+end
+
+-- 收：把对方的档位写进替身的技能实例，再调 To Release。返回说明
+function CHG.stgApply(pup, f, sc, s)
+    local inst = LO and LO.activeInstance and LO.activeInstance(pup, f.name)
+    if not inst then return "替身没有技能实例" end
+    local parts = {}
+    if type(s.c) == "number" then
+        local okW = pcall(function() inst[sc.var] = s.c end)
+        local okR, back = pcall(function() return inst[sc.var] end)
+        local good = okW and okR and type(back) == "number" and math.abs(back - s.c) < 0.01
+        parts[#parts + 1] = string.format("写 %s = %.3f %s（读回 %s）", sc.var, s.c, good and "成功" or "失败", okR and tostring(back) or "读不到")
+    else
+        parts[#parts + 1] = "对方没报变量值、不写"
+    end
+    local okF, err = pcall(function() local fn = inst[sc.fn]; fn(inst) end)
+    parts[#parts + 1] = string.format("调 %s %s", sc.fn, okF and "成功" or ("失败：" .. tostring(err)))
+    return table.concat(parts, "，")
+end
+
+function CHG.stageStep(pup, id, f, tn)
+    local sc = CHG.STAGE[f.name]
+    if not sc or f.stgOff or not valid(pup) then return end
+    local s = CHG.stg[id]
+    local held = INP and INP.heldT and INP.heldT()[id] ~= nil
+    if s and s.n > 0 then
+        f.stgOff = true
+        local _, _, m = LAT.activeMontage(pup)
+        local out1 = sc.rel[m] and ("替身已经自己出手了（" .. m .. "），不改") or CHG.stgApply(pup, f, sc, s)
+        if held then INP.release(id, string.format("对方出手第 %d 档", s.n)) end
+        CHG.stgLog("§420.1 远端#%d %s 对方第 %d 档到（替身放出 %.2f 秒，按住 %s）→ %s；%s", id, f.name, s.n, tn - f.at,
+            held and "中" or "没按上", out1, CHG.stgProbe(pup, f.name, sc))
+        return
+    end
+    if tn - f.at > sc.wait then
+        f.stgOff = true
+        if held then INP.release(id, "等档位太久") end
+        CHG.stgLog("§420.1 远端#%d %s 等 %.1f 秒没收到档位（%s）→ 松开", id, f.name, sc.wait, s and "对方说会报" or "对方旧版没 chs=")
     end
 end
 
@@ -309,6 +477,7 @@ CHG.VEHICLE = { names = { GA_HorseCart_Charge_C = 1 }, MAX = 30.0, logN = 0 }
 
 function CHG.vehicleOff(pup, id, f, tn, why)
     if f.vehOff then return end
+    if f.turnAt and CART and tn - f.turnAt < CART.KEEP then return end   -- §434 力荡判定刚生成，来源技能先留着（每帧会再来）
     f.vehOff = true
     local gone = G.cancelAbilities(pup, function(n) return n == f.name end)
     local landed = #gone > 0 and G.hover(pup, false)
@@ -345,12 +514,68 @@ end
 -- §140 第 2 步实验：替身放名单里的招之前给它"按着"对应的键（G.inputEnsure / inputHold），对方松手到点松开。
 -- 关掉：net/inp_off.txt。实验开着时激光不再续计时（看替身自己会不会照到松手）
 -- 04:30 实验 3：组件、技能变量、Controller、按住都接上了，替身的等松手任务还是不建（多半要玩家控制器），实验先关（KEYS 空）
-INP = { KEYS = {},     -- 实验时：GA_DuYan_Bow_Laser_C = "/PBZInput/InputActions/IA_ShachiAbility_Hold.IA_ShachiAbility_Hold"
-        OFF_FILE = (NET_DIR or "net") .. "/inp_off.txt", logN = 0, held = {} }
+-- 11-23 贪狼按住转圈（用户"蓄力的过程只有开头和结束砸下来，过程中的旋转只有动作没有武器没有判定"）：
+-- 替身这招放出 0.61 秒技能自己就进 End（技能在检查点问 GetSGameInputComponent(角色):IsHolding，替身没组件 = 没按着），
+-- 之后 §407 补的 Loop 只是动作，技能已在收尾（武器收、旋转判定不生成）。§140 实验 1 实测过：新建的组件
+-- GetSGameInputComponent 返回的"就是新建的"、IsHolding 读回 true——激光不行是因为它走的是另一种等松手任务，
+-- 贪狼 / 金瓜旋转是直接问 IsHolding（资产里都有 IsHolding + GetSGameInputComponent，没有等松手任务）。
+-- 资产看不出问的是重击键还是影武键，两个都按住。对方松手 / 放了下一招 / 技能结束 / 记录过期时松开
+local INP_HOLD2 = { "/PBZInput/InputActions/IA_ShachiAbility_Hold.IA_ShachiAbility_Hold", "/PBZInput/InputActions/IA_AttackH_Press.IA_AttackH_Press" }
+-- 金瓜按住连击 / 空中下砸（用户 11.23 在线仍"视为不按住"）：资产里同样问 GetSGameInputComponent:IsHolding，导入的键是
+-- 影武键 IA_ShachiAbility_Hold / IA_ShachiAbility。按住连击另有一个增强输入事件绑定（只有玩家控制器会触发，替身收不到），
+-- 能补的只有 IsHolding 这一路；空中只有 IsHolding
+local INP_SHACHI = { "/PBZInput/InputActions/IA_ShachiAbility_Hold.IA_ShachiAbility_Hold", "/PBZInput/InputActions/IA_ShachiAbility.IA_ShachiAbility" }
+INP = { KEYS = { GA_TanLang_Normal_C = INP_HOLD2, GA_JinGua_RoAttack_C = INP_HOLD2,
+                 GA_JinGua_Normal_C = INP_SHACHI, GA_JinGua_Air_C = INP_SHACHI,
+                 GA_BrutalAxe_Normal_C = CHG.AXE_HOLD, GA_BrutalAxe_Sprint_C = CHG.AXE_HOLD,      -- §420.1 巨斧：按住才涨档
+                 -- §424 黄金火铳站立第二发（用户 11.23"第二发子弹没伤害"；17:21 IGNIZ 打我 4 轮：Normal_02 每轮 −251.5，
+                 -- Normal_04 一次都没中）。第一发资产里有 GAA_ShachiBulletInstant（放出来就出子弹）；第二发没有，
+                 -- 靠 Is Holding / Released / Min Duration Reached 那套（GetSGameInputComponent:IsHolding）→ 替身没输入 = 没出子弹。
+                 -- 资产里没导入具体的键，按金瓜那组影武键按住；对方松手 / 下一招 / 技能结束时松开
+                 GA_HuangJinHuoChong_Normal_04_C = INP_SHACHI,
+                 -- §432 铁拳套三段蓄力（用户 11-24"3 段蓄力攻击或者精准释放似乎都是无效的，在线只默认了瞬发"）：Charge_A / AA / AAA 继承
+                 -- GA_TieKuangQuanTao_ChargeBase，资产里只有 IsHolding（按住松手招_全表），子弹按档位选 Lv0 / Lv1 / Lv2。
+                 -- 11-24 挨打方日志 14:05:25–14:05:40 替身 9 拳全是 *_Lv0（对方 #377 按了 0.75 秒也是 Lv0）= 替身没输入、永远当瞬发。
+                 -- 发送方按住的是影武键（"开始 GA_TieKuangQuanTao_Charge_A_C 时按着的输入 IA_ShachiAbility_Hold"），按金瓜那组；
+                 -- 对方松手（rel= 到点，pupStep）/ 下一招 / 技能结束时松开 → 档位和"精准释放"按对方按住的秒数由游戏自己算
+                 GA_TieKuangQuanTao_Charge_A_C = INP_SHACHI, GA_TieKuangQuanTao_Charge_AA_C = INP_SHACHI,
+                 GA_TieKuangQuanTao_Charge_AAA_C = INP_SHACHI,
+                 -- §434 游龙头高压水柱（11-24 两边日志：发送方 Start 按住 5.66 秒、13:42 打木桩每 0.5 秒 -70；收方替身
+                 -- 远端#310 放出 1.01 秒就进 End、一下没碰到）。资产 GA_YouLongHead_Water 是等松手任务（Release Task / Can Release
+                 -- Task，OnRelease / OnAlreadyRelease，导入的键 IA_ShachiAbility_Hold）：放出约 1 秒（CanRelease）才建任务、建的时候
+                 -- 没按着就 OnAlreadyRelease 收招，水柱 B_YouLongHead_Loop 那一段根本没出。替身先按住影武键让任务看到"按着"；
+                 -- 松开后任务不一定收得到（删键不发松手事件）→ INP.AFTER 兜底收招
+                 GA_YouLongHead_Water_C = INP_SHACHI,
+                 -- §437 泥头车（用户 11-24"替身没放出来"）：GA_HorseCart_Charge 也是等松手任务（OnRelease / OnAlreadyRelease，
+                 -- 导入 IA_ShachiAbility_Hold），替身没按着 → 约 1.86 秒自己下车（收方 14:01:29 / 37 / 57），之后对方的力荡
+                 -- 落在已经下车的替身上。按住影武键一直到对方下车的 rel=（§276.10 发送方只在下车时发）/ 技能结束
+                 GA_HorseCart_Charge_C = INP_SHACHI,
+                 -- §439 拙壁盾举盾（11-25 收方日志 14:35–14:47：对方按 3.4–9.9 秒，替身盾只撑 1.6–4 秒——拉回收盾第一帧暂停
+                 -- 约 1 秒后技能照样结束、盾收掉，之后只剩补的举盾姿势）。发送方举盾时按着的是影武键（"开始 GA_ZhuoBiDun_C 时
+                 -- 按着的输入 IA_ShachiAbility_Hold"）。替身按住影武键让技能自己一直举着；松开：对方 rel= 到点（pupStep）/
+                 -- 下一招 / HOLD_MAX / 回合切换（SHIELD.holdOne 收尾）。拉回暂停留着当兜底（按住不生效时）
+                 GA_ZhuoBiDun_C = INP_SHACHI },
+        -- §432 这些招只在对方发 rel=（新版）时才按住：等不到松手会一直按到记录过期，替身每拳都打满档
+        -- §439 举盾同理：旧版对方等不到松手会举满 45 秒
+        NEED_REL = { GA_TieKuangQuanTao_Charge_A_C = true, GA_TieKuangQuanTao_Charge_AA_C = true, GA_TieKuangQuanTao_Charge_AAA_C = true,
+                     GA_ZhuoBiDun_C = true },
+        -- 激光实验时：GA_DuYan_Bow_Laser_C = "/PBZInput/InputActions/IA_ShachiAbility_Hold.IA_ShachiAbility_Hold"
+        OFF_FILE = (NET_DIR or "net") .. "/inp_off.txt", logN = 0,
+        -- §434 至少按住这么久（秒）才松：对方点按（rel= 0.06–0.09 秒，和出招同一包到）时替身按下马上又松开。
+        -- 11-24 14:03 火铳第二发 Normal_04 四次全落空（远端#362：按住 IsHolding true → 同一帧"对方按了 0.09 秒"松开），
+        -- 11-23 22:32 双开按到技能结束那次是中的。对方放下一招 / 技能结束 / 重置照常马上松
+        MIN_HOLD = { GA_HuangJinHuoChong_Normal_04_C = 1.0 },
+        -- §434 松开后 grace 秒技能还在、也没进收招动作 → 取消技能、补播收招（删键不一定让等松手任务收到松手）
+        AFTER = { GA_YouLongHead_Water_C = { grace = 0.4, endm = "Hun_ShaChi_YouLongTou_Skill_01_End_Montage" } },
+        after = {} }
+-- §434 计时（测试桩里 G.now 可能没有）
+function INP.now() return (now and now()) or os.clock() end
+-- 按住的记录放在 CHG 上（CHG 在观战 / 多人房按对手各一份，PEER.GLOB；远端编号各对手各自从 1 数，放全局会串）
+function INP.heldT() CHG.inpHeld = CHG.inpHeld or {}; return CHG.inpHeld end
 
 function INP.log(fmt, ...)
     INP.logN = INP.logN + 1
-    if INP.logN <= 60 then out(fmt, ...) end
+    if INP.logN <= 200 then out(fmt, ...) end      -- §432 60 → 200：11-24 那局 14:03 就用完，后面贪狼 / 金瓜按没按上看不到
 end
 
 function INP.off()
@@ -362,23 +587,96 @@ end
 -- 放之前：名单里的招 → 替身按住这招的键。返回 是否按上了
 function INP.press(pup, name, id)
     local ia = INP.KEYS[name]
-    if not ia or INP.off() then return false end
+    if not ia or not G.inputEnsure or INP.off() then return false end
+    if INP.NEED_REL and INP.NEED_REL[name] and not CHG.peerRel then return false end   -- §432
     local comp, how = G.inputEnsure(pup)
     if how ~= "已有" then INP.log("输入实验：替身输入组件 %s", tostring(how)) end
     if not comp then return false end
-    local r, isH = G.inputHold(comp, ia, true, G.worldTime(pup) or 0.0)     -- 值 = 按下时的世界时间（同玩家）
-    INP.held[id] = { comp = comp, ia = ia }
-    INP.log("输入实验：远端#%d %s 放之前替身按住 %s：%s，IsHolding → %s", id, name, ia:match("([%w_]+)$"), r, tostring(isH))
-    return isH == true
+    local list = type(ia) == "table" and ia or { ia }
+    local any = false
+    for _, one in ipairs(list) do
+        local r, isH = G.inputHold(comp, one, true, G.worldTime(pup) or 0.0)     -- 值 = 按下时的世界时间（同玩家）
+        INP.log("输入实验：远端#%d %s 放之前替身按住 %s：%s，IsHolding → %s", id, name, one:match("([%w_]+)$"), r, tostring(isH))
+        any = any or isH == true
+    end
+    INP.heldT()[id] = { comp = comp, ia = list, name = name, ok = any, pup = pup, at = INP.now(),
+                        minUntil = INP.MIN_HOLD[name] and (INP.now() + INP.MIN_HOLD[name]) or nil }
+    return any
 end
 
 -- 对方松手到点 → 替身松开
 function INP.release(id, why)
-    local h = INP.held[id]
+    local h = INP.heldT()[id]
     if not h then return end
-    INP.held[id] = nil
-    local r, isH = G.inputHold(h.comp, h.ia, false)
-    INP.log("输入实验：远端#%d 替身松开（%s）：%s，IsHolding → %s", id, why, r, tostring(isH))
+    INP.heldT()[id] = nil
+    local af = INP.AFTER[h.name]
+    if af and h.pup and why ~= "技能结束" and why ~= "没放出来" and why ~= "重置" then
+        INP.after[id] = { name = h.name, pup = h.pup, at = INP.now() + af.grace, endm = af.endm, why = why }
+    end
+    for _, one in ipairs(type(h.ia) == "table" and h.ia or { h.ia }) do
+        -- §432 连招（铁拳套 A→AA→AAA、金瓜按住连击）下一招放之前已经按上同一个键：上一招到点松手别把下一招的也松了
+        local other = INP.otherHolder(id, h.comp, one)
+        if other then
+            INP.log("输入实验：远端#%d 到点（%s）但远端#%d 还按着 %s → 不松", id, why, other, one:match("([%w_]+)$"))
+        else
+            local r, isH = G.inputHold(h.comp, one, false)
+            INP.log("输入实验：远端#%d 替身松开 %s（%s）：%s，IsHolding → %s", id, one:match("([%w_]+)$"), why, r, tostring(isH))
+        end
+    end
+end
+
+-- 别的远端招还按着同一个替身输入组件上的同一个键 → 返回那个招号
+function INP.otherHolder(id, comp, one)
+    for oid, o in pairs(INP.heldT()) do
+        if oid ~= id and (o.comp == comp or (sameObj and sameObj(o.comp, comp))) then
+            for _, k in ipairs(type(o.ia) == "table" and o.ia or { o.ia }) do
+                if k == one then return oid end
+            end
+        end
+    end
+    return nil
+end
+
+-- 按住期结束的几个地方都叫这个（没按着的招什么都不做）。soft = 对方松手到点（MIN_HOLD 没到就先记着，INP.tick 到点再松）
+function INP.done(id, why, soft)
+    local h = INP.heldT()[id]
+    if not h then return end
+    if soft and h.minUntil and INP.now() < h.minUntil then
+        if not h.defer then INP.log("输入实验：远端#%d %s %s，至少按住 %.1f 秒 → 到点再松", id, h.name, why, INP.MIN_HOLD[h.name] or 0) end
+        h.defer = why
+        return
+    end
+    INP.release(id, why)
+end
+
+-- 每帧（CHG.pupStep 开头）：MIN_HOLD 到点的松开；AFTER 松开后技能还挂着的收掉。都空时不读
+function INP.tick(tn)
+    local t = INP.now()
+    for id, h in pairs(INP.heldT()) do
+        if h.defer and h.minUntil and t >= h.minUntil then INP.release(id, h.defer .. "（按满最短时间）") end
+    end
+    if not next(INP.after) then return end
+    for id, a in pairs(INP.after) do
+        if t >= a.at then
+            INP.after[id] = nil
+            local pup = a.pup
+            local live = valid(pup) and LO and LO.activeInstance and LO.activeInstance(pup, a.name)
+            local m = live and montageOf(pup) or ""
+            if live and m ~= a.endm then
+                local gone = {}
+                if G and G.cancelAbilities then
+                    local okC, r = pcall(G.cancelAbilities, pup, function(n) return n == a.name end)
+                    if okC and type(r) == "table" then gone = r end
+                end
+                local okE = a.endm and CHG.spinPlay(pup, a.endm)
+                INP.log("输入实验：远端#%d %s 替身松开 %.1f 秒后技能还在（动作 %s）→ 取消技能 %s，补播收招 %s", id, a.name,
+                    INP.AFTER[a.name] and INP.AFTER[a.name].grace or 0, m ~= "" and m or "无", #gone > 0 and table.concat(gone, ",") or "（没取消掉）",
+                    okE and "成功" or "失败")
+            elseif live then
+                INP.log("输入实验：远端#%d %s 替身松开后自己进了收招（%s）", id, a.name, m)
+            end
+        end
+    end
 end
 
 function CHG.laserLog(fmt, ...)
@@ -388,7 +686,8 @@ end
 
 -- 这一招最多等多久（判定窗口 / 记录保留）
 function CHG.maxAge(name)
-    if SHOT and SHOT.FAM[name] then return math.max(CHG.JUDGE_MAX, SHOT.END_MAX) end   -- §377 一招里好几发：等到对方收招
+    if CHG.VEHICLE and CHG.VEHICLE.names[name] then return CHG.VEHICLE.MAX end      -- §437 马车骑 10 秒以上：记录（和按住的键）留到 MAX，不在 8 秒 + 2 过期松键
+    if SHOT and SHOT.FAM[name] then return math.max(CHG.JUDGE_MAX, SHOT.FAM[name].endMax or SHOT.END_MAX) end   -- §377 一招里好几发：等到对方收招
     return name == CHG.LASER.name and CHG.LASER.max or CHG.JUDGE_MAX
 end
 
@@ -844,7 +1143,22 @@ CHG.SPIN = {
                                    endm = "ShaChi_Hook_Skill_02_End_Montage" },
 }
 -- 这些按住招已经有画面同步，不要抢：紫冥剑召唤（§111 sub= 播召唤循环）、独眼弓激光（§139 一段一段续放）
-CHG.SPIN_SKIP = { GA_Hun_ZiMingJian_New_DB_C = true, GA_DuYan_Bow_Laser_C = true }
+-- §420.2 巨凶斧蓄力是"蓄 → 一次出手"，不是按住持续：11-23 替身 Release_01 播完、对方松手还没到（§420 之前多人房里要等 7 秒），
+-- 兜底把蓄力动作重播一两遍 = 劈完又摆回蓄力姿势。档位 / 出手交给 §420.1
+CHG.SPIN_SKIP = { GA_Hun_ZiMingJian_New_DB_C = true, GA_DuYan_Bow_Laser_C = true, GA_BrutalAxe_Normal_C = true }
+-- 替身这招的技能自己结束了就不再补播（11-23 贪狼按住转圈：替身技能 3.83–3.90 秒自己结束、狼牙武器跟着收掉，
+-- 续转还按对方按住的 6–9.5 秒接着补循环段 → 对方屏幕上只剩角色空手在转。15:13:50 / 15:13:52 两次补播都在技能结束之后）。
+-- 只对"技能结束就藏影之武装"的招开（资产里引用 UE_DoHide，按住松手招_全表 38 招里扫出 12 个，加上表里的钩爪 HookMove）：
+-- 偃月刀 / 混沌钢形态这类主武器招没有，替身没输入就提前结束技能的正是靠续转补画面，不能一刀切。
+-- 11-23 用户"长柄金瓜也看一下"：11-20 / 11-22 日志里金瓜按住连击 / 空中 / 旋转在替身技能结束后还在兜底重播开招段。
+CHG.SPIN_STOP_ON_END = {
+    GA_TanLang_Normal_C = true,
+    GA_JinGua_Normal_C = true, GA_JinGua_Air_C = true, GA_JinGua_RoAttack_C = true,
+    GA_HuangJinHuoChong_Normal_02_C = true, GA_HuangJinHuoChong_Normal_04_C = true,
+    GA_Hun_Lute_SKill_C = true, GA_Hun_ShachiHook_HookMove_C = true, GA_YouLongHead_Water_C = true, GA_ZhuoBiDun_C = true,
+    GA_ThunderSpear_Normal_01_C = true, GA_ThunderSpear_Normal_02_C = true, GA_ThunderSpear_Normal_03_C = true,
+}
+CHG.SPIN_ENDCHK = 0.25      -- 查技能还在不在的间隔（要遍历技能表，别每帧）
 CHG.SPIN_DERIVED = {}
 CHG.spinN, CHG.SPIN_LOGS = 0, 30
 function CHG.spinLog(fmt, ...)
@@ -881,21 +1195,79 @@ function CHG.spinPlay(pup, name)
     local ok2, r2 = pcall(playNamed, pup, name)
     return (ok2 and r2) and true or false
 end
+-- §409.1 对方已经放了下一招（攻击 / 闪避 / 跳 / 切刀），这一招的按住期就结束了，不再补播任何段。
+-- 11-22 实战日志：对方混沌钢形态蓄力重（GA_Hun_Chaos_B_Hold_Physics_C，不在 SPIN 表，走兜底）0.79 秒就闪避取消，
+-- 替身技能也在 0.79 秒结束；但对方回报的松手是"按了 13.10 秒"，兜底照样每 1.2 秒重播开招段（13:03:04 第 1 次），
+-- 13:03:05 我掉 -696 / 杀气 -272（同一局正常命中的这招 177–180，且那时对方伤害放大更高）。
+-- 对方出了下一招时这边还在重播带攻击判定的蓄力动作 = 对方屏幕上不存在的攻击。只看"之后有没有放别的招"，不按伤害封顶。
+CHG.lastFire = nil
+function CHG.endsHold(name, attack)
+    if attack then return true end
+    if type(name) ~= "string" then return false end
+    return (name:find("Dash", 1, true) or name:find("Dodge", 1, true) or name:find("_Jump", 1, true)
+        or name:find("_SWT", 1, true)) and true or false
+end
+-- 远端每个出招事件（AIR.fire 一进来就记；同一招重放 / 等前摇是同一个编号，不算下一招）
+function CHG.onAnyFire(pup, e, tn, attack)
+    if not (e and e.id and e.name and tn) or not CHG.endsHold(e.name, attack) then return end
+    CHG.lastFire = { id = e.id, name = e.name, at = tn, pup = pup }
+end
+-- 同一把武器的子技能（按住期间游戏自己激活的同族 GA）不算"下一招"：只认别的武器族 / 通用闪避
+function CHG.family(n)
+    return type(n) == "string" and n:match("^GA_Hun_([^_]+)_") or nil
+end
+function CHG.sameFamily(a, b)
+    local fa, fb = CHG.family(a), CHG.family(b)
+    return fa ~= nil and fa == fb
+end
+function CHG.movedOn(pup, id, f)
+    local lf = CHG.lastFire
+    if not (lf and f and f.at and lf.id ~= id and lf.at > f.at) then return nil end
+    if CHG.sameFamily(lf.name, f.name) then return nil end
+    if lf.pup ~= nil and pup ~= nil and lf.pup ~= pup and not (sameObj and sameObj(lf.pup, pup)) then return nil end
+    return lf
+end
+
 -- 每帧：替身放的这一招还在按住期，就保证一直有动作
 function CHG.spinStep(pup, id, f, tn)
     local s = f.spin
     if not s or not valid(pup) or s.done then return end
+    if f.shot and SHOT.FAM[f.name] and SHOT.FAM[f.name].noSpin then return end   -- §427 独眼弓按对方每一发出箭，不重播拉弓
+    local nextFire = CHG.movedOn(pup, id, f)
+    if nextFire then
+        s.done = true
+        INP.done(id, "对方放了下一招")
+        CHG.spinLog("§409.1 续转停：远端#%d %s 对方已放下一招 远端#%d %s（放出后 %.2f 秒）→ 不再补播", id, f.name,
+            nextFire.id, nextFire.name, nextFire.at - f.at)
+        return
+    end
     local m = montageOf(pup)
     -- 开招段：放出来之后第一次读到的动作（只在这招真的在跑时认，免得拿到上一招的收尾动作）
     if not s.a then
         if m == "" or (LO and LO.activeInstance and not LO.activeInstance(pup, f.name)) then return end
         s.a = m
     end
-    local sp = CHG.SPIN[f.name] or CHG.spinDerive(s.a)
+    if CHG.SPIN_STOP_ON_END[f.name] and LO and LO.activeInstance and tn >= (s.endChkAt or 0) then
+        s.endChkAt = tn + CHG.SPIN_ENDCHK
+        if not LO.activeInstance(pup, f.name) then
+            s.done = true
+            INP.done(id, "技能结束")
+            CHG.spinLog("§407 续转停：远端#%d %s 替身技能自己结束了（放出后 %.2f 秒，补了 %d 次）→ 不再补播（武器已收）",
+                id, f.name, tn - f.at, s.n or 0)
+            return
+        end
+    end
+    -- 表里写的是资产名（不带 _C），出招名带 _C：以前一直对不上、全走推导；金瓜旋转推导出的收招 _End_Montage
+    -- 不存在（真的是 _Stop_Montage），游戏自己播 Stop 时认不出来，要等 2.5 秒动作空了才补循环段
+    -- 11-23 双开：替身按住键生效（IsHolding 读回 true）时游戏自己进 Loop，别再补（金瓜旋转 22:28:20 把开招段当收招多补了一次）
+    local h = INP and INP.heldT and INP.heldT()[id]
+    if h and h.ok then return end
+    local sp = CHG.SPIN[f.name] or CHG.SPIN[(f.name:gsub("_C$", ""))] or CHG.spinDerive(s.a)
     local secs = CHG.rel[id]
     local over = (secs and tn >= f.at + secs) or (tn - f.at >= CHG.SPIN_MAX)
     if over then
         s.done = true
+        INP.done(id, secs and "对方松手" or "按住超过上限", secs ~= nil)
         if sp and sp.endm and (s.loop or s.seqI) then
             -- 松手：替身那边早就进过收招了，这里再补一次让它收得干净（技能本身不用管）
             CHG.spinPlay(pup, sp.endm)
@@ -952,9 +1324,11 @@ end
 function CHG.pupStep(pup, tn)
     for id, f in pairs(CHG.fired) do
         CHG.selfStep(pup, id, f, tn)
+        CHG.stageStep(pup, id, f, tn)       -- §420.1
         CHG.laserStep(pup, id, f, tn)       -- §139
         CHG.spinStep(pup, id, f, tn)        -- §407
         if f.shot then SHOT.pupStep(pup, id, f, tn) end   -- §377
+        if f.hj then HJHC.step(pup, id, f, tn) end        -- §446
         local secs = CHG.rel[id]
         if CHG.VEHICLE.names[f.name] and valid(pup) then
             if secs and tn >= f.at + secs then CHG.vehicleOff(pup, id, f, tn, string.format("对方按了 %.2f 秒", secs))
@@ -962,10 +1336,36 @@ function CHG.pupStep(pup, tn)
         end
         if not f.done and secs and tn >= f.at + secs then
             f.done = true
+            INP.done(id, string.format("对方按了 %.2f 秒", secs), true)
             if CHG.WAIT[f.name] and valid(pup) then CHG.releaseTo(pup, id, f, tn, secs) end
-        elseif f.at and tn - f.at > ((f.spin and math.max(CHG.maxAge(f.name), CHG.SPIN_MAX) or CHG.maxAge(f.name))) + 2 then
+        elseif f.at and tn - f.at > (((SHIELD and SHIELD.is and SHIELD.is(f.name)) and (SHIELD.HOLD_MAX or CHG.maxAge(f.name)))     -- §439 举盾按住的键留到 HOLD_MAX
+                                     or (f.spin and math.max(CHG.maxAge(f.name), CHG.SPIN_MAX) or CHG.maxAge(f.name))) + 2 then
+            INP.done(id, "记录过期")
             CHG.fired[id] = nil end        -- §407 按住旋转类的记录留到 SPIN_MAX（判定窗口仍按 maxAge，不改）
     end
+end
+
+-- 中招之后的"同一招后续段接着累加"（NET.lastHit）过了 JUDGE_WIN 还要不要留着（11-23 双开实测：金瓜按住连击前三下各 -129 都记上，
+-- 第四段下砸 -414 和地波 -129 在第三下后约 2 秒才落，lastHit 已过期 → 血照扣、没记到这一招、也没回报对方）。
+-- 蓄力 / 按住类招、替身这招的技能还在放、没超过 maxAge、对方松手后不超过 HOLD_HIT_TAIL 秒 → 留着。查技能每 0.2 秒一次
+CHG.HOLD_HIT_TAIL = 2.5
+function CHG.holdHit(lh, tn)
+    local id = lh and lh.r and lh.r.atk
+    local f = id and CHG.fired[id]
+    if not (f and f.name and CHG.isHold(f.name)) then return false end
+    local age = tn - f.at
+    if age > CHG.maxAge(f.name) then return false end
+    local secs = CHG.rel[id]
+    if secs and age > secs + CHG.HOLD_HIT_TAIL then return false end
+    if lh.liveAt and tn - lh.liveAt < 0.2 then return lh.live end
+    local pup = G.puppet and G.puppet()
+    local live = (valid(pup) and LO and LO.activeInstance and LO.activeInstance(pup, f.name)) and true or false
+    lh.liveAt, lh.live = tn, live
+    if live and not lh.liveLogged then
+        lh.liveLogged = true
+        out("  远端#%d %s 中招后过了 %.1f 秒：替身这招还在放（蓄力 / 按住），后续段接着记到这一招", id, f.name, tn - lh.at)
+    end
+    return live
 end
 
 -- 判定窗口过了 JUDGE_WIN 时（netJudge）：这一招还要不要等。j = { id, at, name }，pupM = 替身现在的动作
@@ -1124,7 +1524,10 @@ end
 function CHG.step(p1, pup, tn)
     BOWP.step(p1, pup, tn)                 -- §139.2 只读探针
     if next(BOWN.wait) then BOWN.step(p1, pup, tn) end   -- §139.3 R2 等对方松手再射
+    if next(INP.heldT()) or next(INP.after) then INP.tick(tn) end   -- §434 最短按住到点松开 / 松开后兜底收招
     if next(CHG.fired) then CHG.pupStep(pup, tn) end
+    if CART and CART.live and #CART.live > 0 then CART.step(tn) end   -- §442 力荡判定到点收掉
+    if SHIELD and SHIELD.step then SHIELD.step(tn) end     -- 11-23 举盾保持 + 盾反 / 盾推 / 盾冲的判定（都空时直接返回）
     if next(CHG.LASER.beams) then CHG.laserBeamStep(pup) end    -- §139.1 激光柱对准你 / 到点收
     if #CHG.list == 0 then return end
     if not CHG.probed and valid(pup) then
@@ -1133,13 +1536,44 @@ function CHG.step(p1, pup, tn)
     end
     local keep = {}
     for _, w in ipairs(CHG.list) do
+        if CHG.stepOne(w, tn) then keep[#keep + 1] = w end
+    end
+    CHG.list = keep
+end
+
+-- §420 多人房 / 对决：每个对手一份 CHG（PEER.GLOB），CHG.step 只在 PEER.run 里驱动替身时跑、跑的是对手那份；
+-- "我"放的蓄力招记在主状态（netSend 在 PEER 外面）里，以前没人检查 → 松手只能等"放了下一招"（§409.2）才补发，
+-- 11-23 巨凶斧对方每次都报"按了 7 秒"。netSend 末尾、主状态没在驱动替身时（多人房 / 旧版 1v1 远端数据断了）调这个，
+-- 只看"我"的条目；旧版 1v1 驱动替身时仍由 CHG.step 一起看，不重复
+function CHG.mineStep(tn)
+    if #CHG.list == 0 then return end
+    local keep = {}
+    for _, w in ipairs(CHG.list) do
+        if w.who ~= "我" or CHG.stepOne(w, tn) then keep[#keep + 1] = w end
+    end
+    CHG.list = keep
+end
+
+-- 发送方"按太久"算松手的上限（秒）。11-24 拙壁盾（用户"没有将玩家释放的盾牌视为按住"）：举盾以前也按 JUDGE_MAX 8 秒截断——
+-- 本机 14:20:06 举盾、14:20:24 才盾反（举了约 18 秒），对方日志却是"对方松手（按了 8.04 秒）"，替身 8 秒就收盾；
+-- 同一场另两次 11 / 16 秒也都报成 8.01 / 8.02 秒。举盾跟收方的举盾保持（SHIELD.HOLD_MAX）一样等到 45 秒
+function CHG.holdCap(name, veh)
+    if veh then return CHG.VEHICLE.MAX end
+    if SHIELD and SHIELD.is and SHIELD.is(name) then return SHIELD.HOLD_MAX or CHG.JUDGE_MAX end
+    return CHG.JUDGE_MAX
+end
+
+-- 一条记录走一帧；返回 true = 留着
+function CHG.stepOne(w, tn)
+    do
         local m, sec, pos = G.montageSection(w.actor)
         local key = m and (m .. "|" .. sec) or ""
         if key ~= w.key then
             CHG.note(w, tn, m and string.format("%s[%s]@%.2f", m, sec, pos or -1) or "（没动作）")
             -- §92.8 不管读没读到输入，换到 Release / _End 动作都算松手：18:49:49 炽刃大招 2.18 秒切 _Release，
-            -- 输入里还有别的键按着，拖到 5.06 秒技能结束才算
-            if w.who == "我" and w.hold and w.key and m and not CHG.VEHICLE.names[w.name] and (m:find("Release", 1, true) or m:find("_End", 1, true)) then
+            -- 输入里还有别的键按着，拖到 5.06 秒技能结束才算。11-23 拙壁盾收盾叫 _Exit，也算松手（对方以前要等下一招才知道我放下了盾）
+            if w.who == "我" and w.hold and w.key and m and not CHG.VEHICLE.names[w.name]
+                and (m:find("Release", 1, true) or m:find("_End", 1, true) or (SHIELD and SHIELD.isExit and SHIELD.isExit(m))) then
                 CHG.release(w, tn, "换到 " .. m)
             end
             -- §276.10（移植 0.33 分支 §269.15）马车：播到下车动作（AM_JumpOffHorseCart）就是松手。11-13 实测只认"技能结束"太晚：技能清单（NET.prevAbs）
@@ -1147,6 +1581,7 @@ function CHG.step(p1, pup, tn)
             if w.who == "我" and w.hold and m and CHG.VEHICLE.names[w.name] and m:find("JumpOff", 1, true) then
                 CHG.release(w, tn, "下车 " .. m)
             end
+            if w.who == "我" and w.stg and m and not w.stgN then CHG.stgMine(w, m, tn) end    -- §420.1 我出手是哪一档
             w.key = key
         end
         if m then w.last = tn end
@@ -1167,7 +1602,7 @@ function CHG.step(p1, pup, tn)
         end
         local veh = CHG.VEHICLE.names[w.name]      -- §276.9 马车：不认松键 / 8 秒截断，只认下车
         if w.who == "我" and w.hold and not w.relAt then
-            if w.h0 and not veh then
+            if w.h0 and not veh and not w.stg then    -- §420.1 巨斧只认出手动作（开始时只按着点按键，一松就被当成松手）
                 local h, why = G.holdingInputs(w.actor)
                 local still = false
                 for k in pairs(w.h0) do if h and h[k] then still = true end end
@@ -1180,11 +1615,11 @@ function CHG.step(p1, pup, tn)
         end
         if w.specAt and tn >= w.specAt then w.specAt, w.spec1 = nil, G.specInput(w.actor, w.name) end
         if tn - w.at >= CHG.DUR and not (w.hold and not w.relAt) then CHG.finish(w, tn, "到时间")
-        elseif tn - w.at >= (veh and CHG.VEHICLE.MAX or CHG.JUDGE_MAX) then CHG.release(w, tn, "按太久"); CHG.finish(w, tn, "到时间")
+        elseif tn - w.at >= CHG.holdCap(w.name, veh) then CHG.release(w, tn, "按太久"); CHG.finish(w, tn, "到时间")
         elseif tn - w.last >= CHG.QUIET then CHG.release(w, tn, "没动作"); CHG.finish(w, tn, "没动作、技能也结束了")
-        else keep[#keep + 1] = w end
+        else return true end
     end
-    CHG.list = keep
+    return false
 end
 
 -- ============================================================ §377 一个技能里点按出好几发的影之武装（羽弓 / 虎炮）
@@ -1199,24 +1634,81 @@ end
 --       收到 SHOTEND / 等太久 → 取消替身的这招、停掉蓄力动作。对方旧版（没有 shs=）照旧
 SHOT = {
     FAM = {
+        -- §429 羽弓也开 killNative（11.23 用户"羽弓蓄力攻击无效，会视为瞬发"）：本机 11-24 14:13 替身停在 0.5 秒仍自己射一支 Normal
+        -- （"暂停没拦住"，对面看到瞬发、#460 还多扣一次），技能随之结束，对方满蓄的第二发 Max 到了"已经不在放了"被跳过。
+        -- 三档子弹 B_UnnamedBow_Normal / Max / Perfect 都直接是一支箭（BP_UnnamedBow_*），不再生成别的子弹
         GA_UnnamedBow_C = { key = "UnnamedBow", charge = "AM_Hun_UnnamedBow_Charge", pauseAt = 0.5,
+            killNative = true, nativeCls = "BP_UnnamedBow_",
             dir = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/ShachiWeapon/",
             shots = { AM_Hun_UnnamedBow_Shoot_Normal = "Normal", AM_Hun_UnnamedBow_Shoot_Max = "Max" },
             tiers = { Normal = "B_UnnamedBow_Normal", Max = "B_UnnamedBow_Max", Perfect = "B_UnnamedBow_Perfect" } },
+        -- §428 11-24 虎炮"蓄力提前出判定 / 偶尔多一发满蓄"：暂停蓄力动作拦不住技能自己的计时，替身约 3 秒自己补一发 Perfect
+        -- （11-22 21:36 起每招都有"替身动作换成 AM_Hun_TigerCannon_Launch_Perfect（暂停没拦住）"）→ 用 §427 killNative 收掉它自己的炮弹。
+        -- adopt：按对方出手生成后 ADOPT 秒内新出现的炮弹算我们的（生成的若是发射器、再出炮弹，不被当成替身自己的收掉）
         GA_TigerCannon_C = { key = "TigerCannon", charge = "AM_Hun_TigerCannon_Prepare", pauseAt = 0.8,
+            killNative = true, nativeCls = "TigerCannon_Bullet", adopt = 0.3, killWin = 1.5,
             dir = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/ShachiWeapon/TigerCannon/",
             shots = { AM_Hun_TigerCannon_Launch_NormalGreat = "Normal", AM_Hun_TigerCannon_Launch_Perfect = "Perfect" },
             tiers = { Normal = "B_TigerCannon_Normal", Great = "B_TigerCannon_Great", Perfect = "B_TigerCannon_Perfect" } },
     },
-    TIER_ORDER = { "Perfect", "Great", "Max", "Normal" },      -- 名字里找档位的顺序（NormalGreat 先认 Great）
+    TIER_ORDER = { "Perfect", "Great", "Max", "Normal", "Triple", "Double", "Single" },   -- 名字里找档位的顺序（NormalGreat 先认 Great）
     DATA_KEYS = { "BulletData", "Data", "CurrentBulletData", "BulletDataAsset" },
-    WAIT = 0.25, END_GAP = 0.2, END_MAX = 12.0, UP = 60.0, FWD = 40.0,
-    byMon = {}, bdCache = {}, logN = 0, LOG_MAX = 80, probed = {},
+    WAIT = 0.25, END_GAP = 0.2, END_MAX = 12.0, UP = 60.0, FWD = 40.0, RESTART_BACK = 0.1, KILL_WIN = 0.6,
+    byMon = {}, bdCache = {}, logN = 0, LOG_MAX = 160, probed = {},
     send = { known = {} },
 }
+SHOT.FAM.GA_TigerCannon_QuickCharge_C = {
+    key = "TigerCannon", aliasOf = "GA_TigerCannon_C",
+    charge = "Hun_ShaChi_DonCanon_SpecialAttack_02_Montage_01", pauseAt = 0.1,
+    dir = SHOT.FAM.GA_TigerCannon_C.dir,
+    shots = SHOT.FAM.GA_TigerCannon_C.shots,
+    tiers = SHOT.FAM.GA_TigerCannon_C.tiers,
+}
+-- §427 普通独眼弓 R2（GA_DuYan_Bow_Normal_C）。11-24 用户"普通独眼弓的蓄力射击的问题"：
+--   ① 一次按住射好几箭（拉满自己射、接着再拉），对面只有第一箭掉血：独眼弓借用羽弓的出手动作名，发送方按羽弓发 sub=，
+--     收方找不到替身在放羽弓 → "§377 …跳过"；替身那一招只射它自己那 1 箭（11-22 起就这样）。
+--   ② 替身一拉弓就射（0.63 秒，不等对方松手）：11-23 起 INP（72bae753）给替身建了输入组件，技能的等松手任务读到"没按着"
+--     就马上射；以前没组件时替身 2.96 秒才射，CHG.SELF 在 1.55 秒停得住。资产：技能走 OnRelease / OnAlreadyRelease
+--     （不是 IsHolding），子弹数据 BD_GA_DuYan_Bow_Normal_P1_01 / P2_01+P2_02 / P3_01（BP_PBZ_ProjectileBulletData，
+--     直接是箭 BP_DuYanBow_Arrow），按住越久箭越多。
+--   做法：和羽弓同一套 §377，但动作名和羽弓共用，所以 ① 发送方按"我身上挂着哪个技能"挑家族；② 档位用独眼弓自己的名字
+--   （Single / Double / Triple，按子弹数据名里的 _P1_ / _P2_ / _P3_ 认，一档可以是好几支箭）；③ 只有发 shs=2 的新版
+--   对方才走这条（旧版发的是羽弓档位，收方照旧让替身自己射）；④ 替身蓄力动作 0.3 秒停住，仍漏出它自己的箭就当场收掉
+SHOT.FAM.GA_DuYan_Bow_Normal_C = {
+    key = "DuYan_Bow", charge = "AM_Hun_UnnamedBow_Charge", pauseAt = 0.3, shareMon = true, needVer = 2,
+    noSpin = true, killNative = true, nativeCls = "DuYanBow_Arrow", endMax = 30.0,
+    dir = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/DuYanBow/",
+    shots = { AM_Hun_UnnamedBow_Shoot_Normal = "Single" },
+    tiers = { Single = { "BD_GA_DuYan_Bow_Normal_P1_01" },
+              Double = { "BD_GA_DuYan_Bow_Normal_P2_01", "BD_GA_DuYan_Bow_Normal_P2_02" },
+              Triple = { "BD_GA_DuYan_Bow_Normal_P3_01" } },
+    match = { Single = "_P1_", Double = "_P2_", Triple = "_P3_" },
+}
+SHOT.byTier = {}       -- §427 档位名 → 家族（只放独眼弓这种和别人共用动作名的）
 for name, fam in pairs(SHOT.FAM) do
     fam.name = name
-    for m in pairs(fam.shots) do SHOT.byMon[m] = name end
+    if fam.shareMon then
+        for t in pairs(fam.tiers) do SHOT.byTier[t] = name end
+    elseif not fam.aliasOf then
+        for m in pairs(fam.shots) do SHOT.byMon[m] = name end
+    end
+end
+
+-- §427 这个出手 / 蓄力动作现在算哪一家：共用动作名的家族，技能挂在我身上才算（读不到技能表 → 按原来的）
+function SHOT.famForMon(mon, isCharge)
+    local abs = NET.prevAbs
+    if type(abs) == "table" then
+        for n, fam in pairs(SHOT.FAM) do
+            if fam.shareMon and abs[n] and ((isCharge and fam.charge == mon) or (not isCharge and fam.shots[mon])) then return n end
+        end
+    end
+    if isCharge then
+        for n, fam in pairs(SHOT.FAM) do
+            if fam.charge == mon and not fam.shareMon then return n end
+        end
+        return nil
+    end
+    return SHOT.byMon[mon]
 end
 
 function SHOT.log(fmt, ...)
@@ -1228,7 +1720,7 @@ end
 function SHOT.tierIn(fam, s)
     if not s then return nil end
     for _, t in ipairs(SHOT.TIER_ORDER) do
-        if fam.tiers[t] and s:find(t, 1, true) then return t end
+        if fam.tiers[t] and s:find((fam.match and fam.match[t]) or t, 1, true) then return t end
     end
     return nil
 end
@@ -1277,27 +1769,66 @@ function SHOT.emit(p1, s, tn)
     return true
 end
 
+-- §424 这把武器的招还挂在我身上吗（NET.prevAbs = 这一帧 netSend 读的我的技能；读不到返回 nil = 不知道）
+function SHOT.famOn(active)
+    local abs = NET.prevAbs
+    if type(abs) ~= "table" then return nil end
+    local key = SHOT.FAM[active] and SHOT.FAM[active].key
+    for n in pairs(abs) do
+        local fam = SHOT.FAM[n]
+        if fam and fam.key == key then return true end
+    end
+    return false
+end
+
+-- §424 同一个出手动作从头又播了一遍（移动中连射：Shoot_Normal 接 Shoot_Normal，动作名没变）→ 算新的一发
+function SHOT.restarted(p1, hm)
+    local S = SHOT.send
+    if not (hm and SHOT.byMon[hm]) then S.shotPos = nil; return false end
+    local _, _, m, pos = LAT.activeMontage(p1)
+    if m ~= hm or type(pos) ~= "number" then return false end
+    local again = S.shotPos ~= nil and pos + SHOT.RESTART_BACK < S.shotPos
+    S.shotPos = pos
+    return again
+end
+
 -- 发：每帧（netSend 里，hm = 我现在的动作，prev = 上一帧的）
 function SHOT.mine(p1, hm, prev, tn)
     local S = SHOT.send
     if S.pend and SHOT.emit(p1, S.pend, tn) then S.pend = nil end
-    if hm ~= prev and hm then
-        local name = SHOT.byMon[hm]
+    local again = hm == prev and SHOT.restarted(p1, hm)
+    if hm ~= prev then S.shotPos = nil; SHOT.restarted(p1, hm) end
+    if (hm ~= prev or again) and hm then
+        local name = SHOT.famForMon(hm, false)               -- §427 独眼弓和羽弓同名动作：按挂着的技能挑
+        local cn = SHOT.famForMon(hm, true)
+        if cn and S.active ~= cn then
+            S.active, S.known = cn, {}
+            for _, b in ipairs(SHOT.myBullets(p1, SHOT.FAM[cn])) do S.known[b.key] = true end   -- 起手时已经在场的不算
+        end
+        -- 虎炮快速蓄力（aliasOf）自己的蓄力动作照旧认
         for n, fam in pairs(SHOT.FAM) do
-            if hm == fam.charge and S.active ~= n then
+            if fam.aliasOf and hm == fam.charge and S.active ~= n then
                 S.active, S.known = n, {}
-                for _, b in ipairs(SHOT.myBullets(p1, fam)) do S.known[b.key] = true end   -- 起手时已经在场的不算
+                for _, b in ipairs(SHOT.myBullets(p1, fam)) do S.known[b.key] = true end
             end
         end
         if name then
             S.active = S.active or name
+            -- §427 共用动作名的家族（独眼弓）：蓄力那一帧可能还没读到技能、先记成了羽弓，出手时改正，收招才发对的 key
+            if SHOT.FAM[name].shareMon and S.active ~= name then S.active = name end
             if S.pend then SHOT.emit(p1, S.pend, tn + SHOT.WAIT); S.pend = nil end    -- 上一发还没定：按动作默认先发
             S.pend = { mon = hm, fam = name, at = tn }
             if SHOT.emit(p1, S.pend, tn) then S.pend = nil end
         end
     end
     -- 离开这把武器的动作：发结束（和上一发隔开 END_GAP，不然同一个包里 sub= 只剩最后一个）
-    if S.active and not S.pend and not (type(hm) == "string" and hm:find(SHOT.FAM[S.active].key, 1, true))
+    -- §424 技能还挂着就不算收招（用户 11.23"羽弓移动姿态第二箭和第三箭没伤害"：移动中拉弓是动画层、不播 Charge 蒙太奇，
+    -- 两箭之间动作是空的 → 以前第一箭后就发 SHOTEND，对面把替身这招收了，后两箭到了"替身没在放这招，跳过"）。
+    -- 读不到技能表时照旧按动作判；独眼弓借用同名出手动作，它放的时候羽弓技能不在 → 照旧马上收
+    if S.active and not S.pend and hm ~= SHOT.FAM[S.active].charge
+        and not (type(hm) == "string" and hm:find(SHOT.FAM[S.active].key, 1, true))
+        and not (hm and SHOT.FAM[S.active].shots[hm])                    -- §427 独眼弓的出手动作名里没有它自己的 key
+        and SHOT.famOn(S.active) ~= true
         and tn - (S.lastAt or -99) >= SHOT.END_GAP then
         NET.subN, NET.subT = (NET.subN or 0) + 1, "SHOTEND-" .. SHOT.FAM[S.active].key
         S.lastAt = tn
@@ -1306,8 +1837,12 @@ function SHOT.mine(p1, hm, prev, tn)
     end
 end
 
-function SHOT.wire() return "shs=1\n" end
-function SHOT.recv(v) NET.rshs = (v == "1") end
+-- §427 dyb=1：另外会发普通独眼弓的每一发（独眼弓档位名）。shs= 不能改成 2：旧版收方只认 shs=1，会把羽弓 / 虎炮也关掉
+function SHOT.wire() return "shs=1\ndyb=1\n" end
+function SHOT.recv(v, dyb)
+    NET.rshs = (v == "1")
+    NET.rshsV = (v == "1") and ((dyb == "1") and 2 or 1) or 0
+end
 
 -- 收：sub= 里是不是这类（出手 / 结束）
 function SHOT.isWire(sm)
@@ -1321,24 +1856,37 @@ end
 function SHOT.onFire(pup, e, tn)
     local fam = SHOT.FAM[e.name]
     local f = CHG.fired[e.id]
-    if not (fam and f and NET.rshs) then return end
-    f.shot = { at = tn, n = 0 }
+    if not (fam and f) then return end
+    if fam.aliasOf and ctx.quickShotCertified ~= true then
+        -- Native replay blocks late shared-montage packets from reusing an older manual shot.
+        f.nativeShot = true
+        return
+    end
+    if not NET.rshs then return end
+    if fam.needVer and (NET.rshsV or 0) < fam.needVer then return end      -- §427 对方旧版不发独眼弓的每一发：替身照旧自己射
+    f.shot = { at = tn, n = 0, mine = {} }
+    if fam.killNative then f.shot.inst = LO.activeInstance(pup, e.name) end  -- §427 技能自己收了也用这个实例生成箭
     SHOT.log("§377 替身放 远端#%d %s：对方会发每一发（shs=1）→ 蓄力动作到 %.2f 秒停住，按对方出手生成子弹", e.id, e.name, fam.pauseAt)
 end
 
 -- 这一招最近一次放出、还没收的那条
 function SHOT.latest(name)
     local id, f = nil, nil
+    local wanted = name and SHOT.FAM[name]
     for i, x in pairs(CHG.fired) do
-        if x.shot and not x.shot.done and (not name or x.name == name) and (not id or i > id) then id, f = i, x end
+        local fam = SHOT.FAM[x.name]
+        if ((x.shot and not x.shot.done) or x.nativeShot)
+            and (not name or (wanted and fam and fam.key == wanted.key))
+            and (not id or i > id) then id, f = i, x end
     end
     return id, f
 end
 
 -- 子弹数据：先按数据资产找（B_x.B_x），再找蓝图类的默认对象（B_x.Default__B_x_C）。找到哪种记一次
-function SHOT.bd(fam, tier)
-    local b = fam.tiers[tier]
+function SHOT.bd(fam, tier, b)
+    b = b or fam.tiers[tier]
     if not b then return nil, "没有这一档" end
+    if type(b) == "table" then b = b[1] end
     local c = SHOT.bdCache[b]
     if c and valid(c.o) then return c.o, c.how end
     local p = fam.dir .. b
@@ -1381,18 +1929,30 @@ function SHOT.onSub(pup, sm, tn)
     end
     local mon, tier = sm:match("^(.-)%-(%a+)$")
     local name = SHOT.byMon[mon]
-    local fam = SHOT.FAM[name]
+    if not name then return false end
+    local tf = SHOT.byTier[tier]                     -- §427 独眼弓的档位名 → 独眼弓（出手动作名和羽弓一样）
+    if tf and SHOT.FAM[tf].shots[mon] then name = tf end
     local id, f = SHOT.latest(name)
     if not f then SHOT.log("§377 对方出手 %s %s 档：替身没在放这招（没放出来 / 对方是旧版放法），跳过", mon, tier); return true end
+    if f.nativeShot then return true end
+    name = f.name
+    local fam = SHOT.FAM[name]
     if not valid(pup) then return true end
     local inst = LO.activeInstance(pup, name)
+    if not inst and f.shot and f.shot.inst and valid(f.shot.inst) then inst = f.shot.inst end   -- §427 替身的技能自己收了：用放出时的实例
     if not inst then SHOT.log("§377 对方出手 %s 档：远端#%d 替身的 %s 已经不在放了", tier, id, name); return true end
     if not SHOT.probed[name] then                 -- 第一次：技能里和子弹有关的变量（查子弹数据放在哪）
         SHOT.probed[name] = true
         SHOT.log("§377 探针 %s 技能变量（Bullet）：%s", name, tostring(LO.propsLike(inst, { "Bullet" })))
     end
-    local bd, how = SHOT.bd(fam, tier)
-    if not bd then SHOT.log("§377 对方出手 %s 档：子弹数据%s", tier, tostring(how)); return true end
+    local list = fam.tiers[tier]
+    list = type(list) == "table" and list or { list }
+    local bds = {}
+    for _, b in ipairs(list) do
+        local bd, how = SHOT.bd(fam, tier, b)
+        if not bd then SHOT.log("§377 对方出手 %s 档：子弹数据%s", tier, tostring(how)); return true end
+        bds[#bds + 1] = bd
+    end
     local loc = try("shot loc", function() return pup:K2_GetActorLocation() end)
     if not loc then SHOT.log("§377 对方出手 %s 档：读不到替身位置", tier); return true end
     local rot0, aimHow = SHOT.aim(loc, tn)
@@ -1402,11 +1962,45 @@ function SHOT.onSub(pup, sm, tn)
     G.setControlRot(pup, rot); setYaw(pup, rot.Yaw)
     local tc = LO.targetingComp(pup)                 -- 子弹按锁定目标找人（BP_BulletTargetSelector_LockTarget）：同火枪 / 眼睛
     if tc then ZMX.tcLock(tc); if not NET.rlk then ZMX.tcUnlockAt = math.max(ZMX.tcUnlockAt or 0, tn + 3.0) end end
-    local e, info = G.laserEmitterSpawn(inst, pup, at, rot, bd)
     f.shot.n = f.shot.n + 1
-    SHOT.log("§377 对方出手 %s %s 档 → 远端#%d 替身第 %d 发：%s（%s；瞄 %s P%.0f Y%.0f）", mon, tier, id, f.shot.n,
-        e and G.emitterInfo(e) or "没生成", tostring(info), aimHow, rot.Pitch or 0, rot.Yaw or 0)
+    for k, bd in ipairs(bds) do                      -- §427 独眼弓一档可以是好几支箭（P2 = 两支）
+        local e, info = G.laserEmitterSpawn(inst, pup, at, rot, bd)
+        if e and f.shot.mine then f.shot.mine[full(e)] = true end
+        if fam.adopt then f.shot.adoptUntil = tn + fam.adopt end      -- §428 之后一小段新出的炮弹也算我们的
+        SHOT.log("§377 对方出手 %s %s 档 → 远端#%d 替身第 %d 发%s：%s（%s；瞄 %s P%.0f Y%.0f）", mon, tier, id, f.shot.n,
+            #bds > 1 and string.format("（第 %d / %d 支）", k, #bds) or "",
+            e and G.emitterInfo(e) or "没生成", tostring(info), aimHow, rot.Pitch or 0, rot.Yaw or 0)
+    end
     return true
+end
+
+-- §427 替身自己射出来的箭（不是按对方出手生成的）：当场收掉，免得多一箭 / 早一箭。返回 收掉几支
+function SHOT.killNative(pup, id, f, tn)
+    local fam, s = SHOT.FAM[f.name], f.shot
+    local ok, l = pcall(function() return FindAllOf("BulletActorBase") end)
+    local n = 0
+    for _, b in ipairs(ok and l or {}) do
+        if valid(b) and rawProp(b, "BulletStatus") == 2 and sameObj(rawProp(b, "BulletOwnerAvatar"), pup) then
+            local key = full(b)
+            if not s.mine[key] and not s.killed[key] and key:find(fam.nativeCls, 1, true) then
+                -- §444 替身自己出手的窗口里（killUntil）不认领：11-25 不蓄力那一发对方 ~1.15 秒就出手，正好和替身自己
+                -- 补的 Launch_NormalGreat 同一刻，认领窗口把替身那颗也记成"我们的" → 两颗炮弹两次爆炸（619 / 761，蓄满只有 560）。
+                -- 我们生成的那颗已经在 s.mine 里，爆炸是 OverlapBullet（类名不带 TigerCannon_Bullet），都不会被误收
+                if s.adoptUntil and tn <= s.adoptUntil and not (s.killUntil and tn <= s.killUntil) then   -- §428 刚按对方出手生成过：这颗算我们的
+                    s.mine[key] = true
+                    SHOT.log("§428 远端#%d %s 生成后新出现的 %s 记成对方出手那一发（不收）", id, f.name, key:match("^(%S+)") or key)
+                else
+                    s.killed[key] = true
+                    if pcall(function() b:Deactivate(0.0) end) then n = n + 1 end
+                end
+            end
+        end
+    end
+    if n > 0 then
+        s.killN = (s.killN or 0) + n
+        SHOT.log("§427 远端#%d %s 替身自己射了 %d 支箭（不是对方出手）→ 收掉（这一招共收 %d 支）", id, f.name, n, s.killN)
+    end
+    return n
 end
 
 -- 收：每帧（CHG.pupStep 里）：蓄力动作到点停住；替身自己出手了记一笔；等太久就收
@@ -1415,8 +2009,19 @@ function SHOT.pupStep(pup, id, f, tn)
     if not s or s.done then return end
     local fam = SHOT.FAM[f.name]
     if not valid(pup) then s.done = true; return end
-    if tn - s.at > SHOT.END_MAX then SHOT.finish(pup, id, f, tn, "等太久没收到收招"); return end
+    if tn - s.at > (fam.endMax or SHOT.END_MAX) then SHOT.finish(pup, id, f, tn, "等太久没收到收招"); return end
+    if fam.noSpin then                               -- §427 没等到收招、对方已经放了下一招 → 也收
+        local nf = CHG.movedOn(pup, id, f)
+        if nf then SHOT.finish(pup, id, f, tn, string.format("对方已放下一招 远端#%d %s", nf.id, tostring(nf.name))); return end
+    end
     local _, _, m, pos = LAT.activeMontage(pup)
+    if fam.killNative then
+        -- 替身动作换成出手动作 = 它自己射了：之后 KILL_WIN 秒里每帧找它自己的箭收掉（只在这段时间扫，不常驻）
+        if m ~= s.lastM and fam.shots[m or ""] then s.killUntil = tn + (fam.killWin or SHOT.KILL_WIN) end   -- §444 虎炮 1.5 秒（11-25 #624 0.6 秒没扫到）
+        if (s.killUntil and tn <= s.killUntil) or (s.adoptUntil and tn <= s.adoptUntil) then   -- §428 认领窗口里也扫
+            s.killed = s.killed or {}; SHOT.killNative(pup, id, f, tn)
+        end
+    end
     if not s.paused then
         if m == fam.charge and pos and pos >= fam.pauseAt then
             local ok = G.montagePause(pup, true)
@@ -1442,8 +2047,131 @@ function SHOT.finish(pup, id, f, tn, why)
         #gone > 0 and table.concat(gone, ",") or "（已经没在放）", cut ~= nil and ("，停蓄力动作 " .. tostring(cut)) or "")
 end
 
+-- ============================================================ §446 黄金火铳连射第二发（Normal_02 → Normal_04）收方没伤害
+-- 11-25 用户"原地连射、移动连射后的第二次连射都没有伤害"。"连射"= 点一下 GA_HuangJinHuoChong_Normal_02（第一发，
+-- 子弹 BD_..._Normal_02_01），在它的接招窗口（放出约 0.95 秒）再点 → GA_HuangJinHuoChong_Normal_04（第二发，子弹
+-- BD_..._Normal_02，时间线从 0.8 秒起跳、1.54 秒出子弹 = 放出后约 0.74 秒）。11-22–11-25 收方日志逐条对过：
+--   单独放的 Normal_04（autohit，前面没有 Normal_02）6/6 中（11-22 21:41 三次那时还没有 §424 按住键，照样中）；
+--   接在 Normal_02 后面的 Normal_04 14/14 没中（7 次"落空"，7 次观战没判定行），对方按 0.06–3.49 秒、§424 替身按住
+--   IsHolding=true、§434 按满 1 秒都一样 → 和按没按住无关，只和"前面刚放过 Normal_02"有关（替身身上具体哪一步把
+--   这发子弹弄没了还没查实，见 HANDOVER §446 的两个候选）。
+-- 做法（同 §377 / §427：按对方出手由模组自己生成子弹）：接在 Normal_02 后面放出的 Normal_04，到 DUE 秒还没看到替身
+-- 自己的火铳子弹（BP_Bullet_GuiChai_Black_Bullet_Common，所有者 = 替身）、这一招也还没判中 → 用这招技能实例生成
+-- 一颗 BD_GA_HuangJinHuoChong_Normal_02（瞄你，瞄准组件锁你）。单独放的不碰（原生就中）。关掉：net/hjhc_off.txt
+HJHC = { NAME = "GA_HuangJinHuoChong_Normal_04_C", PREV = "GA_HuangJinHuoChong_Normal_02_C",
+         CHAIN = 2.0, SCAN_FROM = 0.45, DUE = 1.0, CLS = "GuiChai_Black_Bullet",
+         DIR = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/ShachiWeapon/HuangJinHuoChong/",
+         BDN = "BD_GA_HuangJinHuoChong_Normal_02",
+         OFF_FILE = (NET_DIR or "net") .. "/hjhc_off.txt", logN = 0, LOG_MAX = 80 }
+
+function HJHC.log(fmt, ...)
+    HJHC.logN = HJHC.logN + 1
+    if HJHC.logN <= HJHC.LOG_MAX then out(fmt, ...) end
+end
+
+function HJHC.off()
+    local f = io.open(HJHC.OFF_FILE, "r")
+    if f then f:close(); return true end
+    return false
+end
+
+-- 诊断：替身瞄准组件锁没锁着
+function HJHC.lockState(pup)
+    local tc = valid(pup) and LO and LO.targetingComp and LO.targetingComp(pup)
+    if not tc then return "没有瞄准组件" end
+    local ok, r = pcall(function() return tc:HasLockTarget() end)
+    return ok and tostring(r) or "读不到"
+end
+
+-- 放之前（AIR.fire，INP.press 前）：记 Normal_02 的放出时刻；Normal_04 记下替身那时的状态（诊断）
+function HJHC.before(pup, e, tn)
+    if e.name == HJHC.PREV then CHG.hjLast02 = tn; return end
+    if e.name ~= HJHC.NAME then return end
+    local chained = CHG.hjLast02 ~= nil and tn - CHG.hjLast02 <= HJHC.CHAIN
+    CHG.hjPend = { id = e.id, chained = chained }
+    HJHC.log("§446 远端#%d %s 放之前：%s；替身 Normal_02 技能%s，动作 %s，瞄准组件锁定 %s", e.id, e.name,
+        chained and string.format("接在 Normal_02 后面（%.2f 秒）", tn - CHG.hjLast02) or "单独放",
+        (valid(pup) and LO.activeInstance(pup, HJHC.PREV)) and "还挂着" or "没了", tostring(montageOf(pup)), HJHC.lockState(pup))
+end
+
+-- 放成功（CHG.onFire 里，CHG.fired[id] 刚建）
+function HJHC.onFire(pup, e, tn)
+    if e.name ~= HJHC.NAME then return end
+    local p = CHG.hjPend
+    CHG.hjPend = nil
+    if not (p and p.id == e.id and p.chained) or HJHC.off() then return end
+    local f = CHG.fired[e.id]
+    if not f then return end
+    f.hj = { at = tn, inst = LO.activeInstance(pup, e.name), old = HJHC.bulletKeys(pup) }
+end
+
+-- 放出那一刻替身名下已经有的火铳子弹（第一发 Normal_02 留下的），之后不算"这一发自己出了子弹"
+function HJHC.bulletKeys(pup)
+    local keys = {}
+    local ok, l = pcall(function() return FindAllOf("BulletActorBase") end)
+    for _, b in ipairs(ok and l or {}) do
+        if valid(b) and sameObj(rawProp(b, "BulletOwnerAvatar"), pup) and full(b):find(HJHC.CLS, 1, true) then keys[full(b)] = true end
+    end
+    return keys
+end
+
+-- 替身自己的火铳子弹（这一招放出之后才出现的、还在飞的：BulletStatus = 2）
+-- 11-25 双开：只看"名下有火铳子弹"时，第一发 Normal_02 留下的（状态 3 = 已结束）被当成第二发 → "不补" → 落空
+function HJHC.nativeBullet(pup, old)
+    local ok, l = pcall(function() return FindAllOf("BulletActorBase") end)
+    for _, b in ipairs(ok and l or {}) do
+        if valid(b) and rawProp(b, "BulletStatus") == 2 and sameObj(rawProp(b, "BulletOwnerAvatar"), pup)
+            and full(b):find(HJHC.CLS, 1, true) and not (old and old[full(b)]) then return b end
+    end
+    return nil
+end
+
+-- 每帧（CHG.pupStep）：SCAN_FROM–DUE 秒里看替身有没有自己出子弹；DUE 秒还没有、也没判中 → 补一颗
+function HJHC.step(pup, id, f, tn)
+    local h = f.hj
+    if not h or h.done or not valid(pup) then return end
+    local age = tn - h.at
+    if age < HJHC.SCAN_FROM then return end
+    local lh = NET.lastHit
+    if lh and lh.r and lh.r.atk == id then
+        h.done = true
+        HJHC.log("§446 远端#%d %s 已经判中（替身自己的子弹打到了）→ 不补", id, f.name)
+        return
+    end
+    local b = HJHC.nativeBullet(pup, h.old)
+    if b then
+        h.done = true
+        HJHC.log("§446 远端#%d %s 放出 %.2f 秒替身自己出了子弹 %s（状态 %s）→ 不补", id, f.name, age,
+            full(b):match("^(%S+)") or full(b), tostring(rawProp(b, "BulletStatus")))
+        return
+    end
+    if age < HJHC.DUE then return end
+    h.done = true
+    local inst = LO.activeInstance(pup, f.name)
+    if not inst and h.inst and valid(h.inst) then inst = h.inst end
+    if not inst then HJHC.log("§446 远端#%d %s 放出 %.2f 秒没子弹，替身这招技能也没了 → 补不了", id, f.name, age); return end
+    local fam = { dir = HJHC.DIR, tiers = { One = HJHC.BDN } }
+    local bd, how = SHOT.bd(fam, "One")
+    if not bd then HJHC.log("§446 远端#%d 补子弹：子弹数据%s", id, tostring(how)); return end
+    local loc = try("hjhc loc", function() return pup:K2_GetActorLocation() end)
+    if not loc then return end
+    local rot0 = SHOT.aim(loc, tn)
+    local y = math.rad(rot0.Yaw or 0)
+    local at = { X = loc.X + math.cos(y) * SHOT.FWD, Y = loc.Y + math.sin(y) * SHOT.FWD, Z = loc.Z + SHOT.UP }
+    local rot = SHOT.aim(at, tn)
+    G.setControlRot(pup, rot); setYaw(pup, rot.Yaw)
+    local lock0 = HJHC.lockState(pup)
+    local tc = LO.targetingComp(pup)                 -- 子弹按锁定目标找人（BP_BulletTargetSelector_LockTarget）
+    if tc then ZMX.tcLock(tc); if not NET.rlk then ZMX.tcUnlockAt = math.max(ZMX.tcUnlockAt or 0, tn + 3.0) end end
+    local e, info = G.laserEmitterSpawn(inst, pup, at, rot, bd)
+    HJHC.log("§446 远端#%d %s 接在 Normal_02 后面、放出 %.2f 秒替身没出子弹 → 补一颗 %s：%s（%s；锁定 %s → %s；P%.0f Y%.0f）",
+        id, f.name, age, HJHC.BDN, e and G.emitterInfo(e) or "没生成", tostring(info), lock0, HJHC.lockState(pup),
+        rot.Pitch or 0, rot.Yaw or 0)
+end
+
 return {
     SHOT = SHOT,
+    HJHC = HJHC,
     CHG = CHG,
     INP = INP,
     BOWEYE = BOWEYE,

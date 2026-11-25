@@ -990,7 +990,10 @@ function onControl(f, from, text) {
             // 玩家开的多人房：房主已注销 / 6 秒没心跳（等成员 REHOST 中）先不列，免得新人连到走了的房主
             const waitingRehost = (r) => !r.hosted && r.mpMax > 0 && (r.hostDeadAt || (r.seen > 0 && now - r.seen > 6000));
             const own = [...rooms.values()].filter((r) => !waitingRehost(r)).map((r) => ({ ...r, home: '', title: title(r) })).sort(order);
-            const list = own.concat([...remote.values()].sort(order)).slice(0, MAX_LIST);
+            // LIST|code：手输房间号先查连接策略，不受普通列表前 40 间截断影响；不改变普通 LIST。
+            const wanted = clean(f[2], 16).toUpperCase();
+            const all = own.concat([...remote.values()].sort(order));
+            const list = (wanted ? all.filter((r) => r.id === wanted) : all).slice(0, MAX_LIST);
             // 第 8 列 = 能观战（主机认观战、这台开了中转、是这台自己的房间）； 第 11 列 2 = 直连失败时走桥接； 第 12 列 = 多人信息
             send(`${WS}|ROOMS\n` + list.map((r) => `${r.id}\t${r.name}\t${r.map}\t${r.full ? 1 : 0}\t${r.home}\t${r.ranked ? 1 : 0}\t${r.title || ''}\t${r.watch && (RELAY_WATCH || r.hosted) && !r.home ? 1 : 0}\t${r.aiFight ? 1 : 0}\t${r.bh || ''}\t${r.bridgeRoom ? 1 : r.bridgeFallback ? 2 : 0}\t${mpInfo(r)}`).join('\n'), from);     // 0.34 第 11 列 = 对局走桥接平台
             return;
@@ -1088,7 +1091,13 @@ function onControl(f, from, text) {
             s.bBridge = cbridge;
             // 第 7 段 = 对方的平台账号 ID（排位房间才有；旧版联机程序只看前 6 段）
             // 0.34 评审：主机的平台账号 ID只给自己也报了平台账号 ID的客机，同一来源 IP 对同一房间 30 秒一次（外人拿 LIST 扫桥接平台房批量收割主机平台账号 ID的成本）
-            const giveBridge = room.bridge && cbridge && rateOk(from, 'peer:' + id, 30_000, now);
+            // 同 NAT 多成员共用固定的 IP / 房间预算（最多 16 次 / 30 秒），不把客机可控 ID 放进限流 key。
+            // 同一会话重发 JOIN 沿用介绍；旧版 1v1 / 排位仍是每 IP / 房间 30 秒一次。
+            const mpBridge = room.mpMax >= 2 && room.bridgeRoom;
+            const introBudget = mpBridge ? Math.min(16, room.mpMax) : 1;
+            const giveBridge = room.bridge && cbridge && ((mpBridge && s.bridgeGiven === cbridge)
+                || rateOk(from, 'peer:' + id, 30_000, now, introBudget));
+            if (mpBridge && giveBridge) s.bridgeGiven = cbridge;
             if (room.bridgeRoom && room.bridge && !giveBridge) { send(`${WS}|ERR|${id}|needsteam`, from); sessions.delete(s.sid); return; }     // 直连失败走桥接的房：没给成也照常直连
             // 双栈：两边都可能从另一族报过地址（ALT）。第 5 段先给对方那一族的地址，第 8 段给剩下那一族（客户端两个都打洞）
             const [hMain, hOther] = introAddrs(room.host, liveAlt(room.hostAlt, room.hostAltSeen, now), from);
@@ -1232,13 +1241,14 @@ const liveAlt = (a, seen, now) => (a && now - (seen || 0) <= ROOM_TTL ? a : '');
 // 0.34 评审：按来源 IP + 用途限速（STATUS / CFGQ 反射放大、桥接平台房介绍收割）。表每分钟清一次过期项
 const rateTab = new Map();
 let rateSweep = 0;
-function rateOk(from, what, everyMs, now) {
+function rateOk(from, what, everyMs, now, budget = 1) {
     const ip = from.lastIndexOf(':') > 0 ? ipOf(from) : from;     // [IPv6]:端口 也按地址算
     const k = ip + '|' + what;
-    if (now - rateSweep > 60_000) { rateSweep = now; for (const [kk, t] of rateTab) if (now - t > 120_000) rateTab.delete(kk); }
-    const last = rateTab.get(k) || 0;
-    if (now - last < everyMs) return false;
-    rateTab.set(k, now);
+    if (now - rateSweep > 60_000) { rateSweep = now; for (const [kk, t] of rateTab) if (now - t.at > 120_000) rateTab.delete(kk); }
+    let window = rateTab.get(k);
+    if (!window || now - window.at >= everyMs) { window = { at: now, used: 0 }; rateTab.set(k, window); }
+    if (window.used >= budget) return false;
+    window.used++;
     return true;
 }
 

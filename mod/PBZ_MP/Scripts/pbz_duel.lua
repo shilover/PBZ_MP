@@ -481,6 +481,8 @@ local function applyLocalPhase(tn)
     local myPid = mp.myPid()
     local fighter = myPid > 0 and (myPid == fa or myPid == fb)
     duelUiSync("对决 " .. tostring(st))     -- §260 进 / 出对局阶段
+    -- §450 观众：交手中两位选手互为敌对（factionFor），进 / 出交手都重排一次（选手自己仍由下面 setPeerFaction 切）
+    if not fighter and mp.syncFactions then pcall(mp.syncFactions) end
 
     if st == "idle" then
         fireMatchEnd(DUEL.lastEndWhy ~= "" and DUEL.lastEndWhy or "回到待机")
@@ -1124,7 +1126,9 @@ end
 
 function DUEL.shouldLockSelf()
     if not DUEL.isDuel() then return true end
-    if not DUEL.isFighter() then return false end
+    -- §450.1 观众：交手中第一位选手在观众那里是敌方（factionFor），他的招 / 分身可能打到藏着的观众 → 交手中也锁血（不会死；对局外照旧不锁）。
+    -- 11-25 22:07 以前（§450）是观战时关观众碰撞，结果观众按了闪避、技能把移动打开，人穿过地面掉出地图（整片场景卸掉、只剩天空）
+    if not DUEL.isFighter() then return DUEL.state == "fight" end
     return DUEL.state == "cd" or DUEL.state == "fight" or DUEL.state == "rend"
 end
 

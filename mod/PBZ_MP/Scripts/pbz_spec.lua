@@ -810,6 +810,8 @@ local function bossBarStep(s, tn)
         G.bossBarShachiShow(s.bar, true)
         s.nameAt = nil
         out("观战原型 %s 血条：%s", s.tag, short(pathOf(s.bar)))
+        -- §443 同一个 HUD 上没人认领的空血条收起来（B 还没注册时扫不到 B 的：B 之后新注册、认领时会放回来）
+        if G.bossBarSweep then G.bossBarSweep(nil, { s.bar, valid(other.bar) and other.bar or nil }) end
     end
     local hp, hm = G.attrOf(s.pup, "Health"), G.attrOf(s.pup, "Health_Max")
     local sc, sm = G.attrOf(s.pup, "Shachi"), G.attrOf(s.pup, "Shachi_Max")

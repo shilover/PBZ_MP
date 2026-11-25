@@ -90,6 +90,25 @@ LO.atkScale = 1.0
 -- 数据：日志里入站 1607 次中招按替身攻击力归一化（每百攻伤害），族之间的相对值主要看 2026-11-05 21:50–23:18 同一场换 17 种武器那段；
 -- 目标（对方攻击 600、倍率 100%、我满血约 3085）：普通招一下 ≤ 约 30% 血，大招 / 蓄满 ≤ 约 35–45%
 BAL = { on = true, HOLD = 2.5, TAIL = 1.0, last = nil, lastAt = -100, prev = nil, prevAt = -100, FAMILY = {}, MOVE = {} }
+-- 11.20 影武：按住蓄力 / 一招里连发 / 驾车的招，出伤害可能在放招 HOLD 秒以后（虎炮满蓄、巨斧三蓄、马车一路撞），
+-- 以前 HOLD 一过替身攻击力回到不乘这招系数（11-22 15:48:45 日志"替身攻击力 ×78%（武器平衡 标准数值 …）"没有招名）。
+-- 这些招的系数保持到这么多秒（下一招放出来就换，不影响别的招）。秒数：蓄力招 = CHG.JUDGE_MAX 8、§377 连发 = SHOT.END_MAX 12、
+-- 马车 = CHG.VEHICLE.MAX 30
+-- 火力全开 12：11.22 实机 21:46:44 放招、21:46:47 开炮 -529（3 秒后，系数已回到 ×20% 不带 ×1.2 和标准数值），后面每跳到 6 秒以后
+BAL.HOLD_FOR = {
+    GA_HorseCart_Charge_C = 30, GA_TigerCannon_C = 12, GA_TigerCannon_QuickCharge_C = 12, GA_TigerCannon_Ultimate_C = 12, GA_UnnamedBow_C = 12,
+    GA_BrutalAxe_Normal_C = 8, GA_BrutalAxe_Sprint_C = 8, GA_DuYan_Bow_Normal_C = 8, GA_DuYan_Bow_Laser_C = 8,
+    GA_YouLongCha_Normal_C = 8, GA_JinGua_Normal_C = 8, GA_JinGua_RoAttack_C = 8, GA_JinGua_Air_C = 8,
+    GA_TanLang_Normal_C = 8, GA_LionHead_C = 8, GA_ZhuoBiDun_C = 8, GA_YouLongHead_Water_C = 8,
+    GA_Hun_Lute_SKill_C = 8, GA_Hun_HuoLiuXing_AAAA_C = 8, GA_HuangJinHuoChong_Normal_02_C = 8, GA_HuangJinHuoChong_Normal_04_C = 8,
+}
+function BAL.holdOf(name) return math.max(BAL.HOLD, name and BAL.HOLD_FOR[name] or 0) end
+-- 11.22 实机（21:31:49）：保持期里系数还是这招的，但影武等级系数（标准数值 ×3.90）照旧 EDGE_HOLD 2.5 秒就撤、换成主武器的，
+-- 2.5 秒后打中的影武伤害只剩约 1/3.9。保持期内（最后放的还是这招影武）等级系数也按影武算
+function BAL.edgeHeld(tn)
+    local n = BAL.last
+    return n ~= nil and BAL.HOLD_FOR[n] ~= nil and tn - BAL.lastAt < BAL.holdOf(n) and LO.isEdgeAttack(n) == true
+end
 -- §177 召唤物 / 飞出去的东西（紫冥剑的锤枪伞、飞剑……）留场比 HOLD 久，以前 HOLD 一过替身攻击力就回到没乘平衡的 100%。
 -- 表里 summon = { 招名 = 留场秒数 }：放这招（或对方召唤时替身调 TrySummon*）后这么多秒内，系数至少按这招的算；
 -- 期间又放了别的招，取两个里小的（和 TAIL 一个规矩，宁可少打不多打）。留场秒数跟着数值表下发（§158 的 s=），以后只改表就行
@@ -108,7 +127,8 @@ end
 -- 所以写 0.1 不写 0；0 仍是"整个关掉"
 -- §200 瞬影冷却 ShunYingDodge（天赋瞬身）也在这一行；没写 = 默认 10 秒（DCD.secKey），写 0 = 不冷却；只挡瞬影自己。
 -- §200.10 普通闪避 / 灵蛇剑架势闪避不再冷却（改成扣杀气，见下面 cost 行）：旧版主机 / 服务器下发的 cd= 里还带 Dodge / SnakeDodge，收下、没人用
-BAL.CD_DEF, BAL.CD_CAP = { ZiMingJian_HuoQiang = 0.1, ShunYingDodge = 10 }, 60
+-- §426 GA_ 开头的键 = 那一招放出来起算的冷却秒数（base_wrules MCD 段）：双刃第四段 5 秒（用户 11-24 定）；§435 用户改成冷却组 JueYingTrack = 1（绝影 ABB / AAABB / BBBB 共用 1 秒，组表在 base_wrules MCD.GROUP，原 BBBB 5 秒撤掉）
+BAL.CD_DEF, BAL.CD_CAP = { ZiMingJian_HuoQiang = 0.1, ShunYingDodge = 10, JueYingTrack = 1 }, 60
 function BAL.cleanCooldown(t)
     if type(t) ~= "table" then t = BAL.CD_DEF end
     local o = {}
@@ -195,6 +215,16 @@ function BAL.sdmg(key)
     if v == nil then v = BAL.SDMG_DEF[key] end
     return v
 end
+-- 11.21: per-damage-source multipliers; no whole-move spreading.
+BAL.SEGMENTS = {}
+function BAL.cleanSegments(t)
+    local o = {}
+    for k, v in pairs(type(t) == "table" and t or {}) do
+        if type(k) == "string" and (k:match("^BD?_[%w_]+$") or k:match("^BulletData_[%w_]+$") or k == "TipsyLight" or k == "TipsyHeavy" or k == "DrunkHeavy" or k == "ChaosFireHeavy" or k == "JueYingClone")   -- §438
+            and type(v) == "number" and v > 0 and v <= 10 then o[k] = v end
+    end
+    return o
+end
 do
     local okB, T = pcall(require, "pbz_balance")
     if not (okB and type(T) == "table") then okB, T = pcall(function() return dofile((((FORNET or {}).GAME_DIR or (ROOT .. "/Scripts")) .. "/pbz_balance.lua")) end) end
@@ -204,6 +234,7 @@ do
         BAL.DOT, BAL.CTRL = BAL.cleanDot(T.dot), BAL.cleanCtrl(T.ctrl)       -- §199
         BAL.CHILL = BAL.cleanChill(T.chill)                                  -- §206
         BAL.SDMG = BAL.cleanSdmg(T.sdmg)                                     -- §212
+        BAL.SEGMENTS = BAL.cleanSegments(T.segments)
         BAL.COST = BAL.cleanCost(T.cost)                                     -- §200.10
         local n, ns, nd = 0, 0, 0
         for _ in pairs(BAL.MOVE) do n = n + 1 end
@@ -267,11 +298,24 @@ end
 -- 两边各记各的：收到的对方事件记 BAL.rStance（替身放招乘系数），自己发的记 BAL.myStance（TOUCH.scale 回报），规则一样所以对称。
 -- 窗口 10 秒是按 11-09 实战日志估的（架势后 2 / 5 / 8 秒的 B 是强化伤害，11 秒的不是），待实测校
 BAL.STANCE_WIN, BAL.STANCE_FAM, BAL.rStance, BAL.myStance = 10, { YanYueDao = true }, {}, {}
+-- 11.20 影武：子技能按拉起它的那招算系数。巨凶斧疾行斧 GA_BrutalAxe_Sprint 自己没有判定，拉起 Normal 走 SprintRelease 分支；
+-- 以前 Normal 一放出来就按 Normal 的系数（和 Sprint 取小也只管 TAIL 1 秒），蓄力疾行吃不到"疾行斧 -50%"。
+-- PARENT_WIN 秒内先放过 from → 这一次 Normal 按 from 的系数（用一次就清，之后单独放的 Normal 照旧）。两边各记各的，同 §186.3
+BAL.PARENT, BAL.PARENT_WIN = { GA_BrutalAxe_Normal_C = "GA_BrutalAxe_Sprint_C" }, 1.0
+BAL.PARENT_FROM = {}
+for _, from in pairs(BAL.PARENT) do BAL.PARENT_FROM[from] = true end
 function BAL.noteStance(t, name, tn)
+    if name and BAL.PARENT_FROM[name] then t["@" .. name] = tn end     -- 11.20 拉起子技能的那招
     local f = name and name:match("^GA_Hun_(%w+)_Stance_C$")
     if f and BAL.STANCE_FAM[f] then t[f] = tn end
 end
 function BAL.resolve(name, t, tn)
+    local from = name and BAL.PARENT[name]
+    local pat = from and t["@" .. from]
+    if pat then
+        t["@" .. from] = nil
+        if tn - pat <= BAL.PARENT_WIN and BAL.MOVE[from] then return from end
+    end
     local f = name and name:match("^GA_Hun_(%w+)_")
     local at = f and BAL.STANCE_FAM[f] and t[f]
     if at and tn - at <= BAL.STANCE_WIN and name:find("_C$") and not name:find("Reinforced", 1, true) then
@@ -311,7 +355,7 @@ end
 function BAL.now(tn)
     if not BAL.active() then return nil end
     local f, why, name
-    if BAL.last and tn - BAL.lastAt < BAL.HOLD then
+    if BAL.last and tn - BAL.lastAt < BAL.holdOf(BAL.last) then
         f, why = BAL.moveScale(BAL.last, BAL.lastWc)
         name = BAL.last
         if BAL.prev and tn - BAL.prevAt < BAL.TAIL then
@@ -358,7 +402,10 @@ CAP = { SLACK = 1.25, REF_ATK = 200, n = 0,
         -- 列在这里的招应有 = 预算 × 伤害 × 攻击 / 200（× 等级比），**不留 1.25 倍余量**（TOTAL_SLACK）。11-10 07:24–07:36 实测
         -- 裂斩直接 -917 + 点燃（游戏不认替身增伤）累计到 -1480 才被 1.25 倍门槛（1459）拦住，一招约 1.4 倍预算。
         -- 裂斩 1050 = §183 L1+圈一招预算；第二段 _CB_C（§183.1 预算 500）没有原版数，直接伤害可能自己就到 500，先不列
-        TOTAL = { GA_GlobalActionAbility_LieZhan_C_C = 1050 }, TOTAL_SLACK = 1.0 }
+        -- §436 火力全开（用户 11-24："按之前的预期伤害数值给限制"）：11.23 定的预期一招 1500–1550（伤害 20% 房、标准数值、对方攻击 200），
+        -- 不破防实测一招累计 1415–1484（11-24 #981 / #1007 / #1011 / #1013 / #1017）；挨打方挡着被破防那一下游戏自己 ×2（-2721，累计 2820 / 2905）。
+        -- 按 1550 封顶：TOTAL 是伤害 100% / 攻击 200 口径 → 1550 ÷ 20% = 7750（伤害倍率 / 攻击 / 等级照 CAP.expected 缩放）。系数 0.66 以后再改，这里不会跟着变
+        TOTAL = { GA_GlobalActionAbility_LieZhan_C_C = 1050, GA_TigerCannon_Ultimate_C = 7750 }, TOTAL_SLACK = 1.0 }
 -- §359 大招"除了第一刀后面都没伤害"（内测反馈 11-16，v0.34.1 日志）：§197 / §203 列的天玄青铜剑 / 荡寇凶刃 / 玉双环大招，
 -- 原版是只采到一段（青铜剑 1572、荡寇 1952）或打空下限（玉双环 3039）——整招按游戏数据是 6860 / 8884 / 6365（base_capdata.lua
 -- §339.2、data/move_game.csv 1632 × 3.9）。上限 = 原版 × 系数 × …，第一刀就把它吃满，后面每一段都被吃掉（日志"改过之后又吃掉 N 跳"）。
@@ -1243,9 +1290,13 @@ end
 function LO.rescale(pup, tn)
     LO.atkDm = NET.dmgNow()
     local edge = ST.pupEdgeAt and tn - ST.pupEdgeAt < LO.EDGE_HOLD
+    if not edge and BAL.active() and BAL.edgeHeld(tn) then edge = true end      -- 11.22 影武长按保持期
     local f, why = BAL.now(tn)
     if f then LO.atkScale, LO.scaleWhy = NET.atkScale(false) * f, why
     else LO.atkScale, LO.scaleWhy = NET.atkScale(edge), nil end
+    if CHR and CHR.muted and CHR.muted(tn) then       -- §255.1 切形态中间步：对方没放这招，不出伤害
+        LO.atkScale, LO.scaleWhy = 0, "§255.1 切形态中间步（对方没放这招）×0"
+    end
     -- §144 标准数值：再乘 30 级倍率 ÷ 本机倍率；§148 普通房间：乘 对方那把的倍率 ÷ 本机倍率（本机倍率见 STD.localMult）
     local lf, lwhy = STD.levelScale(edge)
     if not edge and BAL.flatLevel(tn) then lf, lwhy = STD.flatScale(false) end   -- §183 裂斩不吃武器等级倍率
@@ -1635,7 +1686,7 @@ function LO.dress(pup, p1)
     end
 end
 
--- §249 报告 §2.4：这 5 招资产上有 BD、会打人，但被 isAttackAbility / LO.isEdgeAttack 的排除词挡住
+-- §249 报告 §2.4 与 11.20 QuickCharge：这些招有 BD、会打人，但被 isAttackAbility / LO.isEdgeAttack 的排除词挡住
 -- （ToZui / Stance / GuardPoint / 名字不带 GA_Hun_ 前缀）。表驱动，别在函数里再散字符串。
 -- 值 "edge" = 影之武装（LO.isEdgeAttack 也认，平衡按 0.35 那套）；"atk" = 只算攻击（主武器，不套影武系数）。
 -- 不加 GA_Hun_DualHook_GEx_C：抓取处决，对局里禁用（报告 §2.4 / §3.6）。
@@ -1643,6 +1694,7 @@ ATK_EXTRA = {
     GA_Hun_ChiZheCanJian_C_ToZui_C = "atk",
     GA_Hun_YanYueDao_Stance_C = "atk",
     GA_TieKuangQuanTao_GuardPoint_C = "edge",
+    GA_TigerCannon_QuickCharge_C = "edge",
     GA_XieShan_LightningIce_PerfectDeflect_C = "atk",
     GA_XieShan_LightningIce_PerfectDeflect_FullCharge_C = "atk",
 }
@@ -1720,31 +1772,49 @@ end
 function LO.syncWge(pup, wge, st)
     if st == nil then wge, st = NET.rwge, LO end
     if wge == nil then return end          -- 旧版对方没有这个字段：不动替身
+    if SHADOWPASSIVES then SHADOWPASSIVES.puppetStep(pup, G.now()) end
     local pp = pathOf(pup)
     local zmOwn = st == LO and NET.rzmb ~= nil        -- §349 对方自己算损血增伤（zmb=）：替身不挂那个 GE，防算两次
     local key = pp .. "|" .. wge .. (zmOwn and "|zm" or "")
+        .. (SHADOWPASSIVES and SHADOWPASSIVES.blocked(SHADOWPASSIVES.paths[1]) and "|shadow" or "")
     if key == st.wgeKey then return end
-    st.wgeKey = key
+    local tick = ST and ST.ticks or 0
+    if st.wgePendingKey == key and tick >= (st.wgeRetryFrom or 0) and tick < (st.wgeRetryAt or 0) then return end
+    st.wgeKey = nil
     if st.wgeFor ~= pp then st.wgeFor, st.wgeOn = pp, {} end
-    local want, added, removed, n = {}, {}, {}, 0
+    local want, added, removed, n, complete = {}, {}, {}, 0, true
     for id in wge:gmatch("[%w_/]+") do
         n = n + 1
-        if not (zmOwn and id == ABUF.ZM_GE) then want[id] = true end
+        if not (zmOwn and id == ABUF.ZM_GE)
+            and not (SHADOWPASSIVES and SHADOWPASSIVES.blocked(id)) then want[id] = true end
     end
     for id in pairs(want) do
         local ck = pp .. "|" .. LO.wgePath(id)            -- 和 CHG.upgrade 同一个记号：§92.7 补过的不再上
         if not st.wgeOn[id] and not CHG.applied[ck] then
-            LO.applyGE(pup, LO.wgePath(id), "替身武器效果 " .. id)
-            st.wgeOn[id], CHG.applied[ck] = true, true
-            added[#added + 1] = id
+            local ok, applied, handle = pcall(LO.applyGE, pup, LO.wgePath(id), "替身武器效果 " .. id)
+            local value = ok and applied == true and rawProp(handle, "Handle") or nil
+            if type(value) == "number" and value >= 0 then
+                st.wgeOn[id], CHG.applied[ck] = true, true
+                added[#added + 1] = id
+            else complete = false end
         end
     end
     for id in pairs(st.wgeOn) do
         if not want[id] then
-            LO.removeGE(pup, LO.wgePath(id), "替身去掉武器效果 " .. id)
-            st.wgeOn[id], CHG.applied[pp .. "|" .. LO.wgePath(id)] = nil, nil
-            removed[#removed + 1] = id
+            local allowed = not (SHADOWPASSIVES and SHADOWPASSIVES.blocked(id)) or SHADOWPASSIVES.allowRemove(pup, LO.wgePath(id))
+            local ok, removedGE = false, false
+            if allowed then ok, removedGE = pcall(LO.removeGE, pup, LO.wgePath(id), "替身去掉武器效果 " .. id) end
+            if ok and removedGE == true then
+                st.wgeOn[id], CHG.applied[pp .. "|" .. LO.wgePath(id)] = nil, nil
+                removed[#removed + 1] = id
+            else complete = false end
         end
+    end
+    -- A failed add/remove is not cached as success; retries are per actor/state and bounded by ticks.
+    if complete then
+        st.wgeKey, st.wgePendingKey, st.wgeRetryAt, st.wgeRetryFrom = key, nil, nil, nil
+    else
+        st.wgePendingKey, st.wgeRetryFrom, st.wgeRetryAt = key, tick, tick + 30
     end
     if #added + #removed > 0 then
         out("替身武器效果同步：对方 %d 个；补上 %s；去掉 %s", n, #added > 0 and table.concat(added, " ") or "-",

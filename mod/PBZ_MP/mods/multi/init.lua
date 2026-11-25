@@ -33,6 +33,16 @@ if UIS and UIS.addPage and UIS.go then
                                    build = function(items, T, lb, page) MP.memberRows(items, T) end }, M.name)
     MP.rulesPage = UIS.addPage({ id = "rules", title = "玩法设置", titleEn = "GAME MODE", back = "main", room = true,     -- 11-15 玩法相关的设置单独一页
                                  build = function(items, T, lb, page) MP.rulesRows(items, T) end }, M.name)
+    MP.resourcesPage = UIS.addPage({ id = "resources", title = "成员特殊资源", titleEn = "MEMBER RESOURCES", back = MP.membersPage, room = true,
+        build = function(items)
+            if MP.training then MP.training.roomItems(items, function(pid)
+                MP.resourcePid = pid; UIS.go(MP.memberResourcesPage)
+            end) end
+        end }, M.name)
+    MP.memberResourcesPage = UIS.addPage({ id = "member_resources", title = "特殊资源设定", titleEn = "SPECIAL RESOURCES", back = MP.resourcesPage, room = true,
+        build = function(items)
+            if MP.training then MP.training.memberItems(MP.resourcePid, items) end
+        end }, M.name)
     MP.uiGo = UIS.go
 end
 MP.attach({ on = M.on, ask = M.on, bind = function(key, fn, label) return M.keys.bind(key, fn, label) end, panelOpen = P.panelOpen })

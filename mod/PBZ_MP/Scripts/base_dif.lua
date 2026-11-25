@@ -96,9 +96,9 @@ CFG = { CHUNK = 600, REQ_EVERY = 3.0, local_ = nil, localStr = nil, localHash = 
 -- §210 表版本号 fv=：每加一组新字段（下面 CFG.KEYS 加键）就把 FV 加 1。旧版本解码不认 fv=、照旧跳过；新版本看到比自己新的 fv、
 -- 或者不认识的键，整份不收（服务器那份 → 用模组文件、横幅提示更新；主机那份 → 用本地、规则指纹会对不上）。
 -- 1 = §158 基础（a / lv / t / tr / e / f / m）、2 = §177 s=、3 = §184 cd=、4 = §199 d= / cc=、5 = §200.10 co=、6 = §206 ch=、7 = §212 sd=
-CFG.FV = 7
+CFG.FV = 8
 CFG.KEYS = { v = true, fv = true, a = true, lv = true, t = true, tr = true, e = true, f = true, m = true, s = true, cd = true,
-             d = true, cc = true, co = true, ch = true, sd = true }
+             d = true, cc = true, co = true, ch = true, sd = true, seg = true }
 
 function CFG.hash(s)            -- FNV-1a 32 位，十六进制
     local h = 0x811c9dc5
@@ -106,7 +106,7 @@ function CFG.hash(s)            -- FNV-1a 32 位，十六进制
     return string.format("%08x", h)
 end
 
-function CFG.num(v) return string.format("%.6g", v) end
+function CFG.num(v) return string.format("%.15g", v) end
 function CFG.short(n)       -- 招式名缩写：GA_Hun_X_C → ~X，GA_X_C → ^X
     local m = n:match("^GA_Hun_(.+)_C$")
     if m then return "~" .. m end
@@ -143,6 +143,7 @@ function CFG.snapshot()
     for k, v in pairs(BAL.CHILL) do c.chill[k] = v end
     for k, v in pairs(BAL.SDMG_DEF) do c.sd[k] = v end     -- §212（同 chill：编码出来总是完整的）
     for k, v in pairs(BAL.SDMG) do c.sd[k] = v end
+    c.seg = BAL.cleanSegments(BAL.SEGMENTS)
     return c
 end
 
@@ -172,7 +173,8 @@ function CFG.encode(c)
         "cc=" .. sortedKV(c.ctrl or {}),                    -- §199 控制类异常时长上限（旧版跳过）
         "co=" .. sortedKV(c.co or BAL.COST_DEF),            -- §200.10 闪避扣杀气 / 切武器保持杀气（旧版跳过）
         "ch=" .. sortedKV(c.chill or BAL.CHILL_DEF),        -- §206 冰缓伤害倍数（旧版跳过；不放进 cc=：cc= 的旧解码不认新键会整张表不认）
-        "sd=" .. sortedKV(c.sd or BAL.SDMG_DEF) }, "|")     -- §212 召唤物每发伤害点数（0.31.0 及更早跳过；§210 起的旧版见 fv=7 整份不收）
+        "sd=" .. sortedKV(c.sd or BAL.SDMG_DEF),            -- §212 召唤物每发伤害点数
+        "seg=" .. sortedKV(BAL.cleanSegments(c.seg)) }, "|") -- fv=8: per-source damage multipliers
 end
 
 -- 解析 + 白名单；不对返回 nil, 原因
@@ -304,6 +306,18 @@ function CFG.decode(s)
         end)
         if not ok then return nil, why end
     end
+    -- No seg in older tables means no per-source overrides, never local defaults.
+    c.seg = {}
+    if p.seg ~= nil then
+        if p.seg:match("^,") or p.seg:match(",$") or p.seg:find(",,", 1, true) then return nil, "分段系数有空项" end
+        ok, why = pairsOf(p.seg, function(k, v)
+            if c.seg[k] ~= nil then return false, "分段系数重复 " .. k end
+            local clean = BAL.cleanSegments({ [k] = v })
+            if clean[k] == nil then return false, "分段系数不对 " .. k end
+            c.seg[k] = clean[k]; return true
+        end)
+        if not ok then return nil, why end
+    end
     -- 没列出来的招按兜底：把兜底不是 1 的那些招也补成表里的数，解出来和 snapshot 一样完整
     for k in pairs(CFG.file_.mv) do
         if c.mv[k] == nil then c.mv[k] = CFG.fallback(k, c.fam, c.edge) end
@@ -335,10 +349,14 @@ function CFG.use(c)
     for k, v in pairs(c.chill or BAL.CHILL_DEF) do BAL.CHILL[k] = v end  -- §206
     BAL.SDMG = {}
     for k, v in pairs(c.sd or BAL.SDMG_DEF) do BAL.SDMG[k] = v end      -- §212
+    BAL.SEGMENTS = BAL.cleanSegments(c.seg)
     LO.EDGE_SCALE = c.edge
 end
 
 -- 本机的基准：大厅服务器给过的那份（联机程序缓存在 net/srvcfg.txt，§158 服务器下发）优先，没有 / 坏了用模组目录里的文件
+-- 11-22 用户"先不服务器下发，新的数值修改作为这个版本默认配置"：默认不读 net/srvcfg.txt，只用模组文件；
+-- 面板也不显示"获取服务器数值表"。以后要恢复下发，把这个改成 true（测试里 ⑦ / ⑩ 段就是这么开的）
+CFG.SERVER_TABLE = false
 function CFG.init()
     CFG.file_ = CFG.snapshot()      -- 模组文件里的（也是解码时的白名单）
     CFG.pick()
@@ -346,8 +364,9 @@ end
 
 function CFG.pick()
     local base, src = CFG.file_, "模组文件"
-    local t = fileReadKV(NET_DIR .. "/srvcfg.txt")
-    CFG.srvHash, CFG.srvAt, CFG.srvSig, CFG.srvPend = t and t.h, CFG.clock(), CFG.peek(), nil
+    local t = CFG.SERVER_TABLE and fileReadKV(NET_DIR .. "/srvcfg.txt") or nil
+    CFG.srvHash, CFG.srvAt, CFG.srvSig, CFG.srvPend = t and t.h, CFG.clock(), CFG.SERVER_TABLE and CFG.peek() or "", nil
+    CFG.srvNewer = nil
     if t and t["end"] and t.h and t.s then
         if CFG.hash(t.s) ~= t.h then
             out("!! 数值表：srvcfg.txt 哈希对不上（%s ≠ %s），不用", CFG.hash(t.s), t.h)
@@ -370,7 +389,8 @@ function CFG.pick()
     CFG.localStr = CFG.encode(CFG.local_)
     CFG.localHash = CFG.hash(CFG.localStr)
     CFG.localSrc = src
-    out("数值表（标准数值基准 + 武器平衡）：本地 %s，%d 字节，来自%s", CFG.localHash, #CFG.localStr, src)
+    out("数值表（标准数值基准 + 武器平衡）：本地 %s，%d 字节，来自%s%s", CFG.localHash, #CFG.localStr, src,
+        CFG.SERVER_TABLE and "" or "（这个版本不用服务器下发的表）")
 end
 
 -- §196 对局外每 SRV_EVERY 秒看一下联机程序有没有从服务器拿到新的。
@@ -398,6 +418,7 @@ function CFG.peek()
     return tostring(h) .. ":" .. tostring(size)
 end
 function CFG.refresh(tn)
+    if not CFG.SERVER_TABLE then return end      -- 11-22 不用服务器表：不查 srvcfg.txt（也不碰磁盘）
     local w = CFG.clock()
     if CFG.srvAt and w >= CFG.srvAt and w - CFG.srvAt < CFG.SRV_EVERY then return end
     CFG.srvAt = w
@@ -511,7 +532,7 @@ CFG.init()
 NET.RK_RULES = "bo=3;dm=20;med=0;bal=1;ctr=1;ab=0;npos=1;ultx=200;std=1;ult0=0;sp0=3;resm=0;acc=2;accn=3;tl=180;gcd=1;dgc=0;sycd=1;stg=1;swk=0;dif=3;accban=AnimMovement,BreakRegen,HealthResistance,MagicWeapon,SwitchEndure;wpnban=-;edgeban=-"
 -- rkParse 认的 0/1 键（其余数字键按 bo / dm / RES_MAX 的范围认；accban / wpnban / edgeban / cfgh 原串保留）
 NET.RK_FLAG_KEYS = { med = true, bal = true, ctr = true, ab = true, npos = true, std = true,
-                     gcd = true, dgc = true, sycd = true, stg = true, swk = true }
+                     gcd = true, dgc = true, sycd = true, stg = true, swk = true, pdsh = true }   -- §423 pdsh
 NET.RK_DEF = {}     -- rkParse 定义好之后由 NET.RK_RULES 填（见下面）；起算也用它
 NET.rkCache = {}
 function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }；空 / 一个认识的键都没有 → nil
@@ -538,6 +559,10 @@ function NET.rkParse(s)      -- "bo=3;dm=150;…" → { bo = 3, dm = 150, … }�
 end
 -- §408：RK_DEF = 盟主默认串解析结果（rkParse 起算 / 缺键兜底的唯一来源）
 NET.RK_DEF = NET.rkParse(NET.RK_RULES) or {}
+if NET.RK_DEF.pdsh == nil then NET.RK_DEF.pdsh = 0 end     -- §423 精防掉杀气：盟主规则串没写 = 关（服务器写 pdsh=1 才开）
+if NET.RK_DEF.pdshv == nil then NET.RK_DEF.pdshv = 100 end -- §423.1 扣多少：没写 = 100（服务器可写 pdshv=50/100/150/200）
+if NET.RK_DEF.stgm == nil then NET.RK_DEF.stgm = 1 end   -- §422.1 精防硬直秒数 近战 / 远程：没写 = 1（服务器可写 stgm= / stgr= 1–5）
+if NET.RK_DEF.stgr == nil then NET.RK_DEF.stgr = 1 end
 function NET.roomRules()
     local ms = MATCH.session
     -- §309（11-14 实测）：联机程序给每个主机都写 roomrules=（把主机自己的设置格式化一遍），那不是"别人定的房间规则"。

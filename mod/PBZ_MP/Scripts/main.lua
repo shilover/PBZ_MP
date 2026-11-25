@@ -21,7 +21,7 @@
 
 local UEHelpers = require("UEHelpers")
 
-local VERSION = "0.34.10"
+local VERSION = "0.34.13"
 local TAG = "[PBZ_MP] "
 -- v0.14.0：所有文件都放在模组自己的目录（…/Mods/PBZ_MP/），不再写死本机的游戏路径，别人的电脑上也能用。
 -- 从本脚本的路径推出模组目录（脚本在 PBZ_MP/Scripts/main.lua）；拿不到时退回 UE4SS 的工作目录（游戏 exe 所在的 platform/steam）下的相对路径
@@ -602,6 +602,39 @@ end
 -- 写 anim / net 就不管房间设置；没有文件 = 按房间设置。文件每 2 秒读一次
 NPM = { K = 14.0, SNAP = 600.0, Z_SNAP = 300.0, EXTRA_MAX = 0.25, STALE = 0.5, mode = "net", readAt = -1, logs = 0 }
 NPM.FILE = NET_DIR .. "/follow.txt"
+-- §436 高度（11-24 庞镇观战：对方站在房顶上，替身一半在屋顶下面）。以前高度全交给替身自己的移动组件，只有差 Z_SNAP（3 米）
+-- 以上才摆：XY 每帧是"不扫碰撞"直接放的，对方跳上 1–3 米的房顶时替身 XY 进了屋子、高度还在街上，移动组件迈不上去
+-- （台阶上限几十厘米）→ 一直卡在屋顶里，差不到 3 米永远不纠正。现在：对方不在空中、替身也不在空中，高度差 Z_FIX 以上
+-- 连着 Z_FIX_SEC 秒 → 摆到包里的高度（同类角色，胶囊一样高，站平地时两边高度一致；走坡 / 台阶的包延迟差不到这么多）。
+-- 对方在做场景互动动作（trv= 还在播，NET.rtrv）→ 替身先悬空（不受重力），高度每帧和 XY 一样平滑跟包，播完放回走路
+NPM.Z_FIX, NPM.Z_FIX_SEC, NPM.TRV_HOLD, NPM.zLogs, NPM.Z_LOG_MAX = 90.0, 0.3, 0.5, 0, 20
+-- §436.2 我在观战（多人房出局 / 只看 = 多人 mod 的 specView.on；旧观战 mod = ST.spec.on）。11-24 双开：包龄 100–180 毫秒，
+-- 按包龄外推（最多 EXTRA_MAX 0.25 秒）时对方一停，替身按停之前的速度多跑 1–2 米再拉回来，观战镜头跟着前后晃
+NPM.WATCH_EXTRA = 0.06
+function NPM.watching()
+    local mp = BASEHOOK.mp
+    local v = type(mp) == "table" and mp.specView or nil
+    return (type(v) == "table" and v.on == true) or (ST.spec ~= nil and ST.spec.on == true) or false
+end
+
+-- 每帧的高度（纯计算，测试用）。cur / pz = 替身现在的高度 / 包里的高度；rair = 对方在空中；trav = 对方在做场景动作；
+-- pupFalling = 替身自己在不在空中（只在要摆的时候才问，函数）；offAt = 上次开始差得多的时刻。
+-- 返回 新高度, 是否直接放, 新的 offAt, 原因（nil / "trav" / "snap" / "fix"）
+function NPM.stepZ(cur, pz, dt, tn, rair, trav, offAt, pupFalling)
+    if not pz then return cur, false, nil, nil end
+    local dz = pz - cur
+    if trav then
+        if math.abs(dz) > NPM.Z_SNAP then return pz, true, nil, "snap" end
+        return cur + dz * math.min(1.0, NPM.K * math.max(dt, 0)), false, nil, "trav"
+    end
+    if rair == true then return cur, false, nil, nil end
+    if math.abs(dz) > NPM.Z_SNAP then return pz + 20.0, true, nil, "snap" end
+    if math.abs(dz) <= NPM.Z_FIX then return cur, false, nil, nil end
+    offAt = offAt or tn
+    if tn - offAt < NPM.Z_FIX_SEC then return cur, false, offAt, nil end
+    if pupFalling and pupFalling() then return cur, false, nil, nil end      -- 替身自己正落下来（起跳的弧）：交给重力
+    return pz + 5.0, true, nil, "fix"
+end
 
 function NPM.parse(text)
     local w = (tostring(text or "")):match("^%s*(%a+)")
@@ -618,7 +651,8 @@ function NPM.readMode(tn)
     end
     -- §226 本地 AI：它的位置是联机程序编的（站你前方 4 米、出招不挪），全程跟网络位置 = 冲刺 / 位移招原地打空气
     -- （内测 11-11："AI 打我的时候原地卡住自己，位移招式过不来"）。对 AI 一律动画带位移（§128 冲过头 2 米停住照旧）
-    local m = NPM.override or ((NET.flagNow("npos") and not NET.rai) and "net" or "anim")
+    local m = (NET.rdummy and NET.rtrainReturn == false) and "anim"
+        or NPM.override or ((NET.flagNow("npos") and not NET.rai) and "net" or "anim")
     if m ~= NPM.mode or not NPM.told then
         NPM.told = true
         out("替身跟随方式：%s（%s）", m == "net" and "全程跟网络位置（动画不带位移）" or "动画带位移（冲过头 2 米停住）",
@@ -632,15 +666,15 @@ end
 function NPM.on() return NPM.mode == "net" end
 
 -- 驱动时记下这一包算出的目标（位置、速度、时刻），每帧从它往前推
-function NPM.setTarget(pup, pos, vel, tn, noExtra, rair)
-    NPM.pup, NPM.pos, NPM.vel, NPM.at, NPM.noExtra, NPM.rair = pup, pos, vel, tn, noExtra, rair
+function NPM.setTarget(pup, pos, vel, tn, noExtra, rair, trav)
+    NPM.pup, NPM.pos, NPM.vel, NPM.at, NPM.noExtra, NPM.rair, NPM.trav = pup, pos, vel, tn, noExtra, rair, trav == true
 end
 
 -- 每帧：这一刻该在的 XY（纯计算，测试用）
 function NPM.aim(tn)
     local p, v = NPM.pos, NPM.vel or {}
     if NPM.noExtra then return { X = p.X, Y = p.Y } end
-    local a = math.min(math.max(tn - NPM.at, 0), NPM.EXTRA_MAX)
+    local a = math.min(math.max(tn - NPM.at, 0), NPM.extraMax or NPM.EXTRA_MAX)
     return { X = p.X + (v.X or 0) * a, Y = p.Y + (v.Y or 0) * a }
 end
 
@@ -662,10 +696,31 @@ function NPM.frame()
     if not cur then return end
     local xy, snap = NPM.stepXY(cur, NPM.aim(tn), dt)
     if snap and PHEAL.young(pup) and (xy.X - cur.X) ^ 2 + (xy.Y - cur.Y) ^ 2 > HOV.FAR ^ 2 then return end   -- §162 刚造的先别扔远处
-    local z = cur.Z
-    if NPM.rair ~= true and math.abs((NPM.pos.Z or z) - cur.Z) > NPM.Z_SNAP then z, snap = NPM.pos.Z + 20.0, true end
+    -- §436 场景动作期间悬空（高度跟包），播完放回走路（悬空等地形加载的 HOV 自己管，不动它）
+    -- （NPM 每个替身一份（PEER.GLOB），travFly 记的就是这个替身自己）
+    local trav = NPM.trav == true and not HOV.has(pup)
+    if trav and not NPM.travFly then
+        NPM.travFly = true
+        G.hover(pup, true)
+    elseif not trav and NPM.travFly then
+        NPM.travFly = nil
+        if not HOV.has(pup) then G.hover(pup, false) end
+    end
+    local xySnap = snap
+    local z, zSnap, why
+    z, zSnap, NPM.zOffAt, why = NPM.stepZ(cur.Z, NPM.pos.Z, dt, tn, NPM.rair, trav, NPM.zOffAt, function()
+        local st = G.airOf(pup)
+        return st ~= nil and st.falling == true
+    end)
+    if zSnap then snap = true end
+    if why == "fix" and NPM.zLogs < NPM.Z_LOG_MAX then
+        NPM.zLogs = NPM.zLogs + 1
+        out("%s替身高度和对方差 %.0f 超过 %.1f 秒，摆到包里的高度（第 %d 次）：%.0f → %.0f（被卡在屋顶 / 台阶下？）；动作 %s",
+            PEER.on and PEER.cur and ("观战 " .. tostring(PEER.cur.tag) .. " ") or "", NPM.pos.Z - cur.Z, NPM.Z_FIX_SEC, NPM.zLogs,
+            cur.Z, z, montageOf(pup))
+    end
     pcall(function() pup:K2_SetActorLocation({ X = xy.X, Y = xy.Y, Z = z }, false, {}, snap) end)
-    if snap and NPM.logs < 20 then
+    if (xySnap or why == "snap") and NPM.logs < 20 then
         NPM.logs = NPM.logs + 1
         -- §223 记全（11-10 观战一次偏差 60 米，当时日志看不出是包里的位置跳了还是外推推飞了）
         local v = NPM.vel or {}
@@ -680,6 +735,15 @@ end
 local function drivePuppet(pup, pos, vel, yaw)
     local cur = try("pup loc", function() return pup:K2_GetActorLocation() end)
     if not cur then return end
+    if NET.rdummy and NET.rtrainReturn == false and not (PEER and PEER.on) then
+        ST.feedLeft, ST.lagSince = 0, nil
+        if RMS.pup ~= pathOf(pup) or RMS.cur ~= 1.0 then
+            RMS.pup, RMS.cur = pathOf(pup), 1.0
+            RMS.set(pup, 1.0)
+        end
+        setYaw(pup, yaw)
+        return 0
+    end
     local dx, dy = pos.X - cur.X, pos.Y - cur.Y
     local dist = math.sqrt(dx * dx + dy * dy)
     -- v0.15.0 实测：只把速度写成 1400 没用，移动组件按 MaxWalkSpeed 截断，替身一直落后 7~8 米、刀全打空。
@@ -832,8 +896,28 @@ end
 -- v0.17.11 试过 HitreactComponent:ChangeHitState（Phantom Pact 的做法）：17:21 实测只改了状态、不播动作，
 -- 替身还一直停在 Normal.Heavy，出招被挡（17:13 那轮大量 返回=false）；PlayHitreactToAvatar 用玩家当攻击来源直接把游戏弄崩了
 -- （17:23:27 dump）。现在照破防同步的做法：挨打方把自己**正在播的受击动作名**发过来，攻击方用 playNamed 在替身上播同一个
+-- 11.24 悬浮盾：本地 AI 被我的招真正击飞 / 打倒（本机游戏给替身播的）时，判定回来不再拿普通受击盖掉，照原版倒地起身。
+-- 以前盖成 Hit_Middle 后 AI 一直站着，悬浮盾第二下（Final）就能再中；真人被击飞起身时会闪掉这一下，在线只中一下（11.23 双开实测）
+-- 11.24 木桩复测（d98ca703）：木桩在挡，第一下是破防 AM_Hun_Break_H_F → 破防挣脱 MoTian_Dodge_B_BanBen2（§356 同一组），
+-- 也被盖成 Hit_Middle、站着吃了 Final。破防 / 破防挣脱同样是本机游戏自己的反应，一并不盖
+-- §428 11-24 名字带受击关键字、其实是出招的动作：虎炮出手 AM_Hun_TigerCannon_Launch_*（游龙头水炮同名）、万钧 AM_Hun_WanJun_Hit_Montage。
+-- 以前发送方出手就发 hr=，收方"对方被打断：替身停招"→ 虎炮不蓄力那一炮偶尔没判定（11-24 14:37:31 远端#968 落空）
+LO.NOT_HIT = { "Cannon_Launch", "WanJun_Hit_Montage" }
+function LO.notHit(m)
+    for _, k in ipairs(LO.NOT_HIT) do if m:find(k, 1, true) then return true end end
+    return false
+end
+
+function LO.isKnockMontage(m)
+    if not m or m == "" or LO.notHit(m) then return false end
+    for _, k in ipairs({ "Launch", "Lying", "GetUp", "Getup", "Knock", "Break", "MoTian_Dodge" }) do
+        if m:find(k, 1, true) then return true end
+    end
+    return false
+end
+
 function LO.isHitMontage(m)
-    if not m or m == "" then return false end
+    if not m or m == "" or LO.notHit(m) then return false end
     for _, k in ipairs({ "_Hit_", "Knock", "Launch", "Lying", "GetUp", "Getup", "Hitreact" }) do   -- §143 马车撞飞后起身是 AM_Hun_Unarmed_Getup_F
         if m:find(k, 1, true) then return true end
     end
@@ -853,6 +937,31 @@ end
 -- 所以改成 AM_Hun_ 开头、名字里带 Medicine 都算
 function LO.isMedMontage(m)
     return m ~= nil and m:find("AM_Hun_", 1, true) == 1 and m:find("Medicine", 8, true) ~= nil
+end
+
+-- §436 场景互动动作（爬墙 / 翻越 / 爬梯 / 贴墙跑 / 跨栏…）。11-24 庞镇观战：对方爬墙，替身只跟着位置挪、没有动作 ——
+-- 状态包只发受击 / 喝药 / 闪避 / 技能内动作，这类动作从没发过。资产（utoc 索引）：Hun/Animation/Interface/Wall_Run/UpRunning
+-- Hun_Wall_Run_Up_{Low,Middle,High}_{Run,Idle}Start(_Mantle)_Montage、Traversal/Mantle/Hun_Traversal_Mantle_Stand_Lfoot_Montage、
+-- SpecialMove/ClimbLadder AM_Hun_Climb_*（+ AM_Hun_Trigger_Ladder）、WallRun Hun_Unarmed_WallRun_*、SideRunning Hun_Unarmed_LedgeRun*、
+-- CrossObstacle Hun_CrossOver_*、DownSliding Hun_Unarmed_SlowFall_*、CloudStep、RopeSwing、AdvancedSpecialMove M_Neutral_Traversal_*
+-- （同一目录里的 Hun_TangBlade_Att_N_D02 是攻击、Hun_GASP_Run_Stop 是普通急停，名字不带下面的词，不会算进来）
+LO.TRV_KEYS = { "Wall_Run", "WallRun", "Traversal", "AM_Hun_Climb", "Trigger_Ladder", "LedgeRun", "CrossOver", "CloudStep",
+                "SlowFall", "RopeSwing", "Mantle" }
+-- §436.1 11-24 17:51 双开复测：爬墙在观战那边还是不对。日志：房主 17:51:52 播 Hun_Wall_Run_Up_Middle_RunStart_Montage、
+-- 17:51:53 才看到技能 GA_SpecialMove_UpRunning_C；收方 :52 照播了动作，:53 又把这个技能当招式让替身放 →"给技能：找不到类"、
+-- 返回=false（放招前那套停招 / 换动作把刚播的爬墙动作打断）。资产：GA_SpecialMove_UpRunning(_Base / _Young) 自己播
+-- Hun_Wall_Run_Up_{Low,Middle,Height}_RunStart / Hun_CrossOver_02（Run_Low / Run_Middle / Run_Height 三档），整段爬墙就是这个动作。
+-- 所以：GA_SpecialMove_* 不当招式发（替身放不出，也不该放）；这类技能挂着时播的动作一律算场景动作（名单外的也发）
+function LO.isSpecialMove(n) return type(n) == "string" and n:find("GA_SpecialMove_", 1, true) ~= nil end
+function LO.specialMoveOn(act)
+    if type(act) ~= "table" then return false end
+    for n in pairs(act) do if LO.isSpecialMove(n) then return true end end
+    return false
+end
+function LO.isTraversalMontage(m)
+    if type(m) ~= "string" or m == "" or m == "-" then return false end
+    for _, k in ipairs(LO.TRV_KEYS) do if m:find(k, 1, true) then return true end end
+    return false
 end
 
 function LO.zmHeal(p1, atkId, dmg)
@@ -1179,7 +1288,7 @@ for _, k in ipairs({ "gcd", "dgc", "sycd" }) do
     NET.FLAG_KEYS[#NET.FLAG_KEYS + 1] = k
     NET.FLAG_DEF[k], NET.flagCfg[k] = 0, 0
 end
-NET.FLAG_NAME.gcd = { "紫冥剑火枪冷却", "ZIMINGJIAN GUN COOLDOWN" }
+NET.FLAG_NAME.gcd = { "紫冥剑火枪冷却", "ZIMINGJIAN GUN COOLDOWN" }   -- §426 11-24 起火枪冷却只看武器平衡：gcd 还收发（旧版兼容），不再生效、面板不显示
 NET.FLAG_NAME.dgc = { "闪避扣杀气", "DODGE COSTS SHACHI" }
 NET.FLAG_NAME.sycd = { "瞬影冷却", "FLASH STEP COOLDOWN" }
 -- §228 stg = 精防硬直（§161：连续被精防 N 次后 X 秒内关输入、播硬直；N / X 跟数值表 co= 的 StaggerHits / StaggerSec 下发）。
@@ -1193,7 +1302,20 @@ NET.FLAG_NAME.stg = { "精防硬直（连续被精防后短时间不能操作）
 NET.FLAG_KEYS[#NET.FLAG_KEYS + 1] = "swk"
 NET.FLAG_DEF.swk, NET.flagCfg.swk = 0, 0
 NET.FLAG_NAME.swk = { "切武器保持杀气（关 = 原版切武器回满）", "KEEP SHACHI ON WEAPON SWITCH (OFF = REFILL AS VANILLA)" }
+-- §423 pdsh = 精防掉对面杀气（用户 11-23"精防防住攻击都可以掉对面杀气 加一个房间设置，默认关，每次掉100杀气"）：
+--   我的招被对方精防 → 我自己扣 pdshv 点杀气（§423.1 房间设置档位，见 RES 段 dif 后面）；对手是本地 AI（杀气按替身，§353）时我精防它 → 扣替身的。
+--   普通房间默认关；武林盟主规则串没写 pdsh= 时也关（base_dif 的 RK_DEF 兜底 0）。PDSH 段在 STG 段后面
+NET.FLAG_KEYS[#NET.FLAG_KEYS + 1] = "pdsh"
+NET.FLAG_DEF.pdsh, NET.flagCfg.pdsh = 0, 0
+NET.FLAG_NAME.pdsh = { "精防掉对面杀气", "PERFECT DEFLECT DRAINS SHACHI" }
 NET.FLAG_OLD = { swk = "bal" }      -- 主机旧版没发这个键时借哪个键的值
+-- 11-23 用户"拿掉"：对手位置严格跟随（npos）没有玩家该关的情况（关了两边替身位置不一致、判定不公平；本地 AI 已自动走
+--   动画带位移，观战强制开），面板不再显示，本机设置固定开：rules.txt 里旧的 npos=0、换房主时接过来的旧版主机 npos=0 都不认。
+--   状态包照旧发 npos=1；客机照旧按主机发来的走（旧版主机关着时两边仍一致）。测试要强制切换用 net/follow.txt（NPM 段）
+NET.FLAG_FIXED = { npos = 1 }
+function NET.flagFix()
+    for k, v in pairs(NET.FLAG_FIXED) do NET.flagCfg[k] = v end
+end
 function NET.flagLoad()
     local t = fileReadKV(NET.AB_FILE) or {}
     for _, k in ipairs(NET.FLAG_KEYS) do
@@ -1201,6 +1323,7 @@ function NET.flagLoad()
         if n == 0 or n == 1 then NET.flagCfg[k] = n end
         if NET.FLAG_LOCKED[k] then NET.flagCfg[k] = 0 end
     end
+    NET.flagFix()
 end
 function NET.flagSet(k, n)
     NET.flagCfg[k] = n
@@ -1353,6 +1476,26 @@ NET.RES_NAME.dif = { "对局难度（精防窗口等按这个难度判）", "MAT
 NET.RES_TEXT.dif = { [0] = { "各用自己存档的", "EACH PLAYER'S OWN" }, [1] = { "入阵者", "WAYFARER" }, [2] = { "破局者", "PATHBREAKER" },
                      [3] = { "逆天者", "HELLWALKER" }, [4] = { "六十六天", "66 DAYS" } }
 NET.RES_MISSING = { dif = 0 }
+-- §423.1 pdshv = 精防掉对面杀气每次扣多少（用户 11-23"加一项，50 / 100 / 150 / 200 四档，默认 100"）。
+--   和开局资源同一套：存 rules.txt、主机定、状态包 pdshv=、客机按主机的、开局定下 MATCH.res.pdshv；武林盟主没写 = 100（base_dif RK_DEF）。
+--   只在"精防掉对面杀气"（pdsh）开着时有用
+NET.RES_KEYS[#NET.RES_KEYS + 1] = "pdshv"
+NET.RES_DEF.pdshv, NET.RES_MAX.pdshv, NET.resCfg.pdshv = 100, 200, 100
+NET.RES_STEPS.pdshv = { 50, 100, 150, 200 }
+NET.RES_NAME.pdshv = { "精防掉杀气数量（每次被精防扣多少）", "SHACHI LOST PER DEFLECT" }
+NET.RES_FMT.pdshv = function(n) return { tostring(n) .. " 点", tostring(n) } end
+-- §422.1 stgm / stgr = 精防硬直锁几秒：被精防的那招是近战 / 远程（用户 11-23"开启这个功能后，近战和远程都可以通过房间设置 1 到 5 秒的时间，默认都是 1 秒"）。
+--   和开局资源同一套：存 rules.txt、主机定、状态包 stgm= / stgr=、客机按主机的、开局定下 MATCH.res；武林盟主没写 = 1（base_dif RK_DEF）。
+--   只在"精防硬直"（stg）开着时有用；远程 / 近战怎么分见 STG.RANGED。数值表 co= 的 StaggerSec 不再用（只留房间设置这一个入口，StaggerHits 照旧）
+for _, k in ipairs({ "stgm", "stgr" }) do
+    NET.RES_KEYS[#NET.RES_KEYS + 1] = k
+    NET.RES_DEF[k], NET.RES_MAX[k], NET.resCfg[k] = 1, 5, 1
+    NET.RES_STEPS[k] = { 1, 2, 3, 4, 5 }
+    NET.RES_FMT[k] = function(n) return { tostring(n) .. " 秒", tostring(n) .. "s" } end
+end
+NET.RES_NAME.stgm = { "精防硬直秒数（近战招）", "DEFLECT STAGGER (MELEE)" }
+NET.RES_NAME.stgr = { "精防硬直秒数（远程招）", "DEFLECT STAGGER (RANGED)" }
+NET.RES_MISSING.stgm, NET.RES_MISSING.stgr = 1, 1     -- 主机旧版没发：旧版默认就是 1 秒
 -- §176 禁用饰品（房间设置 accban=，内测反馈"慈母护符太强"）：饰品 ID 去掉 AC_、逗号隔开（"-" = 一件都不禁），
 -- 只认 STD.ACCESSORIES 里的 66 件、按那个顺序存。全模组默认（普通房间 / 服务器大厅房间 / 武林盟主一样）= 舞扇、慈母护符、古甲残片、百相傩面、神奇刀鞘（§259、11-19 用户"盟主模式的配置就是全 mod 的默认配置"）。
 -- 和 RES 键同一套：存 rules.txt、主机定、客机按主机状态包 accban= 走（没收到 = 默认）、开局时定进 MATCH.res.accban
@@ -1428,6 +1571,7 @@ function NET.svDefApply(on)
         else NET.flagCfg[k] = (NET.svOn and NET.SV_DEF.flag[k] ~= nil) and NET.SV_DEF.flag[k] or NET.FLAG_DEF[k] end
         if NET.FLAG_LOCKED and NET.FLAG_LOCKED[k] then NET.flagCfg[k] = 0 end
     end
+    if NET.flagFix then NET.flagFix() end
     for _, k in ipairs(NET.RES_KEYS) do
         local n = tonumber(t[k])
         if n and NET.resValid and NET.resValid(k, n) then NET.resCfg[k] = n
@@ -2276,6 +2420,7 @@ function STD.gearSync(p1)
     local mid = STD.idOf(LO.heldConfig(p1))
     local sid = STD.idOf(LO.heldConfig(p1, LO.slotShachi()))
     local key = tostring(mid) .. "|" .. tostring(sid)
+        .. (SHADOWPASSIVES and SHADOWPASSIVES.blocked(SHADOWPASSIVES.paths[1]) and "|shadow" or "")
     if key == STD.gearKey then return end
     local have = G.geSet(p1)
     if not have then return end                   -- 读不到身上的效果：下次再试
@@ -2283,8 +2428,10 @@ function STD.gearSync(p1)
     local want, order = {}, {}
     local function addGE(list)
         for _, e in ipairs(list or {}) do
-            if not want[e[1]] then order[#order + 1] = e[1] end
-            if not want[e[1]] or want[e[1]] < e[2] then want[e[1]] = e[2] end
+            if not (SHADOWPASSIVES and SHADOWPASSIVES.blocked(e[1])) then
+                if not want[e[1]] then order[#order + 1] = e[1] end
+                if not want[e[1]] or want[e[1]] < e[2] then want[e[1]] = e[2] end
+            end
         end
     end
     addGE(STD.GEAR.COMMON)
@@ -2293,9 +2440,11 @@ function STD.gearSync(p1)
     local nDel, nAdd, skip = 0, 0, 0
     for path in pairs(STD.gearMine) do
         if not want[path] then
-            LO.removeGE(p1, path, "标准数值：摘掉 30 级效果 " .. STD.geShort(path))
-            STD.gearMine[path] = nil
-            nDel = nDel + 1
+            local allowed = not (SHADOWPASSIVES and SHADOWPASSIVES.blocked(path)) or SHADOWPASSIVES.allowRemove(p1, path)
+            if allowed and LO.removeGE(p1, path, "标准数值：摘掉 30 级效果 " .. STD.geShort(path)) then
+                STD.gearMine[path] = nil
+                nDel = nDel + 1
+            else STD.gearKey = nil end
         end
     end
     for _, path in ipairs(order) do
@@ -2306,10 +2455,13 @@ function STD.gearSync(p1)
             elseif LO.applyGE(p1, path, "标准数值：挂 30 级效果 " .. short, want[path]) then
                 STD.gearMine[path] = true
                 nAdd = nAdd + 1
+            else STD.gearKey = nil
             end
         end
     end
-    out("标准数值（装备）：手上 %s / 影武 %s：挂 30 级效果 %d 个、摘 %d 个，本来就有 %d 个", tostring(mid), tostring(sid), nAdd, nDel, skip)
+    if STD.gearKey or nAdd + nDel > 0 then
+        out("标准数值（装备）：手上 %s / 影武 %s：挂 30 级效果 %d 个、摘 %d 个，本来就有 %d 个", tostring(mid), tostring(sid), nAdd, nDel, skip)
+    end
 end
 -- 对局中（STD.tick 每 2 秒）：手上那格的配置被游戏换回原配置了就再换一次（11-08 实测切武器不会换回，这里是保险）
 function STD.gearCheck(p1)
@@ -2620,7 +2772,32 @@ end
 --   结束后从 0 重新数。两边各自按同一串结果数，所以攻击方本人和防守方屏幕上的替身仍然在同一刀上触发
 local STREAK_RESET = 6.0
 
-local function bumpStreak(side, kind, tn, atkId)
+-- §432 铁拳套【拳挡四方】GA_TieKuangQuanTao_GuardPoint（用户 11-24"经常会被破招，这是格挡技能，理论上不应当被破招"）：
+-- 11-24 IGNIZ 日志 14:06:55–14:07:27：拳挡四方挡住（GpBlock / GpBlock2 → 精防 / 普防，游戏张力会话也记 PerfectDeflect / NormalBlock），
+-- 但攻击方要连续 3 次精防才吃硬直（bumpStreak），攻击方本机屏幕写"你继续攻击，替身在出招 GA_TieKuangQuanTao_GuardPoint_C"，
+-- 下一刀 0.4–1.2 秒后落在拳套的反击动作（Hun_QuanTao_Deflect_A / D）或还在 GpBlock 上 → 挨打方本机照原生掉血、反击被打断（"破招"）。
+-- 原版里拳挡四方挡住后接反击拳（BulletData_TieKuangQuanTao_Counter_01），对手不会接着打。
+-- 改：挡住时挨打方正在拳挡四方 → 不数连续精防，攻击方直接吃一次精防硬直（时长同房间设置，STG.secFor），两边按同一条规则：
+--   挨打方：格挡动作是拳挡四方的 GpBlock / 反击动作；攻击方：替身（= 挨打方）在播这些动作或拳挡四方技能还挂着
+GPD = { GA = "GA_TieKuangQuanTao_GuardPoint_C", logN = 0, LOGS = 30,
+        MONS = { RTGHun_Quan_GpAttack_GpBlock = true, RTGHun_Quan_GpAttack_GpBlock2 = true,
+                 Hun_QuanTao_Deflect_A_Montage = true, Hun_QuanTao_Deflect_D_Montage = true,
+                 Hun_QuanTao_Perfect_Deflect_Attack_03_Montage = true } }
+function GPD.isMon(m) return type(m) == "string" and GPD.MONS[m] == true end
+-- actor 现在是不是在拳挡四方里（动作或技能）
+function GPD.on(actor, m)
+    if GPD.isMon(m) then return true end
+    if not valid(actor) then return false end
+    if GPD.isMon(montageOf(actor)) then return true end
+    local ok, acts = pcall(activeAbilities, actor)
+    return ok and type(acts) == "table" and acts[GPD.GA] ~= nil
+end
+function GPD.log(fmt, ...)
+    GPD.logN = GPD.logN + 1
+    if GPD.logN <= GPD.LOGS then out(fmt, ...) end
+end
+
+local function bumpStreak(side, kind, tn, atkId, atkName, gp)   -- §422 atkName = 这一招的技能名（远程招触发时锁得久）；§432 gp = 挨打方在拳挡四方里
     NET.streak = NET.streak or {}
     local s = NET.streak[side] or { n = 0, at = -100, ids = {}, lockUntil = nil }
     NET.streak[side] = s
@@ -2628,6 +2805,11 @@ local function bumpStreak(side, kind, tn, atkId)
     if s.lockUntil then
         if tn < s.lockUntil then return false, 0 end      -- §230.2 硬直中：不数
         s.lockUntil = nil
+    end
+    if gp and (kind == "parry" or kind == "block") then   -- §432 拳挡四方挡住：攻击方直接吃硬直，不数连续
+        s.n, s.ids, s.at = 0, {}, tn
+        if STG.on() then local sec = STG.secFor(atkName); s.lockUntil = tn + sec; return true, 1, sec end
+        return false, 0
     end
     if kind == "parry" and atkId ~= nil and s.ids[atkId] and tn - s.at <= STREAK_RESET then return false, s.n end   -- §230.2 同一招的后续段
     if kind ~= "parry" or tn - s.at > STREAK_RESET then s.n, s.ids = 0, {} end
@@ -2638,7 +2820,7 @@ local function bumpStreak(side, kind, tn, atkId)
     if s.n >= need then
         local n = s.n
         s.n, s.ids = 0, {}
-        if STG.on() then s.lockUntil = tn + STG.sec(); return true, need end
+        if STG.on() then local sec = STG.secFor(atkName); s.lockUntil = tn + sec; return true, need, sec end
         return false, n
     end
     return false, s.n
@@ -2676,6 +2858,7 @@ local function addResult(kind, attackId, value, tn)
     -- §347 中招 / 落空也把"我精防对方"这一串清零：攻击方收到结果时（applyRemoteResult 的 bumpStreak("atk")）每种结果都会数，
     -- 防守方以前只在精防 / 普防时数，中间夹一下中招两边就数岔了（防守方屏幕上替身吃硬直、对方本人没吃）
     if kind == "hit" or kind == "miss" then bumpStreak("def", kind, tn, attackId) end
+    if kind == "parry" and PDSH and AISYNC and AISYNC.ownShachi and AISYNC.ownShachi() then PDSH.drain(puppet(), "def", attackId, false) end   -- §423 我精防本地 AI：扣替身的（AI 杀气按替身）
     return NET.results[#NET.results]
 end
 
@@ -2695,14 +2878,26 @@ finishDeflect = function(p1, tn)
     local pd = NET.pendDef
     NET.pendDef = nil
     if not pd then return end
-    local kind = pd.drop <= -BLOCK_DROP and "block" or "parry"
+    -- §425 游戏放的是普通防御动作（DefenceNormal）→ 直接定普通防御：这组动作只在游戏判普防时放，比看杀气准
+    --   （杀气在 0.4 秒里没掉的普防以前会被判成精防）；其余格挡动作照旧看杀气
+    local gk = BLK.gameKind(pd, tn)     -- §425.7 先按游戏自己记的结果；读不到再按动作 / 杀气
+    if gk == "none" then                -- §425.9 游戏没判成格挡：窗口还回去
+        NET.judges[#NET.judges + 1] = pd.j
+        return
+    end
+    -- 读不到游戏结果时的兜底（§425.10）：11-23 唐刀实测游戏判精防的 16 次也全是 DefenceNormal 动作，"普通防御动作 = 普防"不成立；
+    --   精防那下常有 +60 的跳涨（精防回杀气），先认它；再按普通防御动作 / 杀气降没降
+    local kind = gk or ((pd.jump >= BLK.PARRY_JUMP and "parry") or ((pd.normal or pd.drop <= -BLOCK_DROP) and "block" or "parry"))
     addResult(kind, pd.j.id, 0, tn)
-    local fire, n = bumpStreak("def", kind, tn, pd.j.id)     -- §230.2 带攻击编号
-    out("  分类依据：动作 %s，杀气最大单步 %+.0f / 最大单步下降 %+.0f → %s%s", pd.m, pd.jump, pd.drop,
-        RES_NAME[kind], kind == "parry" and string.format("（连续第 %d 次）", n) or "")
+    local gp = GPD.isMon(pd.m) or GPD.on(p1)      -- §432 我在拳挡四方里挡住的
+    local fire, n, sec = bumpStreak("def", kind, tn, pd.j.id, pd.j.name, gp)     -- §230.2 带攻击编号；§422 带招名
+    if gp then GPD.log("§432 拳挡四方挡住 远端#%d %s（%s，动作 %s）→ %s", pd.j.id, tostring(pd.j.name), RES_NAME[kind] or kind,
+        tostring(pd.m), fire and "对方直接吃精防硬直（不数连续）" or "精防硬直没开 / 对方还在硬直里") end
+    out("  分类依据：%s动作 %s%s，杀气最大单步 %+.0f / 最大单步下降 %+.0f → %s%s", gk and "游戏记的结果（§425.7）；" or "", pd.m, (not gk and pd.normal and pd.jump < BLK.PARRY_JUMP) and "（普通防御动作）" or "",
+        pd.jump, pd.drop, RES_NAME[kind], kind == "parry" and string.format("（连续第 %d 次）", n) or "")
     if fire then
         -- 我连续精防对方 3 次：我屏幕上的替身吃硬直。对方机器上它的真身收到同样 3 个 parry 后自己吃
-        out("  替身被连续精防 %d 次 → %s", n, staggerOn(puppet(), ST.pupWeapon))
+        out("  替身被连续精防 %d 次（%s，对方锁 %.1f 秒）→ %s", n, tostring(pd.j.name), sec or 0, staggerOn(puppet(), ST.pupWeapon))
     end
 end
 
@@ -2745,12 +2940,97 @@ function BLK.isBreak(m)
     return m ~= nil and (m:find("Deflect_Break", 1, true) or m:find("DeflectBreak", 1, true)) ~= nil
 end
 
+-- §425 刚挨了一下、游戏放的"格挡住"动作（不含格挡被破，那个单独走 §347）：
+--   Deflect = 精防 / 防反类；DefenceNormal = 唐刀 / 青铜剑 / 蛇剑等架势里普通防御挨的那一下（Hun_Tang_DefenceNormal_A–D_Montage、AM_Hun_SlitheringSword_DefenceNormal_*）；
+--   GpBlock = 铁矿拳套 Guard Point 挡住（RTGHun_Quan_GpAttack_GpBlock / 2）。以前只认 Deflect，普通防御挡住全记落空（外部补丁报的，11-22 日志核实）。
+--   不收：AM_Hun_*_DF_/DB_/DH_（举着架势前后左右走）、Special_Defence（鬼柴 / 别离残钩的特殊攻击）、整个 GuardPoint 技能（是攻击）。
+function BLK.isReact(m)
+    if not m or BLK.isBreak(m) then return false end
+    return (m:find("Deflect", 1, true) or m:find("DefenceNormal", 1, true) or m:find("GpBlock", 1, true)) ~= nil
+end
+
+-- §425.5 / §425.7 精防 / 普防按游戏自己记的结果判（只读）：张力系统给"boss"开的会话里有 RecentEvents（OutcomeTag + 游戏时间），
+--   精防记 Defense.PerfectDeflect（含 .PowerAttack）、普防记 Defense.NormalBlock。11-23 本地 AI 对照 18 次：杀气判精防 13 次游戏只认 3 次。
+--   取"这次格挡动作出现前 TEN_PAD 秒到现在"里时间最早的一条 Defense.* 事件：精防 → parry、普防 → block；
+--   没会话 / 窗口里没有 / 是破防等别的结果 → 返回 nil，照旧按杀气判。每次启动前 BLK.TEN_MAX 次写对照日志；net/tension_off.txt 整个关掉
+BLK.TEN_MAX, BLK.tenN, BLK.TEN_PAD = 200, 0, 0.3
+BLK.PARRY_JUMP = 50     -- §425.10 兜底：杀气单步涨这么多算精防（精防回杀气天赋 +60）
+-- 只认格挡类事件（§425.9：NoResponseHit / Grabbed 是挨了别的招，19:13 有 4 次排在真格挡前面被当成"最早一条"）
+BLK.TEN_GUARD = { PerfectDeflect = true, NormalBlock = true, GuardBreak = true, HitWhileBlocking = true }
+function BLK.tenOff()
+    if BLK.tenOffV == nil then
+        local f = io.open(ROOT .. "/net/tension_off.txt", "r")
+        BLK.tenOffV = f ~= nil
+        if f then f:close() end
+    end
+    return BLK.tenOffV
+end
+function BLK.gameKind(pd, tn)
+    if not G.tensionLast or BLK.tenOff() then return nil end
+    local ok, r, why = pcall(G.tensionLast, puppet(), 6)
+    local note
+    local kind
+    if not ok then note = "出错 " .. tostring(r)
+    elseif not r then note = "替身" .. tostring(why)
+    else
+        local now = tonumber(r.now) or 0
+        if BLK.tenUsed and now < (BLK.tenNow or 0) - 1 then BLK.tenUsed = nil end     -- 换图 / 新会话：游戏时间往回走
+        BLK.tenNow = now
+        local from = now - (tn - pd.at) - BLK.TEN_PAD
+        -- 每条事件只给一次判定用（11-23 19:06:27：两招 0.2 秒内先后被挡，第二次又拿到第一次用过的普防）
+        local first
+        for _, e in ipairs(r.ev) do
+            if e.t >= from and (not BLK.tenUsed or e.t > BLK.tenUsed + 0.001) and BLK.TEN_GUARD[e.tag:match("^Defense%.(%a+)") or ""]
+                and (not first or e.t < first.t) then first = e end
+        end
+        if first then
+            BLK.tenUsed = first.t
+            if first.tag:find("^Defense%.PerfectDeflect") then kind = "parry"
+            elseif first.tag == "Defense.NormalBlock" then kind = "block" end
+        end
+        local l = {}
+        for _, e in ipairs(r.ev) do l[#l + 1] = string.format("%s@%.1f", e.tag, e.t) end
+        -- §425.9 有会话、窗口里一条格挡事件都没有 = 游戏没判成格挡（19:11–19:13 六次都是对方打空 Hidden.Whiffed、荡寇按键自己放的格挡动作）
+        --   → 不算防住，窗口还回去照常等（打中按中招、到期记落空）；以前按杀气全判成了精防
+        if not first then kind = "none" end
+        note = string.format("游戏最近 %s（现在 %.1f，从 %.1f 起算）→ %s", table.concat(l, "，"), tonumber(r.now) or -1, from,
+            first and (first.tag .. (kind and "" or "（不是精防 / 普防，按杀气）")) or "窗口里没有格挡事件：游戏没判成格挡，不算防住")
+    end
+    if BLK.tenN < BLK.TEN_MAX then
+        BLK.tenN = BLK.tenN + 1
+        out("§425.7 游戏判定 #%d 远端#%d：%s", BLK.tenN, pd.j.id, note)
+    end
+    return kind
+end
+-- 替身接上输入组件 + 技能输入组件的控制器（和 §140 输入实验同样三步）。11-23 两次都是输入实验接上之后替身才有张力会话，
+-- 改成每回合倒计时就接。返回说明（日志用）
+function BLK.tenAttach(pup)
+    if BLK.tenOff() or not valid(pup) then return nil end
+    local parts = {}
+    if G.inputEnsure then
+        local okE, comp, how = pcall(G.inputEnsure, pup)
+        parts[#parts + 1] = "输入组件 " .. (okE and tostring(how) or ("出错 " .. tostring(comp)))
+    end
+    local aic = rawProp(pup, "Ability Input Component")
+    if valid(aic) and not valid(rawProp(aic, "Controller")) then
+        local ctl = rawProp(pup, "Controller")
+        local okC = valid(ctl) and pcall(function() aic.Controller = ctl end)
+        parts[#parts + 1] = "技能输入组件控制器 " .. (okC and "接上" or "没接上")
+    end
+    return table.concat(parts, "；")
+end
+
+-- §425 游戏判了普通防御才放的动作（精防放的是 Deflect 类）
+function BLK.isNormal(m)
+    return m ~= nil and m:find("DefenceNormal", 1, true) ~= nil
+end
+
 -- 我现在算不算在格挡：返回依据（nil = 不在）。m = 我这一帧的动作名，act = 我挂着的招式技能（NET.prevAbs）
 -- StanceExit = 松开格挡（收架势），不算（§90.1：松开那一下被打中以前被当成格挡中）；格挡被破（§347）也不算
 function BLK.guarding(m, act)
     if m and m:find("StanceExit", 1, true) then return nil end
     if BLK.isBreak(m) then return nil end
-    if m and (m:find("Deflect", 1, true) or m:find("Stance", 1, true)) then return "动作 " .. m end
+    if m and (m:find("Deflect", 1, true) or m:find("Stance", 1, true) or BLK.isReact(m)) then return "动作 " .. m end
     for n in pairs(act or {}) do
         if n:find("Stance", 1, true) or n:find("Deflect", 1, true) then return "技能 " .. n end
     end
@@ -2775,6 +3055,16 @@ function BLK.track(m, tn) BLK.watch(m, NET.prevAbs, tn) end
 function BLK.list(t) return (t and #t > 0) and table.concat(t, " ") or "无" end
 function BLK.ultra(name) return BLK.ULTRA[name or ""] and "（资产标 UltraStrong）" or "" end
 
+-- Corrected, uncompensated loss only; native attack-grade evidence stays in the controller.
+function BLK.guardLoss(p1, j, dmg, tn, m, shNow)
+    if not CTRREC or not LO.isHitMontage(m) then return end
+    local guarding = BLK.on == true and tn >= BLK.at and tn - BLK.at <= BLK.GRACE
+    local breaking = not (type(shNow) == "number" and shNow > 0) or j.brk ~= nil
+        or BLK.isBreak(m) or BLK.ULTRA[j.name or ""] ~= nil or BLK.isCounter(j)
+        or tn - (NET.brkAt or -100) < BLK.BRK_HOLD
+        or (NET.prevAbs and NET.prevAbs.GA_Hun_BreakEscape_C == true)
+    CTRREC.onDamage(p1, tn, dmg, guarding, breaking == true)
+end
 -- netJudge 判出掉血时调（先于软格挡）。mPrev = 上一帧我的动作
 function BLK.onHit(p1, j, dmg, tn, mPrev, m, shPrev, shNow)
     if BLK.n >= BLK.MAX or tn - BLK.at > BLK.GRACE then return end
@@ -2820,7 +3110,7 @@ end
 -- 软格挡时盖受击：m 是受击动作才换；不是（已经被换过，或架势已经重进）就不碰。返回日志用的说明
 function BLK.cover(p1, m, tn)
     BLK.coverUntil = tn + BLK.COVER
-    if m and m:find("Deflect", 1, true) and not BLK.isBreak(m) then return "已经是格挡动作 " .. m end
+    if BLK.isReact(m) then return "已经是格挡动作 " .. m end      -- §425 普通防御 / GpBlock 也算
     if not (LO.isHitMontage(m) or BLK.isBreak(m)) then return "画面上没在受击（" .. ((m and m ~= "") and m or "架势") .. "），不播" end
     local a, ok = BLK.swap(p1, m, tn)
     if not a then return "刚换过" end
@@ -2873,12 +3163,12 @@ function BLK.soften(p1, j, dmg, tn, shNow, shPrev, m)
     BLK.soft = BLK.soft + 1
     local cv = BLK.cover(p1, m or montageOf(p1), tn)
     local r = addResult(kind, j.id, 0, tn)
-    local fire, n = bumpStreak("def", kind, tn, j.id)     -- §230.2 带攻击编号
+    local fire, n, sec = bumpStreak("def", kind, tn, j.id, j.name)     -- §230.2 带攻击编号；§422 带招名
     out("全部可格挡：远端#%d %s%s 格挡中掉血 -%.0f → 软%s（开始格挡 %.2f 秒后挨打%s，补回血，%s），%s（第 %d 次）",
         j.id, j.name or "?", BLK.ultra(j.name), dmg, kind == "parry" and "精防" or "格挡（普防）", since,
         kind == "parry" and string.format("，连续第 %d 次精防", n) or "",
         shTxt, cv, BLK.soft)
-    if fire then out("  替身被连续精防 %d 次 → %s", n, staggerOn(puppet(), ST.pupWeapon)) end
+    if fire then out("  替身被连续精防 %d 次（%s，对方锁 %.1f 秒）→ %s", n, tostring(j.name), sec or 0, staggerOn(puppet(), ST.pupWeapon)) end
     return r
 end
 
@@ -2905,13 +3195,28 @@ end
 function BLK.isCounter(j) return j.brk ~= nil or (j.name ~= nil and j.name:find("Counter", 1, true) ~= nil) end
 
 local function netJudge(p1, tn)
-    while #NET.results > 0 and tn - NET.results[1].at > RES_KEEP do table.remove(NET.results, 1) end
+    if CTRREC then CTRREC.observe(p1, tn) end -- Copy incoming-frame scalars before consumed frames disappear.
+    -- §434 结果按"最后一次变动"起算留 RES_KEEP 秒（r.upd = 追加命中那一刻）。以前按第一下起算：后面的段晚于第一下
+    -- 1.5 秒（实际 1.0–1.2 秒后就赶不上最后几个包）累加进 r.v 也发不出去，攻击方看不到。11-24 墨血无痕：AAA 第一下 -24、
+    -- AAA_02 -125、AAA_03 -273（+1.1 秒），对方只收到前两下；AA 远端#315 本机累计 -69、对方只收到 -16
+    do
+        local rs, n, len = NET.results, 0, #NET.results
+        for i = 1, len do
+            local r = rs[i]
+            if tn - (r.upd or r.at) <= RES_KEEP then
+                n = n + 1
+                if n ~= i then rs[n] = r end
+            end
+        end
+        for i = len, n + 1, -1 do rs[i] = nil end
+    end
     local shNow = attrOf(p1, "Shachi")
     local shPrev = NET.prevSh
     NET.prevSh = shNow
     CAP.flush(NET.lastHit and NET.lastHit.r)          -- §199.9 被吃过跳伤的招结束了 → 记合计
     YQX.fix(p1, tn)                                   -- §361 妖锯妖气爆发只留 5%（在早返回之前：爆发不一定落在招式窗口里）
     HQX.fix(p1, puppet(), tn)                         -- §371 黑魔伤魔剑额外剑气只留 75%（同上，剑气飞过来可能在招式窗口外）
+    if SEG1121 then SEG1121.fix(p1, puppet(), tn) end
     if #NET.judges == 0 and not NET.pendDef and not NET.lastHit
         and not (NET.fighting() and ST.summonArmAt and tn - ST.summonArmAt <= SUMD.FIELD_HOLD) then return end
     local hp = hpOf(p1)
@@ -2919,7 +3224,7 @@ local function netJudge(p1, tn)
     -- §155 回过血（回合开始补满 / 喝药）→ 上一招的多段累加到此为止；倒地动作里掉的血（摔死 / 锁血钳住）不算任何一招打的
     if hp and NET.judgeHp and hp > NET.judgeHp + 0.5 then NET.lastHit = nil end
     if m:find("_Dead", 1, true) then NET.judgeHp = hp; NET.lastHit = nil; return end
-    local newDeflect = m:find("Deflect") ~= nil and m ~= NET.judgeMontage   -- 只认"刚切到格挡动画"那一帧
+    local newDeflect = (BLK.isReact(m) or BLK.isBreak(m)) and m ~= NET.judgeMontage   -- 只认"刚切到格挡动画"那一帧（§425 普通防御 / GpBlock 也算；按住架势不算）
     local mPrev = NET.judgeMontage
     NET.judgeMontage = m
     if #NET.judges > 0 then BLK.track(m, tn) end      -- §87 记最后一次在格挡的时刻
@@ -2960,6 +3265,7 @@ local function netJudge(p1, tn)
             if hcap then hp = NET.judgeHp - hcap end
             local capped = not gun and not sum and CAP.fix(p1, j.name, NET.judgeHp - hp, NET.judgeHp - hp, NET.judgeHp, tn)   -- §197 一招总伤害上限
             if capped then hp = NET.judgeHp - capped end
+            BLK.guardLoss(p1, j, NET.judgeHp - hp, tn, m, shNow)
             NET.lastHit = { r = addResult("hit", j.id, NET.judgeHp - hp, tn), at = tn, name = j.name }
             if capped then NET.lastHit.r.capped, NET.lastHit.r.capName = true, j.name end   -- §199.9 后面的段 / 跳伤按 1 倍门槛
             LAT.learnFrom(j.id, "中招", tn)       -- v0.27.0 追帧：从实际中招学前摇
@@ -2994,7 +3300,12 @@ local function netJudge(p1, tn)
         if hcap then hp = NET.judgeHp - hcap end
         local capped = not gun and not sum and CAP.fix(p1, NET.lastHit.name, NET.judgeHp - hp, r.v + (NET.judgeHp - hp), NET.judgeHp, tn, r)   -- §197
         if capped then hp = NET.judgeHp - capped end
+        BLK.guardLoss(p1, { name = NET.lastHit.name, brk = NET.lastHit.brkM }, NET.judgeHp - hp, tn, m, shNow)
         r.v = r.v + (NET.judgeHp - hp)
+        r.upd = tn                                     -- §434 追加了就重新留 RES_KEEP 秒（见 netJudge 开头）
+        local inRes = false                            -- 已经过期删掉的放回去（下一段晚于 RES_KEEP 才来）
+        for _, x in ipairs(NET.results) do if x == r then inRes = true; break end end
+        if not inRes and r.id then NET.results[#NET.results + 1] = r end
         if not (capped and capped < 0.5) then          -- §199.9 整跳吃掉的不再记"追加 -0"，合计见 CAP.flush
             out("判定 远端#%d → 中招 追加 -%.0f（这招累计 -%.0f）%s", r.atk, NET.judgeHp - hp, r.v, NET.pupAtkNote())
         end
@@ -3023,7 +3334,19 @@ local function netJudge(p1, tn)
         LAT.learnFrom(j.id, "格挡", tn)       -- v0.27.0 追帧：从实际格挡学前摇
         BLK.onBlock(j, m)                     -- §87 格挡探针（对照）
         -- 基准用上一帧的杀气：日志里跳涨常和格挡动作出现在同一帧，用本帧当基准会把跳涨吃掉
-        NET.pendDef = { j = j, at = tn, m = m, lastSh = shPrev or shNow or 0, jump = 0, drop = 0 }
+        NET.pendDef = { j = j, at = tn, m = m, lastSh = shPrev or shNow or 0, jump = 0, drop = 0, normal = BLK.isNormal(m) }
+    end
+    -- §431 只扣杀气、不扣血的命中（幻术琵琶【移商换羽】GA_Lute_Dash 的蓝弹 BD_GA_Hun_Lute_Dash_*_01(_E)：资产里扣血倍率 0、
+    -- 扣杀气 5.28 / 5.81；红弹才扣血）。11-24 14:52 IGNIZ 那边 #634 / #635 / #636 都是受击动作 + 杀气 -159～-165、血不动，
+    -- 到期全判成落空 → 发送方看到"判定丢失"、替身预播的受击被收掉。窗口开着、这一帧没掉血、杀气一下掉了 30 以上
+    -- 且我在播受击动作 → 记在最近开的那个窗口上；到期还没掉过血就记中招 -0（不是落空）
+    if open and not newDeflect and dtick == nil and hp and NET.judgeHp and hp >= NET.judgeHp - 0.5 and shNow and shPrev
+        and shPrev - shNow >= 30 and (LO.isHitMontage(m) or LO.isHitMontage(mPrev or "")) then
+        local j = NET.judges[#NET.judges]
+        if j and not j.shHit then
+            j.shHit = { at = tn, d = shPrev - shNow, m = m }
+            out("§431 远端#%d %s 打中我只扣了杀气 -%.0f（受击 %s，血没掉）→ 记着，到期没掉血就算中招 -0", j.id, j.name or "?", shPrev - shNow, m)
+        end
     end
     local pd = NET.pendDef
     if pd then
@@ -3032,10 +3355,11 @@ local function netJudge(p1, tn)
         if d > pd.jump then pd.jump = d end
         if d < pd.drop then pd.drop = d end
         pd.lastSh = sh
+        if BLK.isNormal(m) then pd.normal = true end    -- §425 观察期里换成普通防御动作也算
         if tn - pd.at >= DEF_OBSERVE then finishDeflect(p1, tn) end
     end
     if dtick ~= "hold" then NET.judgeHp = hp end      -- §381 押着的那一下留到下一帧
-    if NET.lastHit and tn - NET.lastHit.at > JUDGE_WIN and not FJ.holdHit(NET.lastHit, tn) then NET.lastHit = nil end   -- §370 飞剑还在路上接着累加
+    if NET.lastHit and tn - NET.lastHit.at > JUDGE_WIN and not FJ.holdHit(NET.lastHit, tn) and not (CHG.holdHit and CHG.holdHit(NET.lastHit, tn)) then NET.lastHit = nil end   -- §370 飞剑还在路上接着累加；蓄力招替身还在放也接着累加
     local keep, pupM = {}, nil
     for _, j in ipairs(NET.judges) do
         if tn - j.at > JUDGE_WIN and not (j.brkUntil and tn <= j.brkUntil) then      -- §347 格挡被破后至少再等 BRK_KEEP 秒
@@ -3044,6 +3368,9 @@ local function netJudge(p1, tn)
             if LAT.stillPlaying(j.id, tn - j.at, pupM) or CHG.keepJudge(j, tn, pupM) or FJ.keepJudge(j, tn) then keep[#keep + 1] = j   -- §92 蓄力招等松手；§370 紫冥剑飞剑还在路上
             elseif j.brk then
                 out("§347 远端#%d 格挡被破（%s）后 %.2f 秒没掉血 → 记中招 -0（不算精防 / 普防）", j.id, tostring(j.brkM), tn - j.brk)
+                addResult("hit", j.id, 0, tn)
+            elseif j.shHit then
+                out("§431 远端#%d %s 只扣了杀气 -%.0f、没掉血 → 记中招 -0（不算落空）", j.id, j.name or "?", j.shHit.d)
                 addResult("hit", j.id, 0, tn)
             else addResult("miss", j.id, 0, tn) end
         else keep[#keep + 1] = j end
@@ -3055,19 +3382,25 @@ local function applyRemoteResult(p1, r)
     if PEER.on then return end          -- §223 观战替身不收判定结果（p1 是另一个替身）
     local kind = r.kind == "deflect" and "parry" or r.kind     -- v0.9.x 的 deflect 当精防
     local tn = now()
+    if kind == "parry" and PDSH then PDSH.drain(p1, "atk", r.atk, true) end     -- §423 我的招被精防：扣我自己的杀气
     if r.atk then
         NET.resKind = NET.resKind or {}
         NET.resKind[r.atk], NET.resKind[r.atk - 300] = kind, nil
         NET.resAtkTime = NET.resAtkTime or {}
         NET.resAtkTime[r.atk], NET.resAtkTime[r.atk - 300] = tn, nil
     end
-    local fire, n = bumpStreak("atk", kind, tn, r.atk)     -- §230.2 带攻击编号（同一招的后续段不再数）
+    local myAtkName = r.atk and NET.evName and NET.evName[r.atk] or NET.lastMyAtk    -- §422 被判定的是我哪一招（远程招硬直更久）
+    -- §432 对方在拳挡四方里挡住我：我直接吃精防硬直（对方那边 finishDeflect 按同一条规则让替身吃）
+    local gp = (kind == "parry" or kind == "block") and not NET.rai and GPD.on(puppet()) or false
+    local fire, n, stgSec = bumpStreak("atk", kind, tn, r.atk, myAtkName, gp)     -- §230.2 带攻击编号（同一招的后续段不再数）
+    if gp then GPD.log("§432 我的第 #%d 招被对方拳挡四方挡住（%s，替身动作 %s）→ %s", r.atk or -1, RES_NAME[kind] or kind,
+        tostring(montageOf(puppet())), fire and "我直接吃精防硬直（不数连续）" or "精防硬直没开 / 我还在硬直里") end
     -- §104 先和接触时的预测对账：pr.skip = 预测对了、替身已经在播（不重播）；pr.seek = 纠正时从第几秒播起（追帧）
     local pr = PRED.onResult(r, kind, tn)
     if kind == "parry" or kind == "block" then
         -- 我屏幕上代表对方的替身播格挡动作；只有连续第 3 次精防我才吃硬直，其余可以继续打
         -- §230.1 硬直动作按被精防的那一招的武器选（ST.p1Weapon 只认 5 个武器族，拿玉双环时还停在黑伤、播了单刀的 C_Failed）；认不出 = 通用 AM_Hun_Attack_Failed
-        local me = fire and STG.start(p1, NET.lastMyAtk and weaponOfAbility(NET.lastMyAtk), tn) or "继续攻击"     -- §161 / §228 硬直期间关输入
+        local me = fire and STG.start(p1, NET.lastMyAtk and weaponOfAbility(NET.lastMyAtk), tn, stgSec, myAtkName) or "继续攻击"     -- §161 / §228 硬直期间关输入
         local pupTxt
         if pr.skip then
             pupTxt = "替身已经预播了格挡 " .. tostring(pr.m) .. "（预测对了）"
@@ -3094,8 +3427,12 @@ local function applyRemoteResult(p1, r)
         local busy = puppetAttacking(puppet())
         if busy then
             out("◆ 你的第 #%d 招命中对方 -%.0f → 替身正在出招 %s，不播受击（攻击优先）", r.atk, r.v, busy)
+        elseif NET.rdummy and AISYNC and AISYNC.inBreak and AISYNC.inBreak(puppet()) then
+            out("◆ 你的第 #%d 招命中木桩 -%.0f → 木桩格挡被破、在播破防动作，不播受击", r.atk, r.v)     -- 别拿受击盖掉破防
         elseif pr.skip then
             out("◆ 你的第 #%d 招命中对方 -%.0f → 替身已经在播本机受击 %s（预测对了）", r.atk, r.v, tostring(pr.m))
+        elseif NET.rai and LO.isKnockMontage(montageOf(puppet())) then
+            out("◆ 你的第 #%d 招命中本地 AI -%.0f → AI 正在播本机游戏的击飞 / 倒地 / 破防（%s），照原版，不播普通受击", r.atk, r.v, montageOf(puppet()))
         else
             NET.hitSide = NET.hitSide == "R" and "L" or "R"
             local hn = hitNameFor(ST.pupWeapon, NET.hitSide)
@@ -3352,6 +3689,7 @@ function TOUCH.add(id, tn, d)
             local pup, p1 = puppet(), getP1()
             d, yq = YQX.mine(pup, tn, d)
             d = HQX.mine(p1, pup, tn, d)
+            if SEG1121 then d = SEG1121.mine(p1, pup, tn, d, NET.evName[id], id) end
         end
         local add = TOUCH.calc(id, d, tn)
         -- 爆发标签可能下一帧才到：§384 这一下先不进 td=（本地 AI 按累计取最大值，先报全额再扣扣不回来），YQX.minePend 定了再记
@@ -3430,6 +3768,10 @@ function DTICK.aiFlush(tn)
     local s = AIF and AIF.src and AIF.src[p.kind]
     local to, how = nil, nil
     if s and s.id and s.id ~= p.id then to, how = s.id, "持续伤害的来源招"
+    elseif s and s.id == p.id then
+        -- 11.23 实机（火流星磷火龙卷外圈）：木桩只站在外圈、龙卷本体没碰到，被外圈地火点燃，来源就是这一招自己 →
+        -- 以前这里只认"别的招"，跳伤全"找不到来源招，不报"，外圈燃烧等于没生效。这一招点燃了替身就算它碰到了
+        to, how = p.id, "这一招自己点燃的持续伤害"
     else
         local at = -1
         for id, t in pairs(DTICK.contact) do
@@ -3440,7 +3782,8 @@ function DTICK.aiFlush(tn)
     DTICK.ai = DTICK.ai + 1
     DTICK.say("§381 替身掉血 %.0f 是持续伤害跳的（替身%s中，我第 #%d 招 %.2f 秒内没碰到 / 没出受击）→ %s（第 %d 次）",
         p.d, DOT.NAME[p.kind] or p.kind, p.id, tn - p.at,
-        to and string.format("记在%s #%d 上，不算 #%d 碰到", how, to, p.id) or "找不到来源招，不报", DTICK.ai)
+        to == p.id and string.format("记在#%d 上（%s）", to, how)
+            or to and string.format("记在%s #%d 上，不算 #%d 碰到", how, to, p.id) or "找不到来源招，不报", DTICK.ai)
     if to then TOUCH.add(to, tn, p.d) end
 end
 -- 挨打方，netJudge 判定窗口开着时掉血调（j = 最近开的窗口，m = 我这一帧的动作）：
@@ -3515,6 +3858,7 @@ function TOUCH.markBreak(name, tn)
     if not fresh then return false end
     if not (NET.myAtkAt and tn - NET.myAtkAt <= TOUCH.BRK_WIN) then return false end
     TOUCH.mark(tn, nil, true)          -- §388 破防 / 挣脱是新受击，记最近一招（不抢成飞剑）
+    if NET.rdummy and AISYNC and AISYNC.noteBreakId and name:find("Break", 1, true) then AISYNC.noteBreakId(TOUCH.srcId(tn, true), tn) end   -- 木桩普通格挡：这一招打破防了（tbrk=）
     if TOUCH.brkLogs < 30 then
         TOUCH.brkLogs = TOUCH.brkLogs + 1
         out("§356 替身在我这边破防 / 挣脱（%s）→ 算我第 #%d 招碰到了（本地 AI 据此回报）", name, TOUCH.srcId(tn, true))
@@ -3609,6 +3953,7 @@ function TOUCH.watchHp(pup, tn)
     TOUCH.headStep(pup, tn, h)
     if AIF then AIF.step(pup, tn) end                    -- §217 本地 AI：替身身上的持续伤害钉住来源招
     if NET.rai then YQX.minePend(pup, tn); HQX.minePrime(getP1(), pup) end   -- §371 爆发标签晚一帧到 / 我的魔剑刚挂上记底
+    if NET.rai and SEG1121 then SEG1121.minePrime(getP1(), pup) end
 end
 -- §357 驱动那边改替身血量之前先调：上次 watchHp 之后掉的血先记成碰到，再改。
 -- watchHp 在每帧循环里，按对方回报校正（recvOne）/ §301 写满（NET.drive）在驱动里（约 30 次 / 秒）；驱动先跑的那一帧，
@@ -3710,6 +4055,7 @@ function HMISS.onFire(pup, e, tn, tag)
     HMISS.open, HMISS.n = HMISS.open + 1, HMISS.n + 1
 end
 function HMISS.meHit(m)
+    if LO.notHit(m) then return false end         -- §428 我自己虎炮出手不算被碰到
     for _, k in ipairs(HMISS.ME_HIT) do if m:find(k, 1, true) then return true end end
     return false
 end
@@ -3865,6 +4211,11 @@ function PRED.onContact(pup, an, mt, name, tn)
     if not PRED.on then return false end
     local st = PRED.st
     st.contact = st.contact + 1
+    -- 11-24 对方举着拙壁盾：对方那边是盾挡住，不预测受击；返回 false = 调用方照旧掐掉本机受击（SHIELD.onContact 已让替身重摆举盾）
+    if SHIELD and SHIELD.onContact and SHIELD.onContact(pup, tn) then
+        st.shield = (st.shield or 0) + 1
+        return false
+    end
     local busy = PRED.busy(pup, tn)
     if busy then st.busy = st.busy + 1; return false end
     local g = PRED.guarding(tn)
@@ -4214,14 +4565,44 @@ function CTRD.splog(...)
     CTRD.spLogs = CTRD.spLogs + 1
     CTRD.log(...)
 end
+function CTRD.forget()
+    CTRD.monAt, CTRD.monForbid, CTRD.forbidAt, CTRD.holdBad, CTRD.monReadBad = nil, nil, nil, nil, nil
+    CTRD.detailActor, CTRD.detailLast, CTRD.detailAt = nil, nil, nil
+end
+-- Bounded full snapshots only after sustained guard intent, never per normal frame.
+function CTRD.detail(p1, m, tn)
+    if not CTRD.holdBad or tn - CTRD.holdBad < 2 or (CTRD.detailN or 0) >= 12
+        or CTRD.lines >= CTRD.MAX_LINES or tn - (CTRD.detailAt or -100) < 5 then return end
+    local okH, held = pcall(G.holdingInputs, p1, true)
+    if okH and type(held) == "table" and not held.IA_ChangeArmed then return end
+    CTRD.detailAt, CTRD.detailN = tn, (CTRD.detailN or 0) + 1
+    local okA, all = pcall(G.activeAbilities, p1)
+    local function sortedKeys(t, ok)
+        if not ok or type(t) ~= "table" then return "unreadable" end
+        local a = {}
+        for n in pairs(t) do a[#a + 1] = n end
+        table.sort(a)
+        return #a > 0 and table.concat(a, ",") or "none"
+    end
+    CTRD.log("counter guard snapshot: observed=%.1fs montage=%s hp=%s shachi=%s inputLocked=%s held=%s fullAbilities=%s",
+        tn - CTRD.holdBad, tostring(m), tostring(attrOf(p1, "Health")), tostring(attrOf(p1, "Shachi")),
+        tostring(STG.active(tn)), sortedKeys(held, okH), sortedKeys(all, okA))
+end
 -- 常驻防御监视（交手中每秒一次，不依赖红反链）：11-19 伊格尼斯"只有黑魔伤会永久无法防御"——
---   Stance.Forbid 是黑魔伤 SWT / 混沌切形态 / 处决这些技能自己挂的（gasgraph 标签反查），要是技能卡住不结束、
---   标签不撤，就会一直进不了架势。这里只记它出现 / 解除（解除时带挂了多少秒）和"按着格挡键却没进架势"。
+--   gasgraph 显示黑魔伤 SWT / 混沌切形态 / 处决等引用 Stance.Forbid，但不能据此判断谁授予了标签。
+--   这里只记观察到的出现 / 解除和格挡意图；异常持续时补全量活动技能快照，不把松键当成恢复。
 function CTRD.monFrame(p1, m, act, tn)
     if not CTRD.on() then return end
+    if CTRD.monAt and tn < CTRD.monAt then CTRD.forget() end
     if tn - (CTRD.monAt or -100) < CTRD.MON then return end
     CTRD.monAt = tn
-    local tags = G.tagsMatching(p1, CTRD.TAGS) or {}
+    local tags = G.tagsMatching(p1, CTRD.TAGS, true)
+    if type(tags) ~= "table" then
+        if not CTRD.monReadBad then CTRD.log("counter guard monitor: tags unreadable, no state transition inferred") end
+        CTRD.monReadBad, CTRD.holdBad = true, nil
+        return
+    end
+    CTRD.monReadBad = nil
     local set = {}
     for _, t in ipairs(tags) do set[t] = true end
     local forbid = set["CharacterState.AbilityState.Stance.Forbid"] == true
@@ -4236,6 +4617,9 @@ function CTRD.monFrame(p1, m, act, tn)
             (m and m ~= "") and m or "（空）", CTRD.skills(act), tostring(attrOf(p1, "Shachi")),
             hold and "是" or "否", #tags > 0 and table.concat(tags, ",") or "无")
     end
+    local sameActor = CTRD.detailActor == p1 or (G.sameObj and CTRD.detailActor and G.sameObj(CTRD.detailActor, p1))
+    if not sameActor or (CTRD.detailLast and (tn < CTRD.detailLast or tn - CTRD.detailLast > 2.5)) then CTRD.holdBad = nil end
+    CTRD.detailActor, CTRD.detailLast = p1, tn
     if hold and not guard then
         if not CTRD.holdBad then
             CTRD.holdBad = tn
@@ -4243,8 +4627,13 @@ function CTRD.monFrame(p1, m, act, tn)
                 (m and m ~= "") and m or "（空）", CTRD.skills(act),
                 #tags > 0 and table.concat(tags, ",") or "无", tostring(attrOf(p1, "Shachi")))
         end
+        CTRD.detail(p1, m, tn)
     elseif CTRD.holdBad then
-        CTRD.log("§396 防御监视：架势回来了（按着格挡 %.1f 秒没进）", tn - CTRD.holdBad)
+        if guard then
+            CTRD.log("§396 防御监视：架势回来了（按着格挡 %.1f 秒没进）", tn - CTRD.holdBad)
+        else
+            CTRD.log("counter guard monitor: guard intent ended after %.1fs; recovery not observed", tn - CTRD.holdBad)
+        end
         CTRD.holdBad = nil
     end
 end
@@ -4319,11 +4708,48 @@ end
 STG = { DEF = 1.0, untilT = nil, at = 0, dur = nil, name = nil, n = 0, LOGS = 20, locked = false, leak = 0,
         SEC_DEF = 1.0, SEC_MIN = 0.2, SEC_MAX = 10, HITS_DEF = 3, HITS_MAX = 20 }
 function STG.on() return NET.flagNow("stg") end                 -- §228 房间设置"精防硬直"
-function STG.sec()          -- 硬直关输入多少秒：数值表 co= 的 StaggerSec（没写 = 1，2026-11-11 用户定，以前 2），夹在 0.2–10
-    local v = tonumber(BAL.cost("StaggerSec")) or STG.SEC_DEF
+-- §422.1 秒数改成房间设置 stgm（近战）/ stgr（远程），1–5 秒、默认 1：对局中按开局定下的，对局外按房间设置（客机 = 主机的）
+function STG.resSec(k)
+    local v = MATCH and MATCH.res and MATCH.res[k]
+    if not NET.resValid(k, v) then v = NET.resOf(k) end
+    v = tonumber(v) or STG.SEC_DEF
     if v <= 0 then v = STG.SEC_DEF end
     return math.max(STG.SEC_MIN, math.min(STG.SEC_MAX, v))
 end
+function STG.sec() return STG.resSec("stgm") end          -- 近战招触发（以前是数值表 co= 的 StaggerSec，§422.1 起不用）
+-- §422 用户 11-23「精防三次对方硬直，能区分出来对方是近战还是远程招式么 远程的话改为硬直3秒」：
+--   触发硬直的那一招（第 N 次被精防的那招）是远程 / 召唤招 → 锁房间设置 stgr 秒，否则 stgm 秒（§422.1：都是 1–5 秒、默认 1；第一版是数值表、远程默认 3）。
+--   名单 = data/move_table.csv「攻击方式」为远程 / 召唤的招 + tools/balance/rough_tune.py 的 SUMMON_RANGED（§190，平衡表按远程算的同一套），
+--   比较时去掉末尾 _C。两边各按同一招名算：攻击方看自己这招（NET.evName[编号]），防守方看对方这招（判定窗口的 j.name）
+STG.RANGED = {}
+for _, n in ipairs({
+    "GA_CaoOuSiXian_Normal_01", "GA_DuYan_Bow_Laser", "GA_DuYan_Bow_Normal", "GA_HuangJinHuoChong_Dash", "GA_HuangJinHuoChong_DeflectCounter",
+    "GA_HuangJinHuoChong_Normal_02", "GA_HuangJinHuoChong_Normal_04", "GA_Hun_AdvancedDash_Double_Jade", "GA_Hun_BronzeSword_BA",
+    "GA_Hun_BronzeSword_B_Hold", "GA_Hun_BronzeSword_C", "GA_Hun_BronzeSword_SWT", "GA_Hun_Chaos_AAABB_Fire", "GA_Hun_Chaos_AAAB_Fire",
+    "GA_Hun_Chaos_AABB_Fire", "GA_Hun_Chaos_AAB_Fire", "GA_Hun_Chaos_ABB_Fire", "GA_Hun_Chaos_AB_Fire", "GA_Hun_Chaos_BBB_Fire",
+    "GA_Hun_Chaos_BB_Fire", "GA_Hun_Chaos_B_DashDraw", "GA_Hun_Chaos_B_Dash", "GA_Hun_Chaos_B_Draw", "GA_Hun_Chaos_B_Fire", "GA_Hun_Chaos_C",
+    "GA_Hun_Double_JueYing_C_Air", "GA_Hun_Double_JueYing_C", "GA_Hun_FengLeiJian_FengLeiState_SpecailAttack_02", "GA_Hun_GuiTouBlade_B_Hold",
+    "GA_Hun_HeiMoShang_AAAAAB", "GA_Hun_HeiMoShang_AAABB", "GA_Hun_HeiMoShang_AAAB", "GA_Hun_HeiMoShang_AABB", "GA_Hun_HeiMoShang_AAB",
+    "GA_Hun_HeiMoShang_ABB", "GA_Hun_HeiMoShang_AB", "GA_Hun_HeiMoShang_BBB", "GA_Hun_HeiMoShang_BB", "GA_Hun_HeiMoShang_B",
+    "GA_Hun_HeiMoShang_B_DashDraw", "GA_Hun_HeiMoShang_B_Dash", "GA_Hun_HeiMoShang_B_Draw", "GA_Hun_HeiMoShang_C1", "GA_Hun_Horizontal_BladeWave",
+    "GA_Hun_Horizontal_C", "GA_Hun_Jade_AAABB", "GA_Hun_Jade_AAAB", "GA_Hun_Jade_AABB", "GA_Hun_Jade_AAB", "GA_Hun_Jade_A_Snap", "GA_Hun_Jade_BBBB",
+    "GA_Hun_Jade_B_Dash", "GA_Hun_Jade_B_Snap", "GA_Hun_Jade_C_Range", "GA_Hun_Jade_DB", "GA_Hun_Jade_SWT", "GA_Hun_LuanYing_AAAB",
+    "GA_Hun_LuanYing_AAB", "GA_Hun_LuanYing_AB", "GA_Hun_LuanYing_BBB", "GA_Hun_LuanYing_BB", "GA_Hun_LuanYing_B", "GA_Hun_LuanYing_CA",
+    "GA_Hun_LuanYing_P2_AAB", "GA_Hun_LuanYing_P2_AB", "GA_Hun_LuanYing_P2_BBB", "GA_Hun_LuanYing_P2_BB", "GA_Hun_LuanYing_P2_B",
+    "GA_Hun_LuanYing_P2_CA", "GA_Hun_LuanYing_SWT_P1", "GA_Hun_LuanYing_SWT_P2", "GA_Hun_Lute_AAA", "GA_Hun_Lute_AA", "GA_Hun_Lute_A",
+    "GA_Hun_Lute_SKill", "GA_Hun_ShuangYue_DB", "GA_Hun_SnakeDual_DA", "GA_Hun_SnakeDual_DB", "GA_Hun_SnakeDual_PerfectDodge",
+    "GA_Hun_ZiMingJian_New_CCC", "GA_Hun_ZiMingJian_New_CC", "GA_Hun_ZiMingJian_New_DB", "GA_JianKeZhaoJiLing_Normal_01",
+    "GA_KuYeSiZhuChuan_Normal_01", "GA_LionHead_DoubleFireBall", "GA_LionHead_FireBall", "GA_Lute_Dash", "GA_MiaoShouFeiDao_DB",
+    "GA_MiaoShouFeiDao_Normal_01", "GA_MiaoShouFeiDao_Normal_02", "GA_MiaoShouFeiDao_Normal_03", "GA_TanLang_ExtraAttack", "GA_TanLang_Normal",
+    "GA_TanLang_SpeicalAttack", "GA_TigerCannon", "GA_TigerCannon_Dash", "GA_TigerCannon_Ultimate", "GA_UnnamedBow", "GA_UnnamedBow_Dash",
+    "GA_UnnamedBow_DeflectCounter", "GA_YouLongCha_Dash", "GA_YouLongCha_Normal", "GA_YouLongHead_WaterCannon",
+}) do STG.RANGED[n] = true end
+function STG.isRanged(name)
+    if type(name) ~= "string" or name == "" then return false end
+    return STG.RANGED[(name:gsub("_C$", ""))] == true
+end
+function STG.secRanged() return STG.resSec("stgr") end    -- §422.1 远程招触发：房间设置 stgr
+function STG.secFor(name) return STG.isRanged(name) and STG.secRanged() or STG.sec() end
 function STG.need()         -- 连续精防几次触发：数值表 co= 的 StaggerHits（没写 = 3），1–20 的整数
     local v = math.floor(tonumber(BAL.cost("StaggerHits")) or STG.HITS_DEF)
     if v < 1 then v = STG.HITS_DEF end
@@ -4331,14 +4757,14 @@ function STG.need()         -- 连续精防几次触发：数值表 co= 的 Stag
 end
 function STG.active(tn) return STG.untilT ~= nil and tn < STG.untilT and NET.fighting() end
 -- 第 N 次精防触发时调（代替 staggerOn）：播硬直、关输入、记锁到什么时候；返回日志里的一句
-function STG.start(p1, weaponId, tn)
+function STG.start(p1, weaponId, tn, sec, atkName)   -- §422 sec = 这次锁几秒（按触发那招近战 / 远程算），nil = STG.sec()
     if STG.active(tn) then          -- §230.2 已经在硬直里：不重播、不重新计时（以前连着触发能锁 7–8 秒）
         return string.format("已经在硬直里（还剩 %.2f 秒），不重新计时", STG.untilT - tn)
     end
     local name = staggerNameFor(weaponId)
     local asset = montageByName(name)
     local dur = asset and valid(p1) and playOn(p1, asset)
-    local sec = STG.sec()
+    sec = sec or STG.sec()
     STG.name, STG.at, STG.dur = dur and name or nil, tn, dur or nil
     STG.untilT = tn + sec              -- §228 播不出动作也照样锁（锁的是输入，不靠动作）
     local how
@@ -4349,7 +4775,8 @@ function STG.start(p1, weaponId, tn)
         STG.locked = ok and true or false
         how = ok and "已关输入" or ("!! 关输入失败（" .. tostring(err) .. "），只靠事后取消")
     end
-    return string.format("硬直 %s（武器 %s）%s，%.2f 秒内%s", name, tostring(weaponId),
+    return string.format("硬直 %s（武器 %s，触发招 %s%s）%s，%.2f 秒内%s", name, tostring(weaponId), tostring(atkName),
+        STG.isRanged(atkName) and "，远程" or "",
         dur and string.format("已播（动作 %.2f 秒）", dur) or "动作没播出来", sec, how)
 end
 -- §228 到时间 / 离开交手 / 换世界后：开回输入（失败就下一帧再试），清掉按着的键
@@ -4401,6 +4828,42 @@ function STG.check(p1, name, tn)
             back, STG.n)
     end
     return true
+end
+
+-- ============================================================ §423 精防掉对面杀气（房间设置 pdsh，默认关）
+-- 每台电脑只改自己身上的：我的招被对方精防（applyRemoteResult 收到 parry）→ 扣我的；对手是本地 AI 时 AI 杀气按替身（§353），我精防它 → 扣替身的。
+-- 同一招（攻击编号）只扣一次（多段招每段都可能回报精防）。杀气不够扣到 0。走游戏改属性函数（DCD.setSh = AttributeUtils，§113.1），
+-- 扣我自己的计进 DCD.debit，免得"切武器保持杀气"把这一下当成跳变
+PDSH = { LOGS = 30, logs = 0, n = 0, done = {}, DEF = 100, CAP = 1000 }
+function PDSH.on() return NET.flagNow("pdsh") and NET.fighting() end
+function PDSH.amt()        -- §423.1 房间设置档位：对局中按开局定下的，对局外按房间设置（客机 = 主机的）
+    local v = MATCH.res and MATCH.res.pdshv
+    if not NET.resValid("pdshv", v) then v = NET.resOf("pdshv") end
+    v = tonumber(v) or PDSH.DEF
+    return math.floor(math.max(0, math.min(PDSH.CAP, v)))
+end
+function PDSH.drain(actor, side, atkId, mine)
+    if not PDSH.on() or not valid(actor) then return end
+    local key = side .. ":" .. tostring(atkId)
+    if atkId ~= nil and PDSH.done[key] then return end
+    local cost = PDSH.amt()
+    if cost <= 0 then return end
+    local sh = attrOf(actor, "Shachi")
+    if not sh then return end
+    if atkId ~= nil then
+        PDSH.n = PDSH.n + 1
+        if PDSH.n % 200 == 0 then PDSH.done = {} end     -- 别越攒越多
+        PDSH.done[key] = true
+    end
+    local new = math.max(0, sh - cost)
+    local ok, msg = true, nil
+    if new < sh then ok, msg = DCD.setSh(actor, new) end
+    if ok and mine then DCD.debit = (DCD.debit or 0) + (sh - new) end
+    if PDSH.logs < PDSH.LOGS or not ok then
+        PDSH.logs = PDSH.logs + 1
+        out("§423 精防掉杀气：%s #%s → %s杀气 %.0f → %.0f（扣 %d）%s", mine and "我的招被精防" or "我精防了本地 AI", tostring(atkId),
+            mine and "我" or "替身", sh, ok and new or sh, cost, ok and "" or ("，!! 没写进去：" .. tostring(msg)))
+    end
 end
 
 -- ============================================================ §173.7 倒计时只能移动、不能出招
@@ -4530,6 +4993,585 @@ function SHIELD.watchMine(p1)
     SHIELD.mine = held
 end
 
+-- ------------------------------------------------------------ 11-23 举盾在对方视角撑不住（用户"对面的拿盾牌没能在本地正常显示"）
+-- 日志 15:20:07 / 15:20:31 / 15:21:08：替身放出 GA_ZhuoBiDun_C，0.71 秒就播收盾 Exit、1.5–2.2 秒技能结束（盾跟着收），
+-- 对方实际举了 15 / 34 秒。原因同 §140：替身没有输入组件，技能里 IsHolding 一开始就是 false。§407 兜底每 1.2 秒重播举盾动作，
+-- 画面是"举一下放一下"、手里没盾，9 秒后什么都不补。
+-- 做法（只补画面，不碰技能逻辑 / 判定 / 伤害）：替身一进收盾动作，就拉回收盾第一帧暂停——技能要等收盾播完才结束，
+-- 盾和技能就一直留着；对方松手（rel=）/ 放了下一招 / 超过 HOLD_MAX 秒 → 继续播收盾，技能照常收掉。
+-- 暂停的动作被闪避 / 受击打断、技能已经没了 → 只补姿势：重播举盾，举到位停住（盾不一定在手上，日志里写清楚）
+SHIELD.HOLD_MAX, SHIELD.ENTRY_HOLD, SHIELD.RETRY, SHIELD.HLOGS = 45.0, 0.35, 1.0, 40
+SHIELD.ENTRY = "Hun_ShaChi_ZhuoBiDun_Entry_Montage"
+SHIELD.hold, SHIELD.hn, SHIELD.lastId = {}, 0, {}
+function SHIELD.key(pup) local ok, p = pcall(pathOf, pup); return ok and p or tostring(pup) end
+function SHIELD.hlog(fmt, ...)
+    SHIELD.hn = SHIELD.hn + 1
+    if SHIELD.hn <= SHIELD.HLOGS then out(fmt, ...) end
+end
+function SHIELD.isExit(m) return type(m) == "string" and m:find("ZhuoBiDun_Exit", 1, true) ~= nil end
+function SHIELD.isEntry(m) return type(m) == "string" and m:find("ZhuoBiDun_Entry", 1, true) ~= nil end
+function SHIELD.fighting() return (NET and NET.fighting and NET.fighting()) and true or false end
+-- 替身放出对方的举盾（CHG.onFire 调）
+function SHIELD.onFire(pup, e, tn)
+    if not (e and e.id and SHIELD.is(e.name)) then return end
+    SHIELD.hold[e.id] = { id = e.id, name = e.name, at = tn, pup = pup, entryN = 0, fight = SHIELD.fighting() }
+    SHIELD.hold[e.id - 300] = nil
+    SHIELD.lastId[SHIELD.key(pup)] = e.id     -- 盾反 / 盾推 / 盾冲的判定窗口记在这一招上（多人房按替身分开）
+    local f = CHG and CHG.fired and CHG.fired[e.id]
+    if f then f.spin = nil end          -- 不走 §407 续转（它每 1.2 秒重播举盾，会和这里的暂停打架）
+end
+-- 对方不再举着的原因；还举着返回 nil
+function SHIELD.stopWhy(h, tn)
+    local secs = CHG and CHG.rel and CHG.rel[h.id]
+    if secs and tn >= h.at + secs then return string.format("对方松手（按了 %.2f 秒）", secs) end
+    local nf = CHG and CHG.movedOn and CHG.movedOn(h.pup, h.id, h)
+    if nf then return string.format("对方放了下一招 远端#%d %s", nf.id, nf.name) end
+    if tn - h.at >= SHIELD.HOLD_MAX then return string.format("举了超过 %.0f 秒", SHIELD.HOLD_MAX) end
+    local fz = SHIELD.fighting()
+    if fz ~= h.fight then return fz and "回合开打" or "交手结束" end      -- 回合切换不把举盾带过去
+    return nil
+end
+-- 多人房每个对手一份 CHG（PEER.run 里驱动），这里只看当前这个替身的记录（CHG.rel / movedOn 是它那份）
+function SHIELD.holdStep(tn)
+    local cur = puppet()
+    for id, h in pairs(SHIELD.hold) do
+        if valid(h.pup) and cur ~= nil and not sameObj(h.pup, cur) then
+            -- 别的对手的举盾：等驱动它那一份时再看
+        elseif valid(h.pup) then
+            local ok, err = pcall(SHIELD.holdOne, h, tn)
+            if not ok then SHIELD.hold[id] = nil; SHIELD.hlog("举盾保持出错（远端#%d）：%s", id, tostring(err)) end
+        else
+            SHIELD.hold[id] = nil
+        end
+    end
+end
+function SHIELD.holdOne(h, tn)
+    local pup = h.pup
+    local _, _, m, pos = LAT.activeMontage(pup)
+    m = m or ""
+    local stop = SHIELD.stopWhy(h, tn)
+    if stop then
+        SHIELD.hold[h.id] = nil
+        -- §439 替身按着的影武键松开（rel= 到点时 pupStep 已经松过，这里只管下一招 / 超时 / 回合切换；没按着的什么都不做）
+        if INP and INP.done then INP.done(h.id, stop) end
+        local resumed = false
+        if h.paused and m == h.pausedM then resumed = G.montagePause(pup, false) and true or false end
+        SHIELD.hlog("举盾保持：远端#%d %s，替身停了 %.2f 秒%s", h.id, stop, (h.pausedSum or 0) + (h.paused and (tn - h.pausedAt) or 0),
+            h.paused and (m == h.pausedM and (resumed and "，继续播 " .. m or "，继续播失败") or ("，暂停的动作已换成 " .. (m ~= "" and m or "（没动作）"))) or "")
+        return
+    end
+    if h.paused then
+        if m ~= h.pausedM then           -- 被闪避 / 受击 / 别的动作打断
+            h.paused = false
+            h.pausedSum = (h.pausedSum or 0) + (tn - h.pausedAt)
+            SHIELD.hlog("举盾保持：远端#%d 停住的 %s 被 %s 打断（放出后 %.2f 秒）", h.id, h.pausedM, m ~= "" and m or "（没动作）", tn - h.at)
+        end
+        return
+    end
+    if SHIELD.isExit(m) then
+        -- 替身自己松手了：拉回收盾第一帧停住
+        local okP = G.montageSetPos(pup, 0)
+        local ok = G.montagePause(pup, true)
+        local alive = LO.activeInstance and LO.activeInstance(pup, h.name) and true or false
+        if ok then h.paused, h.pausedM, h.pausedAt = true, m, tn end
+        SHIELD.hlog("举盾保持：远端#%d 替身进了收盾（放出后 %.2f 秒，位置 %.2f）→ 拉回第一帧%s、暂停%s；技能%s", h.id, tn - h.at,
+            pos or -1, okP and "成功" or "失败", ok and "成功" or "失败", alive and "还在（盾留着）" or "已经没了")
+        return
+    end
+    if SHIELD.isEntry(m) and h.entryAt then
+        -- 只补姿势：重播的举盾动作举到位就停住
+        if tn - h.entryAt >= SHIELD.ENTRY_HOLD then
+            h.entryAt = nil
+            local ok = G.montagePause(pup, true)
+            if ok then h.paused, h.pausedM, h.pausedAt = true, m, tn end
+            SHIELD.hlog("举盾保持：远端#%d 替身技能已经没了 → 重播举盾停在 %.2f（暂停%s，第 %d 次；盾可能不在手上）", h.id, pos or -1,
+                ok and "成功" or "失败", h.entryN)
+        end
+        return
+    end
+    if m == "" and tn - h.at > 0.5 and tn >= (h.retryAt or 0) then
+        h.retryAt = tn + SHIELD.RETRY
+        if playNamed(pup, SHIELD.ENTRY) then h.entryAt, h.entryN = tn, h.entryN + 1 end
+    end
+end
+
+-- ------------------------------------------------------------ 11-23 盾反 / 盾推 / 盾冲（举盾技能里面按键出的招）
+-- 这三招都是 GA_ZhuoBiDun 自己的时间线（运行时导出 PBZ_GasDump/actions_byclass.jsonl）：
+--   CounterAttack(_02) 播 Hun_ZhuoBi_SpecialAttack_01_A_Montage + 判定 BD_ZhuoBiDun_CounterAttack_KnockBack（_02 = 双重反击升级，数值一样）
+--   Push_F 播 Hun_ShaChi_ZhuoBiDun_Skill_01_Montage + BD_ZhuoBiDun_Push_Body_Small、BD_ZhuoBiDun_KnockBack
+--   Rush_F 播 Hun_ShaChi_ZhuoBiDun_Skill_02_Montage + BD_ZhuoBiDun_Rush_Body_Small ×5、BD_ZhuoBiDun_Rush_Finish
+-- 不是新技能、也不是闪避 / 受击动作，以前对方那边根本不发。现在：
+--   发：举盾中动作换成这三个之一 → 走 sub=（§111 技能内动作同一个字段）
+--   收：替身照播动作 + 按下面的时间用替身的举盾技能生成判定（§229.5 红光直接播同一套 G.laserEmitterSpawn），
+--       每个判定开一个判定窗口（记在对方举盾那一招的编号上），伤害系数按拙壁盾（BAL.onFire）。
+--   判定时间是按时间线的前摇估的（资产里没有开始时间），实测看"盾反判定"日志再调
+SHIELD.BD = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/ShachiWeapon/ZhuoBiDun/"
+function SHIELD.bd(n) return SHIELD.BD .. n .. "." .. n end
+SHIELD.SUB = {
+    Hun_ZhuoBi_SpecialAttack_01_A_Montage = { what = "盾反", bul = { { 0.30, "BD_ZhuoBiDun_CounterAttack_KnockBack" } } },
+    Hun_ShaChi_ZhuoBiDun_Skill_01_Montage = { what = "盾推", bul = { { 0.18, "BD_ZhuoBiDun_Push_Body_Small" }, { 0.30, "BD_ZhuoBiDun_KnockBack" } } },
+    Hun_ShaChi_ZhuoBiDun_Skill_02_Montage = { what = "盾冲", bul = { { 0.18, "BD_ZhuoBiDun_Rush_Body_Small" }, { 0.52, "BD_ZhuoBiDun_Rush_Body_Small" },
+        { 0.86, "BD_ZhuoBiDun_Rush_Body_Small" }, { 1.20, "BD_ZhuoBiDun_Rush_Body_Small" }, { 1.54, "BD_ZhuoBiDun_Rush_Body_Small" },
+        { 1.90, "BD_ZhuoBiDun_Rush_Finish" } } },
+}
+SHIELD.FWD, SHIELD.GAP, SHIELD.AIM_Z, SHIELD.SLOGS = 100.0, 40.0, 80.0, 40
+SHIELD.pend, SHIELD.sn, SHIELD.subN = {}, 0, 0
+function SHIELD.isSub(m) return type(m) == "string" and SHIELD.SUB[m] ~= nil end
+function SHIELD.slog(fmt, ...)
+    SHIELD.sn = SHIELD.sn + 1
+    if SHIELD.sn <= SHIELD.SLOGS then out(fmt, ...) end
+end
+-- 发送方：netSend 看到我的动作换成新的一个时调；是这三招之一返回 true（调用方发 sub=）
+function SHIELD.mineSub(hm, prev)
+    return hm ~= prev and SHIELD.isSub(hm)
+end
+-- 11-24 盾反判定时间：资产 GA_ZhuoBiDun CounterAttack 的 LGAAction_DurationBulletWithDeflect PreHitPointDuration = 0.3（和 SUB 表一致），
+-- 但那是从对方播动作算起；这边收到 sub= 时已经晚了一个包龄（日志"包龄中位 67–116 ms"），以前再从收到起等满 0.30 秒。
+-- 现在判定提前包龄（最多 AGE_MAX），动作也往后跳同样的秒数，判定和对方屏幕上的出手对齐。没有时间戳（旧版对方）= 不补
+SHIELD.AGE_MAX, SHIELD.AGE_MIN_LEAD = 0.20, 0.03
+-- 收：对方 sub= 是这三招之一（NET.recvOne 调）。age = 这一包的包龄（秒，没有 = nil）
+-- （SHIELD.onContact 在下面"每帧"那段前；它返回 true 时 PRED.onContact 返回 false，由 suppressLocalReact 照旧掐掉本机受击）
+function SHIELD.onSub(p1, pup, sm, tn, age)
+    local sc = SHIELD.SUB[sm]
+    if not (sc and valid(pup)) then return end
+    SHIELD.subN = SHIELD.subN + 1
+    local id = SHIELD.lastId[SHIELD.key(pup)] or 0
+    montageByName(sm, true)
+    pcall(G.facePlayer, pup)
+    local okP = playNamed(pup, sm)
+    local lag = (type(age) == "number" and age > 0) and math.min(age, SHIELD.AGE_MAX) or 0
+    if okP and lag > 0 then pcall(LAT.setPos, pup, lag) end
+    local f = CHG and CHG.fired and CHG.fired[id]
+    if f and f.mon then f.mon[sm] = true end
+    -- 读秒里不出伤害：只播动作（多人房 / 观战照常生成，和替身放别的招一样；判定窗口 openJudge 自己看 PEER.on）
+    local why = (CDL and CDL.active and CDL.active()) and "读秒里不出伤害" or nil
+    if not why and BAL and BAL.onFire and BAL.onFire("GA_ZhuoBiDun_C", tn) and LO.rescale then LO.rescale(pup, tn) end
+    if not why then
+        for i, b in ipairs(sc.bul) do
+            local d = math.max(SHIELD.AGE_MIN_LEAD, b[1] - lag)
+            SHIELD.pend[#SHIELD.pend + 1] = { t = tn + d, bd = b[2], pup = pup, id = id, n = i, total = #sc.bul, what = sc.what, t0 = tn }
+        end
+    end
+    SHIELD.slog("盾反同步：对方%s %s → 替身%s；%s（记在远端#%d 上；包龄 %s，判定提前 %.2f 秒）", sc.what, sm, okP and "已播" or "播放失败",
+        why or string.format("排了 %d 个判定", #sc.bul), id, type(age) == "number" and string.format("%.0f ms", age * 1000) or "不知道", lag)
+end
+-- 到点生成判定
+function SHIELD.subStep(tn)
+    if #SHIELD.pend == 0 then return end
+    local keep, p1 = {}, getP1()
+    for _, q in ipairs(SHIELD.pend) do
+        if tn < q.t then keep[#keep + 1] = q
+        elseif valid(q.pup) then
+            local ok, err = pcall(SHIELD.spawnOne, p1, q, tn)
+            if not ok then SHIELD.slog("  盾反判定 %s 出错：%s", q.bd, tostring(err)) end
+        end
+    end
+    SHIELD.pend = keep
+end
+function SHIELD.spawnOne(p1, q, tn)
+    local bd = G.findOrLoad and G.findOrLoad(SHIELD.bd(q.bd)) or nil
+    local okL, l = pcall(function() return q.pup:K2_GetActorLocation() end)
+    local okP, pl = false, nil
+    if valid(p1) then okP, pl = pcall(function() return p1:K2_GetActorLocation() end) end
+    local src, srcWay = nil, "没有技能对象"
+    if DIAG and DIAG.PDX then src, srcWay = DIAG.PDX.src(q.pup, "GA_ZhuoBiDun_C") end
+    local at, yaw, pitch, dist = nil, yawOf(q.pup) or 0.0, 0.0, nil
+    if okL and l then
+        if okP and pl then
+            local dx, dy = pl.X - l.X, pl.Y - l.Y
+            dist = math.sqrt(dx * dx + dy * dy)
+            local adv = math.min(SHIELD.FWD, math.max(0.0, dist - SHIELD.GAP))
+            local ux, uy = (dist > 1e-3) and dx / dist or math.cos(math.rad(yaw)), (dist > 1e-3) and dy / dist or math.sin(math.rad(yaw))
+            at = { X = l.X + ux * adv, Y = l.Y + uy * adv, Z = pl.Z + SHIELD.AIM_Z }
+            yaw = math.deg(math.atan(uy, ux))
+        else
+            local r = math.rad(yaw)
+            at = { X = l.X + math.cos(r) * SHIELD.FWD, Y = l.Y + math.sin(r) * SHIELD.FWD, Z = l.Z + SHIELD.AIM_Z }
+        end
+    end
+    local em, how
+    if bd and at then
+        local okS, a, b2 = pcall(G.laserEmitterSpawn, src, q.pup, at, { Pitch = pitch, Yaw = yaw, Roll = 0.0 }, bd)
+        if okS then em, how = a, b2 else how = "出错 " .. tostring(a) end
+    else
+        how = bd and "读不到替身位置" or "找不到判定数据"
+    end
+    if em and q.id > 0 then openJudge(p1, q.id, tn, "GA_ZhuoBiDun_C") end
+    SHIELD.slog("  盾反判定 %s（%s 第 %d/%d 个，+%.2f 秒）：%s（%s；来源 %s；距离 %s）", q.bd, q.what, q.n, q.total, tn - q.t0,
+        em and "生成了" or "没生成", tostring(how), tostring(srcWay), dist and string.format("%.0f", dist) or "?")
+end
+-- 11-24 我的刀在本机碰到举着盾的替身（PRED.onContact 最先问）：对方那边是盾挡住（本机 14:08:06–09 替身停在收盾帧时，
+-- 我的木剑连击被预测成"对方没在格挡 → 留着本机受击"，替身一直播 Hit_*、举盾被打断、技能没了；对方本机同一段是盾挡掉、
+-- 杀气 -33 / -30 …，4 秒后盾反）。对方举着盾时不留本机受击（这里返回 true → PRED.onContact 返回 false → 照旧掐掉），并让举盾保持马上重摆举盾姿势
+-- （不等 RETRY）。对方真被打断时 hr= 会照常让替身播受击，不受影响
+SHIELD.cn = 0
+function SHIELD.holdingFor(pup)
+    for _, h in pairs(SHIELD.hold) do
+        if valid(h.pup) and sameObj(h.pup, pup) then return h end
+    end
+    return nil
+end
+function SHIELD.onContact(pup, tn)
+    if not next(SHIELD.hold) then return false end
+    local h = SHIELD.holdingFor(pup)
+    if not h or SHIELD.stopWhy(h, tn) then return false end
+    h.retryAt = 0
+    SHIELD.cn = SHIELD.cn + 1
+    if SHIELD.cn <= 20 or SHIELD.cn % 25 == 0 then
+        SHIELD.hlog("举盾保持：远端#%d 我的刀在本机碰到举盾的替身 → 不留本机受击，按盾挡住处理（第 %d 次）", h.id, SHIELD.cn)
+    end
+    return true
+end
+
+-- 每帧（CHG.step 调）：举盾保持 + 盾反判定。都空的时候什么都不做
+function SHIELD.step(tn)
+    if next(SHIELD.hold) then SHIELD.holdStep(tn) end
+    if #SHIELD.pend > 0 then SHIELD.subStep(tn) end
+end
+
+-- ------------------------------------------------------------ §434 泥头车【力荡四方】（处决键最后一击）在线同步
+-- 11-24 两边日志（房主 IGNIZ 开车打客机）：力荡在发送方是马车技能 GA_HorseCart_Charge 里按处决键（IA_Execution 增强输入事件）
+-- 出的一招：动作 AM_DriveHorseCart（升级 EnableTurnAttack）+ 判定 BulletData_TurnAttack = BD_NiTouChe_Overlap_TurnAttack，
+-- 打木桩那一下 -703（普通冲撞 -469，13:41:11–12）。替身没有玩家控制器，增强输入事件根本收不到，等松手任务在
+-- 1.86 秒（CanRelease）自己就下车了（收方 14:01:29 / 37 / 57 三次都是 GetOn → 1.86 秒 JumpOff，没有 DriveHorseCart），
+-- 以前也不发 sub= → 收方从来没出过力荡的判定。现在：
+--   发：马车里动作换成 AM_DriveHorseCart → sub=（§111 同一个字段；旧版收方不认识，忽略）
+--   收：用替身的马车技能实例（没了退技能默认对象）在替身身上生成 BD_NiTouChe_Overlap_TurnAttack（同盾反 G.laserEmitterSpawn），
+--       伤害记在这一招马车上（还在累加就走追加命中，不然开判定窗口）；对方下车的 rel= 晚到 KEEP 秒内先不取消替身技能
+--   判定位置 / 范围是估的（原版挂在车上），实测看日志"力荡同步"
+CART = { GA = "GA_HorseCart_Charge_C", MON = "AM_DriveHorseCart", KEEP = 1.2, LOGS = 30, n = 0,
+         BD = "/PBZCombatAsset/ActorData/Players/Hun/BulletData/NiTouChe/BD_NiTouChe_Overlap_TurnAttack.BD_NiTouChe_Overlap_TurnAttack" }
+function CART.log(fmt, ...)
+    CART.n = CART.n + 1
+    if CART.n <= CART.LOGS then out(fmt, ...) end
+end
+function CART.isSub(m) return m == CART.MON end
+CART.CART_MON, CART.CART_KEY = "ShaChi_HorseCart_Armed_Skill01_Montage", "HorseCart"
+function CART.spinCart(pup, id)
+    local mt = montageByName(CART.CART_MON, true)
+    if not mt then CART.log("力荡同步：远端#%d 车的动作 %s 不在内存里（没播）", id, CART.CART_MON); return end
+    local comp, how = nil, "没有 G.vehicleMesh"
+    if G.vehicleMesh then comp, how = G.vehicleMesh(pup, CART.CART_KEY) end
+    if not comp then CART.log("力荡同步：远端#%d 找不到替身的车（%s）", id, tostring(how)); return end
+    local len, why = G.playOnMesh(comp, mt)
+    CART.log("力荡同步：远端#%d 车播 %s → %s（车：%s）", id, CART.CART_MON,
+        len and string.format("成功 %.2f 秒", len) or ("没成 " .. tostring(why)), tostring(how))
+    return len
+end
+
+-- §442 力荡判定收不掉（11-25 用户"对方放完马车后身上有残留攻击判定，我靠近就被打死了，无论是否在对决里"）：
+-- 收方日志 15:59:58 / 16:00:12（结算倒计时里）/ 16:03:18 / 16:04:28 / 16:05:44 都是 -1920.4，马车早结束、对方也没回报，
+-- 就是 §434 在替身位置生成的 BD_NiTouChe_Overlap_TurnAttack 一直留在原地（原版判定挂在车上随车收掉，我们生成的没人收）。
+-- 现在记下来：车的转圈动作时长（读不到按 1.5 秒，夹在 0.8–3 秒），到点 / 对方下车替身收技能 / 回合清场时销毁
+CART.live, CART.LIFE, CART.dn = {}, 1.5, 0
+function CART.lifeOf(len)
+    if type(len) ~= "number" or len <= 0 then return CART.LIFE end
+    return math.max(0.8, math.min(3.0, len))
+end
+function CART.kill(why, tn)
+    for i = #CART.live, 1, -1 do
+        local x = CART.live[i]
+        local ok = G.destroyActor(x.e)
+        CART.dn = CART.dn + 1
+        if CART.dn <= 30 then
+            out("力荡判定收掉：远端#%d（%s，生成后 %.2f 秒）：%s", x.id, why, (tn or now()) - x.t, ok and "成功" or "已经没了")
+        end
+        table.remove(CART.live, i)
+    end
+end
+function CART.step(tn)
+    for i = #CART.live, 1, -1 do
+        local x = CART.live[i]
+        if tn - x.t >= x.life then
+            local ok = G.destroyActor(x.e)
+            CART.dn = CART.dn + 1
+            if CART.dn <= 30 then out("力荡判定收掉：远端#%d（到点 %.2f 秒）：%s", x.id, x.life, ok and "成功" or "已经没了") end
+            table.remove(CART.live, i)
+        end
+    end
+end
+-- 发送方：动作刚换成 AM_DriveHorseCart（只有马车里会播）
+function CART.mineSub(hm, prev) return hm ~= prev and hm == CART.MON end
+-- 收：对方 sub=AM_DriveHorseCart
+function CART.onSub(p1, pup, sm, tn)
+    if not valid(pup) then return end
+    local id, f
+    for fid, ff in pairs(CHG and CHG.fired or {}) do
+        if ff.name == CART.GA and (not id or fid > id) then id, f = fid, ff end
+    end
+    if not id then CART.log("力荡同步：对方 %s，但这边没有在开的马车（没生成判定）", sm); return end
+    f.turnAt = tn                         -- CHG.vehicleOff 等 KEEP 秒再取消替身技能（判定的来源技能还要用）
+    if f.mon then f.mon[sm] = true end
+    -- §437 替身照播力荡动作（以前只生成判定，替身没动作）；读秒里也播，只是不出伤害
+    montageByName(sm, true)
+    local okM = playNamed(pup, sm)
+    if not okM then CART.log("力荡同步：远端#%d 替身播 %s 没成", id, sm) end
+    -- §441 力荡四方的转圈是车自己的动作 ShaChi_HorseCart_Armed_Skill01_Montage（骨架 HorseCart_Skeleton，马车技能引用），
+    -- AM_DriveHorseCart 只是人的驾车姿势（替身本来就在播）→ 11-25 收方 8 次判定都生成了、对方看着没转。给替身的车也播一遍
+    local spinLen = CART.spinCart(pup, id)
+    if CDL and CDL.active and CDL.active() then CART.log("力荡同步：远端#%d 读秒里不出伤害", id); return end
+    if BAL and BAL.onFire and BAL.onFire(CART.GA, tn) and LO.rescale then LO.rescale(pup, tn) end
+    local bd = G.findOrLoad and G.findOrLoad(CART.BD) or nil
+    local src, srcWay = nil, "没有技能对象"
+    if DIAG and DIAG.PDX then src, srcWay = DIAG.PDX.src(pup, CART.GA) end
+    local okL, l = pcall(function() return pup:K2_GetActorLocation() end)
+    local em, how
+    if bd and okL and l then
+        local okS, a, b2 = pcall(G.laserEmitterSpawn, src, pup, { X = l.X, Y = l.Y, Z = l.Z }, { Pitch = 0.0, Yaw = yawOf(pup) or 0.0, Roll = 0.0 }, bd)
+        if okS then em, how = a, b2 else how = "出错 " .. tostring(a) end
+    else
+        how = bd and "读不到替身位置" or "找不到判定数据"
+    end
+    local add = NET.lastHit and NET.lastHit.r and NET.lastHit.r.atk == id
+    if em and not add then openJudge(p1, id, tn, CART.GA) end
+    if em then CART.live[#CART.live + 1] = { e = em, id = id, t = tn, life = CART.lifeOf(spinLen) } end   -- §442 到点收掉
+    local dist
+    if valid(p1) and okL and l then
+        local okP, pl = pcall(function() return p1:K2_GetActorLocation() end)
+        if okP and pl then dist = math.sqrt((pl.X - l.X) ^ 2 + (pl.Y - l.Y) ^ 2) end
+    end
+    CART.log("力荡同步：远端#%d 对方 %s → %s（%s；来源 %s；离我 %s 厘米；%s）", id, sm, em and "生成了力荡判定" or "没生成",
+        tostring(how), tostring(srcWay), dist and string.format("%.0f", dist) or "?", add and "接着这一招追加" or "开判定窗口")
+end
+
+-- ------------------------------------------------------------ §430 幻术琵琶【破阵曲】（GA_Hun_Lute_SKill）在线同步
+-- 11.23 用户反馈："幻术琵琶全部攻击在线模式下会有极高的延迟判定和不同步的问题，【破阵曲】尤其明显"。
+-- 资产（_tools/gasgraph/按住松手招_全表.csv）：GA_Hun_Lute_SKill 是 OnRelease 型（等松手任务），三段动作
+--   Start（按下）→ Loop（按住：循环里隔一阵打一发 BD_Hun_Lute_Skill_Red_01(_E)，同时持续扣杀气）→ End（松手：BulletData_Hun_Lute_SKill_01–04 那一轮）。
+--   技能放出来后一段时间内（11-24 实测 12 秒）再按影武键 = 同一个技能里再来一轮 Start → End，不是新技能、没有新的 ev=。
+-- 11-24 14:15–14:16 两边日志（本机客机发，IGNIZ 房主收）：发送方每轮都是点按（Start → End，没进 Loop），一个技能里点 2–5 轮；
+--   收方替身没有输入组件、等松手任务永远等不到 → 自己 Start → Loop 一直循环到技能超时（远端#241：Loop 6 秒，多打两发 Red 各 -71，
+--   杀气每 0.4 秒 -52；这两发已经出了判定窗口，没人知道）；后面几轮点按根本没发过去（只有第一轮的 ev=）。
+--   §407 续转在对方松手时只在"自己补过 Loop"的情况下补收招，替身自己进的 Loop 不管。
+-- 现在：
+--   发：破阵曲三段任何一段开始 → sub=<次数>:<动作名>-<这一招的招式号>（§111 同一个字段；旧版收方不认识这个名字，忽略）
+--   收：照对方的段播。第一轮的 Start 替身放技能时自己会播，不重播；第二轮起每个 Start 照播并开一个判定窗口（记在这一招的编号上），
+--       End 来时这一招没有开着的窗口也开一个。替身自己进了 Loop、对方并不在 Loop（最近一段是 End，或者第一轮对方已经松手 rel=）
+--       → 马上播 End。§407 续转不再管这一招（CHG.SPIN_SKIP）。对方旧版（不发段）只靠 rel= 停自循环。
+--   §440 11-25 15:37 对决：对方按 6.30 秒松手，替身一直循环到 14 秒后倒计时才收、多打 8 发各 -214 把我打死。两个原因：
+--     ① 发送方 Start / End 的招式号是 0（Start 时这一招还没发 ev=，End 时"我"那条已松手收掉）→ 收方把 0 当真编号、找不到招 → End 不播；
+--     ② 对方 Loop 段到了（r.seg = "Loop"），rel= 到时 LUTE.step 只认"最近一段是 Start / 没段"才停 → 不停。
+--     现在：发送方 Loop / End 没号时用最近一次的号；收方 Loop / End 的 0 号当没带号（取替身最近那次破阵曲），Start 的 0 号照旧不猜；
+--     第一轮 rel= 到点不管最近一段是 Start 还是 Loop 都收；播了 End 1.5 秒后替身又回到 Loop → 直接取消这一招
+--   日志关键字"§430 破阵曲"
+LUTE = { GA = "GA_Hun_Lute_SKill_C",
+         START = "Hun_ShaChi_Lute_Skill_01_Start_Montage", LOOP = "Hun_ShaChi_Lute_Skill_01_Loop_Montage",
+         ENDM = "Hun_ShaChi_Lute_Skill_01_End_Montage", MAX_AGE = 15.0, LOGS = 80, n = 0 }
+LUTE.SEG = { [LUTE.START] = "Start", [LUTE.LOOP] = "Loop", [LUTE.ENDM] = "End" }
+function LUTE.log(fmt, ...)
+    LUTE.n = LUTE.n + 1
+    if LUTE.n <= LUTE.LOGS then out(fmt, ...) end
+end
+-- §407 续转别管破阵曲（base_charge 载入后调一次；替身驱动时也补一次，多人房按对手各一份 CHG）
+function LUTE.skipSpin()
+    if CHG and CHG.SPIN_SKIP and not CHG.SPIN_SKIP[LUTE.GA] then CHG.SPIN_SKIP[LUTE.GA] = true end
+end
+-- sub= 里的名字："<动作名>" 或 "<动作名>-<招式号>"。返回 段名, 动作名, 招式号（不是破阵曲的段 → nil）
+function LUTE.parse(sm)
+    if type(sm) ~= "string" then return nil end
+    local mon, rid = sm:match("^([%w_]+)%-(%d+)$")
+    mon = mon or sm
+    local seg = LUTE.SEG[mon]
+    if not seg then return nil end
+    return seg, mon, tonumber(rid)
+end
+function LUTE.isSub(sm) return LUTE.parse(sm) ~= nil end
+-- 发送方：我这一招的招式号（CHG.list 里"我"的那条；大招压着还没发时没有 → 0）
+function LUTE.myId()
+    local best, at = nil, nil
+    for _, w in ipairs((CHG and CHG.list) or {}) do
+        if w.who == "我" and w.name == LUTE.GA and w.id and (not at or w.at > at) then best, at = w.id, w.at end
+    end
+    return best or 0
+end
+-- 发送方：netSend 看到我的动作换成新的一个时调；是破阵曲的段 → 返回要发的 sub 名字（调用方发 sub=），否则 nil
+function LUTE.mineSub(hm, prev)
+    if hm == prev or not LUTE.SEG[hm or ""] then return nil end
+    local id = LUTE.myId()
+    if id ~= 0 then LUTE.lastId, LUTE.lastAt = id, now()
+    elseif hm ~= LUTE.START and LUTE.lastId and now() - LUTE.lastAt <= LUTE.MAX_AGE then id = LUTE.lastId end   -- §440 ①
+    LUTE.log("§430 破阵曲：我 %s（#%d）→ 发给对方", LUTE.SEG[hm], id)
+    return hm .. "-" .. id
+end
+-- 收方每一招的记录（放在 CHG 上：观战 / 多人房按对手各一份）
+function LUTE.rec(id)
+    CHG.luteR = CHG.luteR or {}
+    local r = CHG.luteR[id]
+    if not r then r = { starts = 0, round = 1 }; CHG.luteR[id] = r end
+    return r
+end
+function LUTE.judgeOpen(id)
+    for _, j in ipairs(NET.judges or {}) do if j.id == id then return true end end
+    return false
+end
+-- 收：对方 sub= 是破阵曲的一段（NET.recvOne 调）
+function LUTE.onSub(p1, pup, sm, tn)
+    LUTE.skipSpin()
+    local seg, mon, rid = LUTE.parse(sm)
+    if not (seg and valid(pup)) then return end
+    if rid == 0 then                          -- §440 ① 发送方当时没号：Start 不猜（可能是新的一招），Loop / End 取最近那次
+        if seg == "Start" then
+            LUTE.log("§430 破阵曲：对方 Start 没带招式号 → 放的时候自己会播")
+            return
+        end
+        rid = nil
+    end
+    local f = rid and CHG.fired and CHG.fired[rid]
+    if not rid then          -- 没带招式号：取替身最近放的那一次破阵曲
+        for id, x in pairs(CHG.fired or {}) do if x.name == LUTE.GA and (not rid or id > rid) then rid, f = id, x end end
+    end
+    if not f or f.name ~= LUTE.GA then
+        -- 第一轮的 Start 可能比替身放这一招还早到：替身放技能自己会播，不用管；别的段等不到这一招就算了
+        LUTE.log("§430 破阵曲：对方 %s（远端#%s），替身还没放这一招 → %s", seg, tostring(rid), seg == "Start" and "放的时候自己会播" or "不播")
+        if seg == "Start" and rid then LUTE.rec(rid).starts = 1 end
+        return
+    end
+    if tn - f.at > LUTE.MAX_AGE then
+        LUTE.log("§430 破阵曲：对方 %s（远端#%d），这一招放出 %.1f 秒了 → 不播", seg, rid, tn - f.at)
+        return
+    end
+    local r = LUTE.rec(rid)
+    local cur = montageOf(pup) or ""
+    local play, why = true, nil
+    if seg == "Start" then
+        r.starts = r.starts + 1
+        if r.starts == 1 then play, why = false, "第一轮，替身放技能时自己播"
+        else r.round = r.round + 1 end
+    elseif seg == "Loop" and cur == LUTE.LOOP then play, why = false, "替身已经在循环"
+    elseif seg == "End" and cur == LUTE.ENDM and r.selfEnd == r.round then play, why = false, "替身刚收过招"
+    end
+    r.seg, r.segAt = seg, tn
+    local okP
+    if play then
+        montageByName(mon, true)
+        pcall(G.facePlayer, pup)
+        okP = playNamed(pup, mon)
+        if f.mon then f.mon[mon] = true end
+    end
+    -- 判定窗口：第二轮起的 Start；End 时这一招没有开着的窗口（按住久了第一轮的窗口早过了）
+    local opened = false
+    if p1 and ((seg == "Start" and r.starts > 1) or (seg == "End" and not LUTE.judgeOpen(rid))) then
+        openJudge(p1, rid, tn, LUTE.GA)
+        opened = true
+    end
+    LUTE.log("§430 破阵曲：对方第 %d 轮 %s（远端#%d，放出 %.2f 秒）→ 替身%s%s（替身原来 %s）", r.round, seg, rid, tn - f.at,
+        play and (okP and "已播" or "播放失败") or ("不播：" .. tostring(why)), opened and "，开判定窗口" or "", cur ~= "" and cur or "没动作")
+end
+-- 每帧（替身驱动里调）：替身自己进了 Loop、对方不在 Loop → 收招
+function LUTE.step(pup, tn)
+    if not (CHG and CHG.fired and next(CHG.fired)) then return end
+    LUTE.skipSpin()
+    local cur
+    for id, f in pairs(CHG.fired) do
+        if f.name == LUTE.GA and tn - f.at <= LUTE.MAX_AGE then
+            cur = cur or (valid(pup) and montageOf(pup)) or ""
+            LUTE.endFirst(pup, id, f, cur, tn)          -- §449 替身一放就进收招 → 收完重放
+            if cur ~= LUTE.LOOP then return end
+            local r = LUTE.rec(id)
+            if r.selfEnd == r.round and r.selfAt and tn - r.selfAt > 1.5 and not r.cancelled then    -- §440 播了 End 又回到循环
+                r.cancelled = true
+                local okC, gone = pcall(G.cancelAbilities, pup, function(n) return n == LUTE.GA end)
+                LUTE.log("§430 破阵曲：远端#%d 播了收招 %.1f 秒后替身又回到循环 → 取消这一招（%s）", id, tn - r.selfAt,
+                    okC and tostring(gone) or ("出错 " .. tostring(gone)))
+                return
+            end
+            local secs = CHG.rel and CHG.rel[id]
+            local stop
+            if r.seg == "End" then stop = "对方这一轮已经收招"
+            elseif r.round == 1 and secs and tn >= f.at + secs then      -- §440 ② 最近一段是 Loop 也算
+                stop = string.format("对方按了 %.2f 秒就松手（替身自己进了循环）", secs)
+            end
+            if stop and r.selfEnd ~= r.round then
+                r.selfEnd, r.selfAt = r.round, tn
+                local ok = playNamed(pup, LUTE.ENDM)
+                if f.mon then f.mon[LUTE.ENDM] = true end
+                LUTE.log("§430 破阵曲：远端#%d 第 %d 轮 %s → 替身停循环、播收招 %s（放出 %.2f 秒）", id, r.round, stop,
+                    ok and "成功" or "失败", tn - f.at)
+            end
+        end
+    end
+end
+
+-- §449 破阵曲少打（11-25 15:38:06 远端#211 / 15:41:20 远端#350）：对方按住 8.03 秒，替身 GA_Hun_Lute_SKill_C 一放出来
+--   动作就是 Hun_ShaChi_Lute_Skill_01_End_Montage（蓄力探针 #10 / #14："0.00 …End… 2.17 -GA"），2.2 秒就自己收完、Loop 一发没打。
+--   两次的上一次破阵曲都是没走收招就被掐掉的：#204 被 §364 倒计时取消（15:37:45）、#348 被"对方被打断：替身停招"切掉（15:41:18）；
+--   走完收招的那几次（#211 之后的 #348、11-23 / 11-24 全部）下一次都是正常的 Start → Loop。§440"播了 End 又回到循环 → 取消"
+--   同样是没走收招就掐掉。推断技能（每个角色一个实例）里松手类的状态没清，下一次放直接走收招；实例变量放之前读一次记日志（LUTE.preFire）。
+-- 做法：替身放出 EF_WIN 秒内自己进了收招（不是我们播的、对方这一招也没发 End）→ 记下；等这次收完（技能没了），对方还没松手
+--   （没 rel=、最近一段不是 End）就重放一次这一招（走完收招后再放是正常的），每招最多一次；EF_WAIT 秒还没收完就算了。
+--   日志关键字"§449 破阵曲"
+LUTE.EF_WIN, LUTE.EF_WAIT, LUTE.EF_POLL = 0.5, 4.0, 0.1
+LUTE.VARS = { "AlreadyRelease", "CanRelease", "BulletDuration" }
+LUTE.preN = 0
+-- 放之前（AIR.fire）：只读，实例变量记日志（前 12 次）
+function LUTE.preFire(p1, pup, e, tn)
+    if e.name ~= LUTE.GA then return end
+    LUTE.p1 = p1                                  -- 重放时开判定窗口用
+    if LUTE.preN >= 12 then return end
+    LUTE.preN = LUTE.preN + 1
+    local s = (G.LO and G.LO.instVars) and G.LO.instVars(pup, LUTE.GA, LUTE.VARS) or "（没有读实例的函数）"
+    LUTE.log("§449 破阵曲：远端#%d 放之前替身的技能实例：%s；替身动作 %s", e.id or -1, tostring(s), tostring(montageOf(pup) or "无"))
+end
+function LUTE.endFirst(pup, id, f, cur, tn)
+    local r = LUTE.rec(id)
+    if r.ef == nil then
+        if tn - f.at > LUTE.EF_WIN then r.ef = false; return end
+        if cur == LUTE.ENDM and not (f.mon and f.mon[LUTE.ENDM]) and r.seg ~= "End" and not r.selfEnd then
+            r.ef = { at = tn, nextT = tn }
+            LUTE.log("§449 破阵曲：远端#%d 替身放出 %.2f 秒就自己进了收招（对方最近一段 %s、%s）→ 等收完，对方还按着就重放", id,
+                tn - f.at, tostring(r.seg or "没收到"), (CHG.rel and CHG.rel[id]) and "已松手" or "没松手")
+        end
+        return
+    end
+    if not r.ef or r.ef.done or tn < r.ef.nextT then return end
+    r.ef.nextT = tn + LUTE.EF_POLL
+    local why
+    if r.seg == "End" then why = "对方这一轮已经收招"
+    elseif CHG.rel and CHG.rel[id] then why = string.format("对方按了 %.2f 秒已经松手", CHG.rel[id])
+    elseif tn - r.ef.at > LUTE.EF_WAIT then why = "等了太久还没收完"
+    elseif tn - f.at > LUTE.MAX_AGE then why = "这一招太久了" end
+    if not why then
+        local okA, act = pcall(G.activeAbilities, pup)
+        if okA and type(act) == "table" and act[LUTE.GA] then return end      -- 还在收招
+        if not okA then why = "读不到替身技能" end
+    end
+    r.ef.done = true
+    if why then
+        LUTE.log("§449 破阵曲：远端#%d %s → 不重放", id, why)
+        return
+    end
+    local okF, ok = pcall(RECM.activateOnPuppet, pup, LUTE.GA, NET.sub or {}, "§449 重放 远端#" .. id)
+    r.refiredAt = tn
+    if okF and ok and LUTE.p1 and not LUTE.judgeOpen(id) then openJudge(LUTE.p1, id, tn, LUTE.GA) end   -- 重放的 Loop 照常判定
+    LUTE.log("§449 破阵曲：远端#%d 替身的收招走完了（放出 %.2f 秒）、对方还按着 → 重放这一招 %s", id, tn - f.at,
+        (okF and ok) and "成功" or ("失败 " .. tostring(ok)))
+end
+
+-- ============================================================ §448 幻术琵琶【移商换羽 / 转轴拨弦】（GA_Lute_Dash）诊断（只读）
+-- 资产：每个方向一对音刃——蓝 BD_GA_Hun_Lute_Dash_<F/B/L/R>_01(_E)（只有真杀气 5.28 / 5.81、扣血 0）+ 红 BD_Hun_Lute_Dash_<…>_Red_01(_E)
+--   （元素 + 真伤 6.6 / 7.26）。在线：蓝的每次都中（受击 + 杀气 -160～-215），红的时有时无——
+--   挨打方 11-24 14:46 #1043 红中 -268，#1045 / #1047（隔 3 / 5 秒）只有蓝；发送方 14:49 #603 / 14:52 #632 回报 -206，
+--   紧跟着的 #605 / #634 / #635 / #636 都只扣杀气（§431 起记中招 -0）。像是一串里只有第一下出红，原因没查清（替身没出红 /
+--   本来就有内置间隔 / 红的被别的挡掉都有可能）。这里两边各记一次：发送方我放这招（动作 Hun_ShaChi_Lute_Dash_*）、
+--   挨打方替身放出来以后 AT 秒各扫一次子弹（FindAllOf，一招 3 次），看红 / 蓝音刃到底生成了没有。日志关键字"§448 移商换羽"
+LDASH = { GA = "GA_Lute_Dash_C", AT = { 0.35, 0.7, 1.1 }, LOGS = 60, n = 0, pend = nil }
+function LDASH.isMon(m) return type(m) == "string" and m:find("^Hun_ShaChi_Lute_Dash") ~= nil end
+function LDASH.start(who, actor, tn, tag)
+    if LDASH.n >= LDASH.LOGS or not valid(actor) then return end
+    LDASH.pend = { who = who, actor = actor, at = tn, k = 1, tag = tag }
+end
+function LDASH.step(tn)
+    local p = LDASH.pend
+    if not p or tn - p.at < LDASH.AT[p.k] then return end
+    if p.k >= #LDASH.AT then LDASH.pend = nil else p.k = p.k + 1 end
+    if not valid(p.actor) then LDASH.pend = nil; return end
+    LDASH.n = LDASH.n + 1
+    local s = G.bulletScan and G.bulletScan(function(o) if sameObj(o, p.actor) then return p.who end end) or "（没有扫子弹的函数）"
+    local mine = {}
+    for item in tostring(s):gmatch("%S+") do if item:find(p.who .. ":", 1, true) == 1 then mine[#mine + 1] = item end end
+    out("§448 移商换羽 %s %s +%.2f 秒：%s 的子弹 %s", p.who, tostring(p.tag), tn - p.at, p.who, #mine > 0 and table.concat(mine, " ") or "没有")
+end
+
 -- ============================================================ §108 房间设置"血瓶：关"时交手中不能喝药
 -- 喝药 = 本机玩家开始播 AM_Hun_Medicine_*（§103 同一个判断）；喝药技能 GA_Medicine_* 不在发包看的技能里。回血是开始喝后
 -- 约 1 秒内分几跳到（2026-11-05 22:44:50 日志：+15 / +46 交替），可能在我们看到动作前就到了一跳。所以关的时候：
@@ -4626,6 +5668,7 @@ function LAT.target(tn)
     if ST.pupAtkAt and tn - ST.pupAtkAt < LAT.EXTRA_ATK then return pos, "出招" end
     if NET.lastHrAt and tn - NET.lastHrAt < LAT.EXTRA_HIT then return pos, "受击" end
     if NET.turnAt and tn - NET.turnAt < LAT.EXTRA_TURN then return pos, "急转" end
+    if NET.stopAt and tn - NET.stopAt < LAT.EXTRA_TURN then return pos, "急停" end     -- §436.2
     local age = LAT.age(LAT.peerTs, tn)
     if not age then return pos, "没有时间戳" end
     LAT.st.extra = LAT.st.extra + 1
@@ -4637,7 +5680,11 @@ function LAT.onVel(old, new, tn)
     if not (old and new) then return end
     local s1, s2 = math.sqrt(old.X ^ 2 + old.Y ^ 2), math.sqrt(new.X ^ 2 + new.Y ^ 2)
     if s1 > 100 and s2 > 100 and old.X * new.X + old.Y * new.Y < 0 then NET.turnAt = tn end
+    -- §436.2 急停：速度一包里掉到原来的 STOP_RATIO 以下（松开摇杆 / 撞墙）= 对方停了，EXTRA_TURN 秒内不外推（不然按停之前的速度往前推，
+    -- 替身冲出去再被拉回来）；停着的时候（新速度很小）也一直算
+    if (s1 > 150 and s2 < s1 * LAT.STOP_RATIO) or (s2 < 30 and s1 >= 30) then NET.stopAt = tn end
 end
+LAT.STOP_RATIO = 0.4
 
 -- C：这招最多能跳多少秒（纯函数）。age = 晚到的秒数，windup = 前摇秒数（不知道 = nil）。返回 秒数（0 = 不跳）, 原因
 function LAT.skipFor(age, windup)
@@ -4971,6 +6018,7 @@ CHGM = BASEPARTS.load("charge", {
     activeAbilities = function(...) return activeAbilities(...) end,
     montageOf = function(...) return montageOf(...) end,
 })
+LUTE.skipSpin()      -- §430 破阵曲按对方的段播，§407 续转不管
 
 -- ============================================================ v0.24.2 空中同步（→ base_air.lua）
 local AIR = BASEPARTS.load("air", {
@@ -4984,11 +6032,91 @@ local AIR = BASEPARTS.load("air", {
     montageOf = function(...) return montageOf(...) end,
 })
 
+CTRREC = BASEPARTS.load("guard_recovery", { G = G,
+    out = function(...) return out(...) end,
+    hpOf = function(...) return hpOf(...) end,
+    attrOf = function(...) return attrOf(...) end,
+    locked = function(tn) return STG.active(tn) or CDL.active() end })
+
 -- ============================================================ 武器平衡规则（§184 / §212 火枪、§242 召唤、§242/§245/§246 火流星、§200 闪避、§200.11 切武器保持杀气 → base_wrules.lua）
 -- 全局表（最外层 local 已经很多，不再加；GCD / GDMG / SUMD / HLFX / DCD / SWK 各自仍为全局）
 WRULES = BASEPARTS.load("wrules", { ST = ST, NET = NET, MATCH = MATCH, NET_DIR = NET_DIR, G = G,
     -- 主循环那段会把这几个换成计时包装（PROF.wrap）：传"调用时再取"，和搬出来之前一样
     out = function(...) return out(...) end, attrOf = function(...) return attrOf(...) end, montageOf = function(...) return montageOf(...) end })
+
+-- Reversible local and replay-actor passive rules; original equipment assets remain unchanged.
+SHADOWPASSIVES = BASEPARTS.load('shadowpassives', {
+    active = function() return NET.fighting() and BAL.active() end,
+    actorKey = function(actor) return valid(actor) and full(actor) or nil end,
+    mapToken = function() return ST.mapLoads end,
+    equipped = function(actor) return valid(actor) and STD.idOf(LO.heldConfig(actor, LO.slotShachi())) or nil end,
+    snapshot = function(actor, paths)
+        local snap = G.snapshotEffects(actor, paths)
+        if sameObj(actor, getP1()) and STD.gearMine then
+            for path, e in pairs(snap.effects) do if STD.gearMine[path] then e.restore = false end end
+        end
+        if SHADOWPASSIVES and SHADOWPASSIVES.blocked(paths[1]) then
+            if not SHADOWPASSIVES.snapshotKeys or SHADOWPASSIVES.snapshotMap ~= ST.mapLoads then
+                SHADOWPASSIVES.snapshotKeys, SHADOWPASSIVES.snapshotLogs, SHADOWPASSIVES.snapshotMap = {}, 0, ST.mapLoads
+            end
+            for path, e in pairs(snap.effects) do
+                local note = string.format('%s %s active=%s level=%s policy=%s safe=%s complete=%s', full(actor), STD.geShort(path),
+                    tostring(e.active), tostring(e.level), tostring(e.removalPolicy), tostring(e.safeRemoval), tostring(snap.complete))
+                if not SHADOWPASSIVES.snapshotKeys[note] and SHADOWPASSIVES.snapshotLogs < 40 then
+                    SHADOWPASSIVES.snapshotKeys[note], SHADOWPASSIVES.snapshotLogs = true, SHADOWPASSIVES.snapshotLogs + 1
+                    out('11.20 passive snapshot: %s', note)
+                end
+            end
+        end
+        return snap
+    end,
+    remove = function(actor, path) return LO.removeGE(actor, path, '11.20 disable passive') end,
+    apply = function(actor, path, level)
+        local ok, handle = LO.applyGE(actor, path, '11.20 restore passive', level)
+        local value = rawProp(handle, 'Handle')
+        return ok and type(value) == 'number' and value >= 0
+    end,
+    out = function(...) return out(...) end,
+})
+function SHADOWPASSIVES.forActor(actor)
+    if sameObj(actor, getP1()) then return SHADOWPASSIVES end
+    if not SHADOWPASSIVES.puppets or SHADOWPASSIVES.puppetMap ~= ST.mapLoads then
+        SHADOWPASSIVES.puppetMap, SHADOWPASSIVES.puppets = ST.mapLoads, {}
+    end
+    local key = full(actor)
+    local api = SHADOWPASSIVES.puppets[key]
+    if not api then api = SHADOWPASSIVES.fork(); SHADOWPASSIVES.puppets[key] = api end
+    return api
+end
+function SHADOWPASSIVES.puppetStep(actor, tn)
+    if not valid(actor) then return end
+    local api = SHADOWPASSIVES.forActor(actor)
+    api.step(actor, tn)
+end
+function SHADOWPASSIVES.allowRemove(actor, path)
+    local api = SHADOWPASSIVES.forActor(actor)
+    if api.canRemove(actor, path) then return true end
+    -- A successful journal removal may precede the old STD/wge bookkeeping cleanup.
+    local snap = G.snapshotEffects(actor, {path})
+    local e = snap.effects[path]
+    return snap.complete and e and e.active == false
+end
+
+-- Local read-only part pilot; no connection to damage correction or CFG wire values.
+DAMAGEPARTS = BASEPARTS.load('damageparts', { NET_DIR = NET_DIR, G = G,
+    configDir = (FORNET_BASE and FORNET_BASE.dir) or (ROOT .. '/Scripts'),
+    mapToken = function() return ST.mapLoads end,
+    out = function(...) return out(...) end, hpOf = function(...) return hpOf(...) end,
+    inScope = function()
+        return NET.fighting() and BAL.active() and not PEER.on
+            and not (BASEHOOK.inMp and BASEHOOK.inMp())
+    end,
+    sources = function()
+        local j = NET.judges and NET.judges[#NET.judges]
+        local incoming = (j and j.name) or (NET.lastHit and NET.lastHit.name) or BAL.last
+        local id = PRED.myAttackId()
+        return incoming, NET.evName and NET.evName[id], puppet()
+    end })
 
 -- §132 我锁没锁定对手（发 lk=）：GetLockingTarget 读不到时问瞄准组件；变了记一行（前 60 次），真人对战时好确认读对了
 function NET.myLk(p1)
@@ -5012,16 +6140,19 @@ local function netSend(p1, tn)
             if not NET.prevAbs[n] then SWK.note(n, tn); ABUF.onAbility(n, tn, true) end   -- §200.11 切武器（切刀斩）；§349 武器状态 / 放血计时
             if not NET.prevAbs[n] and SUMMON.armName and SUMMON.armName(n) then ST.p1SummonAt = tn end   -- §118 / §242 我放了召唤（认替身分身时用）
             if not NET.prevAbs[n] and isAttackAbility(n) then NET.lastMyAtk = n end   -- §230.1 最近一招攻击（硬直动作按它的武器选）
-            if not NET.prevAbs[n] and RECM.replayable(n) and not NOCTR.check(p1, n, tn)   -- §105.3 红蓝光反击关着时拦掉
+            if not NET.prevAbs[n] and RECM.replayable(n) and not LO.isSpecialMove(n)       -- §436.1 爬墙等走 trv= 发动作，不当招式发
+                and not NOCTR.check(p1, n, tn)                                        -- §105.3 红蓝光反击关着时拦掉
                 and not STG.check(p1, n, tn)                                          -- §161 硬直中出招拦掉
                 and not CDL.check(p1, n, tn)                                          -- §173.7 倒计时里出招拦掉
-                and not DCD.check(p1, n, act, tn) then                                -- §200 瞬影冷却中拦掉（普通闪避在这里扣杀气，§200.10）
+                and not DCD.check(p1, n, act, tn)                                     -- §200 瞬影冷却中拦掉（普通闪避在这里扣杀气，§200.10）
+                and not MCD.check(p1, n, tn) then                                     -- §426 招式冷却中拦掉（双刃第四段等）
                 -- v0.27.2 大招先压住，看这一帧 / 下几帧的动作：C_Failed（没充能）就不发，放出来了才发（ULT.flushHeld）
                 -- §375 影之武装同理：暗源不够播 ShachiWeapon_Failed 就不发（ULT.flushEdge）
                 local held = ULT.isUlt(n) or LO.isEdgeAttack(n)
                 if ULT.isUlt(n) then ULT.held[#ULT.held + 1] = { name = n, ts = LAT.ms(tn), n = 0 }
                 elseif held then ULT.holdEdge(n, tn)
                 else ULT.emit(n, tn, LAT.ms(tn)) end
+                CHG.onMyFire(n, tn, isAttackAbility(n))     -- §409.2 我按着蓄力时放了下一招 = 松手
                 if CHG.watched(n) then CHG.watch(p1, "我", n, tn, not held and NET.evId or nil) end   -- §92 松手检测 / 探针
             end
         end
@@ -5037,12 +6168,15 @@ local function netSend(p1, tn)
     DCD.frame(p1, act, tn)          -- §200 我的瞬影停没停（停了开始冷却）
     if NET.prevAbs then for n in pairs(NET.prevAbs) do if not act[n] then ABUF.onAbility(n, tn, false) end end end   -- §349 招收掉：状态多在这时已挂上
     NET.prevAbs, NET.prevAbsTick = act, ST.ticks       -- 同一次驱动里观察玩家1 直接用（§82.1）
+    if not NET.driving then CHG.mineStep(tn) end       -- §420 多人房 / 对决：我的蓄力松手检测（CHG.step 只在驱动替身时跑、跑的是对手那份）
     -- v0.18.3 受击动作：我本机游戏给我播的受击动作（轻击小顿 / 重击 / 击倒 / 击飞……）换成新的一个时次数 +1，
     -- 发 hr=<次数>:<动作名>，对方让替身播同一个
     local hm = montageOf(p1)
+    if DSTAT then DSTAT.frame(p1) end
     BLK.watch(hm, act, tn)          -- §87 记"开始格挡"的时刻（软格挡按它分精防 / 普防）
     CTRD.frame(p1, hm, act, tn)     -- §396 红反链：之后能不能进架势
     CTRD.monFrame(p1, hm, act, tn)  -- §396 防御监视：Stance.Forbid 出现 / 解除、按着格挡没进架势
+    CTRREC.frame(p1, hm, act, tn)   -- Guard-release fallback; never cancel skills or reset the input stack.
     if hm ~= NET.hrPrev and LO.isHitMontage(hm) then
         NET.hrN, NET.hrT = (NET.hrN or 0) + 1, hm
     end
@@ -5052,15 +6186,27 @@ local function netSend(p1, tn)
         NET.medN, NET.medT = (NET.medN or 0) + 1, hm
     end
     NOMED.frame(p1, tn)
+    -- §436 场景互动动作（爬墙 / 翻越…）：换成新的一个时次数 +1，发 trv=<次数>:<动作名>:<现在还在不在播>，对方替身照播、
+    -- 播的时候高度也跟着包走（不然替身贴着墙根、到顶才一下摆上去）
+    NET.trvOn = LO.isTraversalMontage(hm) or (hm ~= "" and LO.specialMoveOn(act))     -- §436.1 爬墙技能挂着时播的也算
+    -- （按"这一段场景动作里发过的那个"比，不按上一帧：技能比动作晚一两帧才读到时，名单外的动作也能补发）
+    if NET.trvOn and hm ~= NET.trvCur then NET.trvN, NET.trvT = (NET.trvN or 0) + 1, hm end
+    NET.trvCur = NET.trvOn and hm or nil
     -- §111 技能里面按键换的动作（紫冥剑召唤）：换成新的一个时次数 +1，发 sub=<次数>:<动作名>，对方替身照播
     if hm ~= NET.hrPrev and (LO.isSubMontage(hm) or CHG.isLaserSub(hm, NET.hrPrev)) and GCD.mine(hm, tn) then    -- §139 加独眼弓激光；§184 冷却里的火枪不发
         NET.subN, NET.subT = (NET.subN or 0) + 1, hm
     end
+    if SHIELD.mineSub(hm, NET.hrPrev) then NET.subN, NET.subT = (NET.subN or 0) + 1, hm end   -- 11-23 拙壁盾盾反 / 盾推 / 盾冲
+    if CART.mineSub(hm, NET.hrPrev) then NET.subN, NET.subT = (NET.subN or 0) + 1, hm end     -- §434 泥头车力荡四方
+    NET.luteSub = LUTE.mineSub(hm, NET.hrPrev)            -- §430 破阵曲每一段（带招式号）
+    if NET.luteSub then NET.subN, NET.subT = (NET.subN or 0) + 1, NET.luteSub end
     SHOT.mine(p1, hm, NET.hrPrev, tn)   -- §377 羽弓 / 虎炮：每一发出手（带档位）和收招也走 sub=
+    if hm ~= NET.hrPrev and LDASH.isMon(hm) then LDASH.start("我", p1, tn, hm) end   -- §448 移商换羽：我这边生成了哪些音刃
     GCD.frame(p1, hm, tn)           -- §184 火枪收没收掉（两边）+ 本机冷却里拦召唤 / 提示
     -- §118 闪避动作（往哪边翻）：换成新的一个时次数 +1，发 dg=<次数>:<动作名>，对方替身翻同一个方向
     if hm ~= NET.hrPrev and DGE.isDodge(hm) and not DCD.muted(tn) then     -- §200 刚拦掉的瞬影动作不发
         NET.dgN, NET.dgT = (NET.dgN or 0) + 1, hm
+        NET.ddir = DDIR.mine(p1, hm)       -- §421 这次闪避身上的方向标签（对方替身放影武闪避招要用）
     end
     ZMX.fxProbe(p1, hm ~= NET.hrPrev and hm or nil, tn)     -- §119 以后查布局闪避的金光
     if hm ~= NET.hrPrev and hm:find("C_Failed", 1, true) then ULT.watch(p1, false, "我大招失败 " .. hm, tn) end   -- v0.27.1
@@ -5120,7 +6266,7 @@ local function netSend(p1, tn)
         .. "medok=" .. NET.flagCfg.med .. "\n"   -- §108 我的"血瓶"设置（只有主机的算数；med= 已经是喝药动作）
         .. "npos=" .. NET.flagCfg.npos .. "\n"  -- §128.2 我的"对手位置严格跟随"设置（只有主机的算数）
         .. "std=" .. NET.flagCfg.std .. "\n"    -- §144 我的"标准数值"设置（只有主机的算数）
-        .. "gcd=" .. NET.flagCfg.gcd .. "\ndgc=" .. NET.flagCfg.dgc .. "\nsycd=" .. NET.flagCfg.sycd .. "\nstg=" .. NET.flagCfg.stg .. "\nswk=" .. NET.flagCfg.swk .. "\n"   -- §216 / §228 精防硬直 我的火枪冷却 / 闪避扣杀气 / 瞬影冷却设置（只有主机的算数）
+        .. "gcd=" .. NET.flagCfg.gcd .. "\ndgc=" .. NET.flagCfg.dgc .. "\nsycd=" .. NET.flagCfg.sycd .. "\nstg=" .. NET.flagCfg.stg .. "\nswk=" .. NET.flagCfg.swk .. "\npdsh=" .. NET.flagCfg.pdsh .. "\n"   -- §216 / §228 精防硬直 我的火枪冷却 / 闪避扣杀气 / 瞬影冷却设置（只有主机的算数）
         .. "cfgh=" .. CFG.wire() .. "\n"       -- §158 我的数值表哈希（只有主机的算数；客机对不上就来要）
         .. "rfp=" .. RFP.wire() .. "\n"       -- §210 这一场的规则指纹（对方比；联机程序排位时报给服务器）
         .. "ult0=" .. NET.resCfg.ult0 .. "\nsp0=" .. NET.resCfg.sp0 .. "\nresm=" .. NET.resCfg.resm .. "\n"   -- §113 我的开局精纯杀气 / 暗源 / 每场每局（只有主机的算数）
@@ -5132,10 +6278,14 @@ local function netSend(p1, tn)
         .. "wpnban=" .. WBAN.cfg.wpnban .. "\nedgeban=" .. WBAN.cfg.edgeban .. "\n"   -- §180 我的禁用武器 / 影之武装（只有主机的算数）
         .. WBAN.wire()                                                        -- §180 我装着的 wpn=<武器,武器> / edg=<影武,影武>（主机开局前复核）
         .. "med=" .. (NET.medN or 0) .. ":" .. (NET.medT or "-") .. "\n"   -- §103 喝药动作（次数:动作名）
+        .. "trv=" .. (NET.trvN or 0) .. ":" .. (NET.trvT or "-") .. ":" .. (NET.trvOn and 1 or 0) .. "\n"   -- §436 场景互动动作（次数:动作名:还在播）
         .. "sub=" .. (NET.subN or 0) .. ":" .. (NET.subT or "-") .. "\n"   -- §111 技能里面换的动作（紫冥剑召唤；次数:动作名）
         .. "dg=" .. (NET.dgN or 0) .. ":" .. (NET.dgT or "-") .. "\n"     -- §118 闪避动作（次数:动作名）
+        .. "ddir=" .. (NET.ddir or "-") .. "\n"                           -- §421 那次闪避的方向标签 F/B/L/R/N
         .. "tl=" .. NET.resCfg.tl .. "\n"                                  -- §173 我的回合时限设置（只有主机的算数）
-        .. "dif=" .. NET.resCfg.dif .. "\n"                                -- §266 我的对局难度设置（只有主机的算数）
+        .. "pdshv=" .. NET.resCfg.pdshv .. "\n"                            -- §423.1 我的精防掉杀气数量（只有主机的算数）
+        .. "stgm=" .. NET.resCfg.stgm .. "\nstgr=" .. NET.resCfg.stgr .. "\n"   -- §422.1 我的精防硬直秒数 近战 / 远程（只有主机的算数）
+        .. "dif=" .. NET.resCfg.dif .. "\n"                             -- §266 我的对局难度设置（只有主机的算数）
         .. "tk=" .. RT.wire() .. "\n"                                      -- §173 这一回合交手后我受到的伤害（回合:累计），主机按它判时间到
         .. "inf=" .. INF.mine(p1, tn) .. "\n"                               -- §160 我身上的异常状态（类型:次数:段:积累,…），对方替身跟着
         .. "wge=" .. (NET.wgeStr or "") .. "\n"                                -- §118 我身上的武器效果 GE（替身也上）
@@ -5288,9 +6438,38 @@ function NET.recvRules(t)
     end
     if PEER.on then return end
     WBAN.recv(t)                           -- §180 主机的禁用武器 / 影之武装名单 + 对方装着的 wpn= / edg=
-    if (t.av or "") ~= NET.rav then
-        NET.rav = t.av or ""
+    -- §453：对决房的规则串（pbz_duel feedRules，@duel@1:ru|…）和多人房房主的包也走这里，它们不带 av=；
+    -- 以前把"没带"当"v0.21 及以前"，11-25 22:29:18 对 0.34.13 的房主误报版本不一致。没带 av= 就不判断
+    -- （多人房每人的版本由 pbz_multi 按状态包的 av= 单独比）
+    if t.av ~= nil and t.av ~= NET.rav then
+        NET.rav = t.av
         if NET.rav ~= VERSION then out("!! 版本不一致：我 v%s，对方 v%s", VERSION, NET.rav ~= "" and NET.rav or "0.21 及以前") end
+    end
+end
+
+-- §436 对方的场景互动动作 trv=<次数>:<动作名>:<还在播 1/0>（旧版没有这个字段 = 什么都不做）。
+-- 新的一个 → 替身照播（第一次收到只记次数，同 med=）；还在播 → NET.rtrv：NPM.frame 这段时间高度也跟包走、替身不受重力，
+-- AIR 不按"对方在空中"让替身起跳（爬墙那几秒对方的移动组件可能报在空中，替身起跳会画一道弧）
+NET.TRV_LOG_MAX = 60
+function NET.recvTrv(t, tn)
+    local n, m, on = (t.trv or ""):match("^(%d+):([%w_%-]+):?([01]?)$")
+    n = tonumber(n)
+    if not n then NET.rtrv = false; return end
+    if NET.trvIn and n > NET.trvIn and m ~= "-" and not REP.on then      -- §436.1 发送方已把关（爬墙技能挂着时名单外的动作也发）
+        montageByName(m, true)          -- 表里没有就重扫一次（最多 2 秒一次）
+        local ok = playNamed(puppet(), m)
+        NET.trvLogs = (NET.trvLogs or 0) + 1
+        if NET.trvLogs <= NET.TRV_LOG_MAX then
+            out("  %s对方场景动作 %s%s → 替身 %s", PEER.on and PEER.cur and ("[" .. tostring(PEER.cur.tag) .. "] ") or "", m,
+                n > NET.trvIn + 1 and string.format("（中间漏了 %d 个）", n - NET.trvIn - 1) or "",
+                ok and "已播" or "播放失败（本机没有这个动作）")
+        end
+    end
+    NET.trvIn = n
+    NET.rtrv = on == "1"
+    if NET.rtrv then
+        NET.rtrvAt = tn
+        AIR.rair = false
     end
 end
 
@@ -5317,7 +6496,7 @@ function NET.recvOne(p1, tn, t)
         out("远端序号回退 %d -> %d（对方重启了？），重置", NET.lastSeq, seq)
         NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.subIn, NET.resAtk = 0, nil, 0, nil, nil, nil, nil, {}
         NET.resSeen = {}                              -- §370 收过的结果号跟着清
-        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil; INF.reset(); GCD.reset("对方重启"); DCD.reset("对方重启")     -- §184 / §200
+        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil; DDIR.nIn, DDIR.dir = nil, nil; INF.reset(); GCD.reset("对方重启"); DCD.reset("对方重启")     -- §184 / §200
     end
     if NET.lastSeq == -1 or NET.lastRecvAt < tn - 5 then
         out("开始收到远端 v2 状态 seq=%d 地图=%s 武器=%s", seq, tostring(t.map), tostring(t.w))
@@ -5327,7 +6506,7 @@ function NET.recvOne(p1, tn, t)
         -- 新对手的 #1–#14 全被当成"已处理"丢掉。断了 5 秒以上再收到就算新连接，各计数清零（旧事件早超过 EV_KEEP 了）
         NET.lastEvIn, NET.wTried, NET.lastResIn, NET.brkIn, NET.hrIn, NET.medIn, NET.subIn, NET.resAtk = 0, nil, 0, nil, nil, nil, nil, {}
         NET.resSeen = {}                              -- §370 收过的结果号跟着清
-        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil; INF.reset()      -- §104 换了对手：防住率从先验重新学
+        LAT.reset(); CHG.reset(); PRED.reset(); DGE.nIn = nil; DDIR.nIn, DDIR.dir = nil, nil; INF.reset()      -- §104 换了对手：防住率从先验重新学
         if not PEER.on then                   -- §223 观战替身（PEER.run 里）不碰对局 / 判定的状态（LAT / PRED / INF 是它自己那份）
             GCD.reset("换对手 / 新连接")      -- §184 火枪冷却清零
             DCD.reset("换对手 / 新连接")      -- §200 闪避冷却清零
@@ -5355,12 +6534,17 @@ function NET.recvOne(p1, tn, t)
     if t.asp ~= NET.rasp then NET.rasp = t.asp; ARN.refresh(p1, "主机的开战点变了") end      -- §238 主机的开战点（旧版没有）
     if not PEER.on then RT.onPacket(t) end                                     -- §173 对方这一回合受到的伤害 tk=
     BOWAIM.recv(t.aim, tn)
-    SHOT.recv(t.shs)                                                           -- §377 对方会不会发羽弓 / 虎炮的每一发
+    SHOT.recv(t.shs, t.dyb)                                                    -- §377 对方会不会发羽弓 / 虎炮的每一发（§427 dyb= 普通独眼弓）
     BOWEYE.recv(t.eye)                                                     -- §139.9 对方的光柱有没有眼睛                                                     -- §139.3 对方放独眼弓时的镜头朝向
     NET.rlk = t.lk == "1"                                                      -- v0.23.3 对方锁定着我（旧版没有这个字段 = 不追）
     if not PEER.on then
         NET.rai = t.ai == "1"                                                      -- v0.26.0 对方是 AI（本地 AI / 测试假对手）：回合倒计时才强制归位
         NET.rdummy = NET.rai and t.dummy == "1"                                    -- §342 对方是测伤木桩（本地 AI 难度"木桩"）
+        NET.rtrainReturn = NET.rdummy and t.trainReturn ~= "0"
+        NET.rtrainHpRegen = NET.rdummy and t.trainHpRegen ~= "0"
+        NET.rtrainChi = NET.rdummy and t.trainChi or nil
+        NET.rtrainAiChi = NET.rai and t.trainAiChi == "1"
+        NET.rtrainUnsupported = NET.rdummy and t.trainUnsupported or nil
     end
     NET.rrly = t.rly                                                           -- §276 主机下场时我是第一位（h）：代主机开局
     NET.rnm = t.nm                                                             -- §85.5 对方昵称（联机程序加的 nm=）：AI 换人看它变没变
@@ -5391,6 +6575,7 @@ function NET.recvOne(p1, tn, t)
         end
         NET.medIn = mn
     end
+    NET.recvTrv(t, tn)          -- §436 对方的场景互动动作（爬墙 / 翻越…）：替身照播；还在播时不按"在空中"起跳
     -- §111 对方技能里面换的动作（紫冥剑召唤武器）→ 替身照播（动作自己带召唤 / 伤害的通知）。第一次收到只记次数。
     -- 动作是替身放 DB 时才加载的，表里没有就重扫一次；播过的记进这一招的 f.mon，判定窗口接着等（CHG.keepJudge）
     local sn, sm = (t.sub or ""):match("^(%d+):([%w_%-]+)$")
@@ -5400,6 +6585,15 @@ function NET.recvOne(p1, tn, t)
         if NET.subIn and sn > NET.subIn and SHOT.isWire(sm) and not REP.on then      -- §377 羽弓 / 虎炮的一发 / 收招
             local okW, errW = pcall(SHOT.onSub, puppet(), sm, tn)
             if not okW then out("§377 对方出手 %s 处理出错：%s", sm, tostring(errW)) end
+        elseif NET.subIn and sn > NET.subIn and SHIELD.isSub(sm) and not REP.on then          -- 11-23 拙壁盾盾反 / 盾推 / 盾冲
+            local okZ, errZ = pcall(SHIELD.onSub, p1, puppet(), sm, tn, pktAge)
+            if not okZ then out("盾反同步出错：%s", tostring(errZ)) end
+        elseif NET.subIn and sn > NET.subIn and CART.isSub(sm) and not REP.on then            -- §434 泥头车力荡四方
+            local okC, errC = pcall(CART.onSub, p1, puppet(), sm, tn)
+            if not okC then out("力荡同步出错：%s", tostring(errC)) end
+        elseif NET.subIn and sn > NET.subIn and LUTE.isSub(sm) and not REP.on then            -- §430 破阵曲每一段
+            local okL, errL = pcall(LUTE.onSub, p1, puppet(), sm, tn)
+            if not okL then out("§430 破阵曲同步出错：%s", tostring(errL)) end
         elseif NET.subIn and sn > NET.subIn and (laser or LO.isSubMontage(sm)) and not REP.on then
             local pupS = puppet()
             montageByName(sm, true)
@@ -5482,6 +6676,7 @@ function NET.recvOne(p1, tn, t)
         local okW, errW = pcall(LO.syncWge, pup)
         if not okW and errW ~= LO.wgeErr then LO.wgeErr = errW; out("!! 替身武器效果同步出错：%s", tostring(errW)) end
     end
+    DDIR.onPacket(t, tn)           -- §421 对方最近一次闪避的方向（要在放这个包的招之前）
     -- 出招事件（evt / list 在 LAT.onPacket 后面已经解析好）
     for _, e in ipairs(list) do
         if e.id > NET.lastEvIn then
@@ -5575,6 +6770,18 @@ function NET.recvOne(p1, tn, t)
     -- §174 起对方的杀气从来没到过（黄条一直是替身自己的、每 10 帧补满 = 一直满）。不读 t.sh：那是身份哈希，全数字时会被当成杀气
     NET.rsh, NET.rshm = tonumber(t.sq), tonumber(t.shm)
     NET.rsqp = t.sqp == "1"         -- §353 本地 AI：交手中替身杀气按游戏自己的（不补满），AI 跟着 psq= 走
+    if not PEER.on and NET.rai and valid(pup) then
+        local epoch = tonumber(t.trainChiEpoch)
+        local refillChi = epoch and NET.trainChiEpoch and epoch ~= NET.trainChiEpoch
+        if NET.rtrainAiChi or NET.rtrainChi == "locked" or (NET.rtrainChi == "refill" and refillChi) then
+            local mx = attrOf(pup, "Shachi_Max")
+            if mx then setAttr(pup, "Shachi", mx) end
+        elseif NET.rtrainChi == "empty" and NET.fighting() then
+            setAttr(pup, "Shachi", 0)
+        end
+        if TRAINCTX then TRAINCTX.emptyBreak(pup) end
+        NET.trainChiEpoch = epoch
+    elseif not PEER.on then NET.trainChiEpoch = nil end
     -- §223.6 观战替身：判定结果在 applyRemoteResult / LO.zmHeal 里自己不做；下面的房间设置照记（记进这个替身自己那份，
     -- NET.flag / resOf / accBanOf 观战时按主机那一路记下的，两个替身都按主机的规则，同真实对局）；会对外要东西 / 改共用状态的跳过
     NET.recvRules(t)
@@ -5699,6 +6906,10 @@ local function netStep()
     REL.poll()
     netRecv(p1, tn)
     netJudge(p1, tn)
+    if TRAINING then
+        TRAINING.step(tn)
+        if TRAINING.infinite("hp") and NET.judgeHp then NET.judgeHp = hpOf(p1) end
+    end
     -- 2026-11-05：以前每 2 次发一包（驱动又只有 15.6 次 / 秒，对面只收到 7.8 帧 / 秒）。现在每次都发，约 30 包 / 秒
     -- §82.4：ST.SPLIT 时发包挪到下一帧（NET.sendStep），和收包 / 驱动替身错开，单帧不再一口气做完
     if ST.SPLIT then NET.sendDue = true else netSend(p1, tn) end
@@ -5771,12 +6982,19 @@ function NET.drive(p1, pup, tn)
     local tgt, why = LAT.target(tn)                                 -- v0.27.0 追外推后的位置
     if NPM.readMode(tn) == "net" then           -- §128.1 全程跟网络位置：出招 / 受击时也外推，急转 / 没时间戳不外推
         local age = LAT.age(LAT.peerTs, tn)
-        NPM.setTarget(pup, NET.pos, NET.vel, tn - (age or 0), why == "急转" or not age, AIR.rair)
+        -- §436.2 我在观战：不按包龄往前推（看的人不需要"预测对方现在在哪"，推了对方一停替身就冲出去再拉回），
+        -- 只从收到包起推 WATCH_EXTRA 秒补两包之间的空当
+        local watch = NPM.watching()
+        NPM.extraMax = watch and NPM.WATCH_EXTRA or nil
+        NPM.setTarget(pup, NET.pos, NET.vel, watch and (NET.lastRecvAt or tn) or (tn - (age or 0)),
+            why == "急转" or why == "急停" or not age, AIR.rair,
+            NET.rtrv == true and tn - (NET.rtrvAt or -100) < NPM.TRV_HOLD)     -- §436 对方在爬墙 / 翻越：高度也跟
         local a = NPM.aim(tn)
         tgt = { X = a.X, Y = a.Y, Z = NET.pos.Z }
     end
     NET.lastErr = drivePuppet(pup, tgt, NET.vel, yaw)
     DGE.step(pup, tn)          -- §118 替身闪避方向跟对方一样
+    DDIR.step(pup, tn)         -- §421 挂上的闪避方向标签到时撤回
     INF.step(pup, tn)          -- §160 替身的冰冻 / 点燃 / 中毒…跟对方一样（本机自己积出来的撤掉）
     AIR.step(p1, pup, tn)      -- v0.24.2 对方在空中 → 替身起跳；排队的空中招
     HOV.watchPuppet(pup, tn, AIR.rair == true)   -- §99 对方在地上替身却往下掉 / 被引擎藏起 → 悬空、重新显示
@@ -5786,7 +7004,9 @@ function NET.drive(p1, pup, tn)
     if TAGD then pcall(TAGD.step, tn) end    -- §249 状态对比：到点前只比一个时间戳，排过才做事
     if not spec then ULT.step(p1, tn) end      -- v0.27.1 大招资源诊断（只在有等着的诊断时读属性）
     CHG.step(p1, pup, tn)      -- §92 蓄力探针（只在有在记的条目时读）
+    LUTE.step(pup, tn)         -- §430 破阵曲：替身自己进了循环、对方没在按 → 收招
     ZMX.step(pup, tn)          -- §119 紫冥剑实验（只在替身刚放 DB 时读）
+    if LDASH.pend then pcall(LDASH.step, tn) end      -- §448 移商换羽：到点扫一次子弹
     -- 替身的架势在本机保持满值：破防应由对方判定，不能被我本机的刀打出来（v0.9.5 日志里有本机 BreakEscape）
     if ST.ticks % 10 == 0 then
         local mx, cur = attrOf(pup, "Shachi_Max"), attrOf(pup, "Shachi")
@@ -5794,7 +7014,7 @@ function NET.drive(p1, pup, tn)
         if mx and cur and cur < mx and not (AISYNC and AISYNC.ownShachi()) then setAttr(pup, "Shachi", mx) end   -- §353 本地 AI 交手中不补
         -- §113 暗源同理：对方放成功了才会发来，替身自己不在铃铛回复，以前打几局就耗光、影之武装放不出来
         local smx, scur = attrOf(pup, "SpiritShadow_Max"), attrOf(pup, "SpiritShadow")
-        if smx and scur and scur < smx then setAttr(pup, "SpiritShadow", smx) end
+        if smx and scur and scur < smx and not (NET.rai and TRAINING and TRAINING.allowed()) then setAttr(pup, "SpiritShadow", smx) end
     end
     protectPuppet(pup)
     -- v0.16.0 配装同步：对方的攻击属性写进替身；替身被本机玩家换装带偏就重装对方武器
@@ -6256,7 +7476,7 @@ end
 --    对方那边看到的是砍你。替身放名字带 Clone / Summon 的招后 WINDOW 秒内、对局中每 BG_EVERY 次驱动（影之武装的召唤被动不走出招事件）
 --    扫一遍带阵营组件的角色：主人（Owner / Instigator）是替身或替身控制器的，阵营改成和替身一样
 -- 全局（不是 local）：主代码块的 local 已满 200 个
-SUMMON = { WINDOW = 5.0, EVERY = 6, BG_EVERY = 150, LOG_MAX = 8, kind = {}, nKind = 0, mine = {}, fc = {}, fail = {}, GIVE_UP = 3,
+SUMMON = { WINDOW = 5.0, EVERY = 6, BG_EVERY = 150, LOG_MAX = 8, kind = {}, nKind = 0, mine = {}, fc = {}, fail = {}, GIVE_UP = 3, oldLogged = {},
            st = {}, REVERT_MAX = 4, AFTER_FOUND = 0.5, found = nil, EDGE = { "JianKeZhaoJiLing", "CaoOuSiXian", "KuYeSiZhuChuan", "XuKongHuaShan" } }
 -- §242 哪些招之后要去找替身的召唤物：名字带 Clone / Summon 的（§94），以及 4 件召唤类影之武装的召唤招
 -- （GA_JianKeZhaoJiLing_Normal_01 / GA_CaoOuSiXian_Normal_01 / GA_KuYeSiZhuChuan_Normal_01 / GA_XuKongHuaShan_Skill / Reborn；
@@ -6326,8 +7546,43 @@ end
 -- §242 剑客召集令 / 草偶丝线 / 枯叶丝竹串 / 虚空化山 召出来的 NPC / 场地物也是主人认不出（不是 BP_Monster_Hun_Summon_ 开头），
 -- 以前这条直接 return nil → 阵营一直是玩家方，不打人（实测 4 件召唤后 5 秒 0 伤害）。现在召唤窗口里新出现的阵营角色都算，
 -- 只有"我自己这几秒也放过召唤"时才按离谁近分；主人明确是我 / 替身的仍然按主人（上面先判过，进不来）。
+-- §450 这几样永远不是召唤物（11-25 mp_probe(43) 观战：把观众自己的角色、另一位选手的替身、关卡里摆的柴堆 BP_Firewood_003_C 都认成了
+-- "替身刚放召唤后新出现"、改了阵营，还一直跟着替身改）：玩家角色类（自己 / 所有替身都是 BP_Renewal_Hun_C）、
+-- 关卡里摆好的东西（世界分区的 Actor 名带 _UAID_，运行时生成的召唤物没有）、本机自己的角色
+function SUMMON.never(e)
+    if e.cls == "BP_Renewal_Hun_C" then return "玩家角色类" end
+    if e.path and e.path:find("_UAID_", 1, true) then return "关卡里摆的" end
+    local okM, me = pcall(getP1)
+    if okM and valid(me) and e.path == pathOf(me) then return "本机角色" end
+    return nil
+end
+
+-- §451 11-25 mp_probe(45)/(46) 两边都用绝影：本机自己几秒前放的分身被认成"替身的"、改成敌方、锁定我
+-- （一个分身不动 / 两个分身都打一个人）。原因：替身一放召唤，第一遍扫描只当基准、不记已有的，
+-- 下一遍我那个还活着的分身就成了"第一次见"→ 类名直接认（我放的超过 5 秒）或"离替身更近"（对打时常常更近）。
+-- 冷却中空放的分身招也会照发过来，同样开扫描把我的分身认走。
+-- 修：召唤物存在的时间比替身这招放出到现在还长（+ AGE_SLACK）= 替身放之前就在了，不是这次召出来的。
+-- 读不到存在时间就照旧判。慢动作时游戏时间走得慢，读到的偏短 → 只会退回照旧判，不会把真召唤物挡掉。
+SUMMON.AGE_SLACK = 0.5
+function SUMMON.ageOf(actor)
+    local ok, v = pcall(function() return actor:GetGameTimeSinceCreation() end)
+    if ok and type(v) == "number" then return v end
+    return nil
+end
+
 function SUMMON.byClass(e, pup, p1, tn)
     if not (ST.summonArmAt and tn - ST.summonArmAt < SUMMON.WINDOW) then return nil end
+    if SUMMON.never and SUMMON.never(e) then return nil end
+    local age = e.actor and SUMMON.ageOf and SUMMON.ageOf(e.actor)
+    if age and age > tn - ST.summonArmAt + (SUMMON.AGE_SLACK or 0.5) then
+        SUMMON.oldLogged = SUMMON.oldLogged or {}
+        if not SUMMON.oldLogged[e.path] then
+            SUMMON.oldLogged[e.path] = true
+            out("  §451 %s 已经存在 %.1f 秒，替身这招才放出 %.1f 秒：放之前就在（多半是我自己的），不算替身的",
+                short(e.actor), age, tn - ST.summonArmAt)
+        end
+        return nil
+    end
     if SUMMON.fixOff() then
         if not (e.cls and e.cls:find("^BP_Monster_Hun_Summon_")) then return nil end
         if not (ST.p1SummonAt and tn - ST.p1SummonAt < SUMMON.WINDOW) then return "类名，替身刚放召唤" end
@@ -6540,11 +7795,11 @@ function NET.rulesList(room)
     if MATCH.flags and MATCH.flags.ctr == false then rules[#rules + 1] = T("无红蓝光反击", "NO RED/BLUE COUNTERS") end   -- §105.3
     if MATCH.flags and MATCH.flags.bal then rules[#rules + 1] = T("武器平衡", "WEAPON BALANCE") end                     -- §106.5
     if MATCH.flags and MATCH.flags.med == false then rules[#rules + 1] = T("禁用血瓶", "NO POTIONS") end                -- §108
-    if MATCH.flags and MATCH.flags.gcd then rules[#rules + 1] = T("火枪冷却", "GUN COOLDOWN") end                     -- §216
     if MATCH.flags and MATCH.flags.dgc then rules[#rules + 1] = T("闪避扣杀气", "DODGE COSTS SHACHI") end             -- §216
     if MATCH.flags and MATCH.flags.sycd then rules[#rules + 1] = T("瞬影冷却", "FLASH STEP COOLDOWN") end             -- §216
     if MATCH.flags and MATCH.flags.swk then rules[#rules + 1] = T("切武器保持杀气", "SWITCH KEEPS SHACHI") end         -- 11-16
-    if MATCH.flags and MATCH.flags.stg then rules[#rules + 1] = string.format(T("连续精防 %d 次硬直 %g 秒", "%d DEFLECTS → %gS STAGGER"), STG.need(), STG.sec()) end   -- §228
+    if MATCH.flags and MATCH.flags.pdsh then rules[#rules + 1] = string.format(T("被精防扣 %d 杀气", "DEFLECTED: -%d SHACHI"), PDSH.amt()) end   -- §423
+    if MATCH.flags and MATCH.flags.stg then rules[#rules + 1] = string.format(T("连续精防 %d 次硬直：近战招 %g 秒 / 远程招 %g 秒", "%d DEFLECTS → STAGGER %gS MELEE / %gS RANGED"), STG.need(), STG.sec(), STG.secRanged()) end   -- §228 / §422
     if STD.active() then rules[#rules + 1] = T("标准数值", "STANDARD STATS") end
     do   -- 0.34：这一局用哪份数值表（主机那份 / 本地）、和服务器下发的是否一致（TASK_0.34 §4 边界：主机表同步保留但要告知）
         local role = MATCH.session and MATCH.session.role
@@ -6754,6 +8009,7 @@ function NET.adoptHostRules()
     for _, k in ipairs(NET.FLAG_KEYS) do
         if NET.rflag[k] ~= nil then NET.flagCfg[k] = NET.rflag[k] end
     end
+    if NET.flagFix then NET.flagFix() end
     for _, k in ipairs(NET.RES_KEYS) do
         if NET.rres[k] ~= nil then NET.resCfg[k] = NET.rres[k] end
     end
@@ -6903,11 +8159,13 @@ local function enter(p1, s, tn, why)
             local okC, gone = pcall(G.cancelMoves, who[1])
             if okC and gone and #gone > 0 then out("§364 倒计时取消%s还在放的招：%s", who[2], table.concat(gone, ",")) end
         end
+        do local okT, msgT = pcall(BLK.tenAttach, puppet())     -- §425.7 让游戏给替身开张力会话（精防 / 普防按游戏结果判要用）
+            if msgT then out("§425.7 倒计时给替身接输入：%s", okT and msgT or ("出错 " .. tostring(msgT))) end end
         local pos, yaw = spawnPoint()
         -- v0.26.0 强制归位只对 AI 对手（用户："主要是为了给 AI 在开战前保持一定距离，真人对战不需要"）：
         -- AI 只会跟着你走，不归位就贴着脸开打；真人自己会拉开距离，各自留在原地
         -- §238 用户 11-11："倒计时开始时各自归位"：有检查过的开战点（MATCH.sp）时真人对战也归位
-        if NET.rai or MATCH.sp then
+        if (NET.rai or MATCH.sp) and not (NET.rdummy and NET.rtrainReturn == false) then
             -- v0.26.2 安全放置（§79）：起点 = 开局时主机站的点（主机自己的出生点就是它，不用缩）
             local a = MATCH.arena
             local anchor = (MATCH.role ~= "host" and a) and { X = a.x, Y = a.y, Z = a.z + 20.0 } or nil
@@ -6917,7 +8175,7 @@ local function enter(p1, s, tn, why)
         end
         ARN.lock()                                         -- §238 倒计时里不能操作，开打开回
         refillPotions("第 " .. MATCH.round .. " 回合")     -- 已停用，只留着日志入口
-        if MATCH.round == 1 and MATCH.rebuildPuppet then
+        if MATCH.round == 1 and MATCH.rebuildPuppet and not (NET.rdummy and NET.rtrainReturn == false) then
             local okR, errR = pcall(MATCH.rebuildPuppet, "对局 #" .. MATCH.id .. " 开始")
             if not okR then out("!! 重建替身 -> %s", tostring(errR)) end
         end
@@ -6934,9 +8192,9 @@ local function enter(p1, s, tn, why)
         NET.rulesBegin(p1, "cd", "第 " .. MATCH.round .. " 回合倒计时", MATCH.round == 1, tn)
         out("== 第 %d 回合 倒计时 %.0f 秒（我 %d : %d 对方）；我是%s，%s ==",
             MATCH.round, CD_SEC, MATCH.me, MATCH.op, MATCH.role == "host" and "主机" or "客机",
-            (NET.rai or MATCH.sp) and string.format("%s，归位到出生点 (%.0f, %.0f) 朝向 %.0f%s", NET.rai and "对手是 AI" or "真人对战",
+            (NET.rai or MATCH.sp) and not (NET.rdummy and NET.rtrainReturn == false) and string.format("%s，归位到出生点 (%.0f, %.0f) 朝向 %.0f%s", NET.rai and "对手是 AI" or "真人对战",
                 pos.X, pos.Y, yaw, MATCH.sp and string.format("（开战点，两人相距 %.0f 米）", MATCH.sp.d * 2 / 100.0) or "")
-                or "真人对战、没有开战点，不强制归位")
+                or "本回合不强制归位")
         if MATCH.state ~= "idle" then return end
         s = "idle"
     end
@@ -6952,12 +8210,16 @@ local function enter(p1, s, tn, why)
         out("== 第 %d 回合 开打 ==", MATCH.round)
         if TAGD then pcall(TAGD.schedule, tn) end      -- §249 状态对比：第 1 回合开打后 3 秒（只排一次）
     elseif s == "rend" then
+        if TRAINING and NET.rdummy then TRAINING.roundEnd(tostring(MATCH.id) .. ":" .. tostring(MATCH.round), tn) end
         PCB.off(p1, "第 " .. tostring(MATCH.round) .. " 回合结束")      -- §261
         if HLFX then pcall(HLFX.clearFx, "第 " .. tostring(MATCH.round) .. " 回合结束") end   -- §246 回合结束也清
         out("== 第 %d 回合结束：%s（我 %d : %d 对方）==", MATCH.round,
             MATCH.win == "d" and ((RT.info and RT.info.round == MATCH.round) and "时间到、受伤一样，平局不计分" or "同时倒下，平局不计分")
                 or (iWon() and "我赢" or "对方赢"), MATCH.me, MATCH.op)      -- §173.9 限时判的平局不是"同时倒下"
     elseif s == "end" then
+        if NET.rdummy and NET.rtrainHpRegen == false and TRAINING and TRAINING.allowed() then
+            TRAINCTX.restartAt = tn + 1
+        end
         PCB.off(p1, "对局结束")                                          -- §261
         if HLFX then pcall(HLFX.clear, "对局结束") end   -- §246 对局结束：补出来的特效全清、探针次数归零
         out("== 对局结束：%s %d : %d ==", MATCH.me > MATCH.op and "胜利" or "失败", MATCH.me, MATCH.op)
@@ -8416,24 +9678,19 @@ function NETUI.roomItem(k, lb)
     else
         it = { label = s.lbl(s.cfg()) .. (s.tail or T("（主机设置，下一局生效）", " (HOST, NEXT MATCH)")), act = s.click }
     end
-    -- 11-18：多人房（淘汰 / 积分）不用"局数 / 回合时限"（它有自己的命数 / 时限，在玩法设置页），
-    -- 隐藏掉，别让人以为改了会影响多人对局。对决和旧版 1v1 都用这两项，照常显示。
-    if it and BASEHOOK.inMp() and k == "npos" then
-        it.label = it.label .. T("（只用于 1v1）", " (1v1 ONLY)")
-    end
     return it
 end
 -- §171 房间设置页：全部按类折叠（一次只展开一类，展开最多的一类也不超出面板行数）。
 -- 11-18 用户"顶部这些（标准数值 / 武器平衡 / 饰品 / 生效饰品数量 / 禁用饰品 / 禁用武器 / 禁用影之武装）
 -- 合并成一个叫'对局平衡设置'的分类里"：原来置顶的 7 项收进第一个折叠类
--- npos（严格跟随）在系统设置 → 网络；没归类的新键自动进"其他"
+-- npos（严格跟随）11-23 起不在任何页显示（固定开）；没归类的新键自动进"其他"
 NETUI.ROOM_TOP = {}
 NETUI.ROOM_CATS = {
     -- 11-18 用户"房间设置里的几局几胜 / 对局时间移到旧版 1v1 分类里"：bo / tl 挪去最后一类；
     -- 对决的这两项在"玩法设置"页里改（同一个 NET.boCfg / NET.resCfg.tl，两边都是入口）
     { id = "balance", zh = "对局平衡设置", en = "MATCH BALANCE", keys = { "std", "bal", "acc", "accn", "accban", "wpnban", "edgeban" } },   -- §176 / §180
     { id = "match", zh = "对局", en = "MATCH", keys = { "dm", "bar" } },
-    { id = "combat", zh = "战斗规则", en = "COMBAT", keys = { "dif", "ab", "ctr", "med", "gcd", "dgc", "swk", "sycd", "stg" } },     -- §216 / §228 / §266 对局难度
+    { id = "combat", zh = "战斗规则", en = "COMBAT", keys = { "dif", "ab", "ctr", "med", "dgc", "swk", "sycd", "stg", "stgm", "stgr", "pdsh", "pdshv" } },     -- §216 / §228 / §266 对局难度
     { id = "res", zh = "开局资源", en = "STARTING RESOURCES", keys = { "ult0", "ultx", "sp0", "resm" } },
     { id = "spec", zh = "旧版 1v1", en = "CLASSIC 1V1", spec = true, keys = { "bo", "tl" } },   -- 11-18 局数 / 时限 + 观战排队（旧版 1v1 才显示）
 }
@@ -8546,6 +9803,7 @@ end
 -- 0.34 最终方案 4：数值表不再自动下发，玩家点一下才向大厅服务器要（先二次确认）；显示本地缓存的哈希 / 时间和上次结果。
 -- 11-18 用户"获取最新数值表的功能，移到一键套用盟主规则下面"：从系统设置 → 对局 挪到房间设置页底部（"一键套用武林盟主规则…"和"返回"之间）。
 local function cfgFetchItems(lb, items)
+    if not (CFG and CFG.SERVER_TABLE) then return end      -- 11-22 这个版本不用服务器下发的数值表：不显示获取按钮
     local ch, cat = (lb.cfgh or "") ~= "" and lb.cfgh or nil, tonumber(lb.cfgat) or 0
     items[#items + 1] = { label = T("服务器数值表：", "SERVER TABLE: ")
                               .. (ch and (ch .. (cat > 0 and ("  " .. os.date("%m-%d %H:%M", cat)) or "")) or T("没有（用模组自带的）", "NONE (BUILT-IN)"))
@@ -8739,8 +9997,7 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
                 items[#items + 1] = { label = T("  客机跟主机；桥接要双方都启用并同意", "  Guests follow the host; the bridge needs both sides"), col = COL_LABEL }
             end
         end
-        local npos = NETUI.roomItem("npos", lb)
-        if npos then items[#items + 1] = npos end
+        -- 11-23 对手位置严格跟随（npos）从面板拿掉、固定开（NET.FLAG_FIXED）
         -- §125 桥接连接自检（单机能跑，约 12 秒）：看游戏有没有把外部服务的连接回调送到，结果写进 net\bridge_conn.log（F4c-2：只在装了桥接扩展包时显示）
         if NETUI.hasBridge() then
             local svc = NETUI.bridgeSvc()
@@ -8812,9 +10069,13 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
         items[#items + 1] = dstatBtn
         aiRoomItems()
         if aiLv == 3 then
+            items[#items + 1] = { label = T("木桩训练设置…", "DUMMY TRAINING..."), act = page("training") }
+        end
+        items[#items + 1] = { label = T("AI 特殊资源设定…", "AI RESOURCE OVERRIDES..."), act = page("training:resources") }
+        if aiLv == 3 then
             -- 两条都控制在半角 56 格以内：一条写太长会把整个文字面板撑出屏幕（§398）
-            items[#items + 1] = { label = T("（木桩：站着不动、不出招、不防、不会死、不限时）",
-                                            "(DUMMY: STANDS STILL, NEVER ATTACKS OR DIES)") }
+            items[#items + 1] = { label = T("（木桩：出招、防御与资源可在训练设置中调整）",
+                                            "(DUMMY: CONFIGURABLE MOVES, DEFENSE AND RESOURCES)") }
             items[#items + 1] = { label = T("（默认不带饰品；伤害按完整一招算）",
                                             "(NO ACCESSORIES; DAMAGE COUNTS THE WHOLE MOVE)") }
         end
@@ -8830,6 +10091,10 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
         items[#items + 1] = { label = T("AI 装备…", "AI LOADOUT..."), act = page("aiload") }     -- §114
         items[#items + 1] = dstatBtn
         aiRoomItems()
+        if aiLv == 3 then
+            items[#items + 1] = { label = T("木桩训练设置…", "DUMMY TRAINING..."), act = page("training") }
+        end
+        items[#items + 1] = { label = T("AI 特殊资源设定…", "AI RESOURCE OVERRIDES..."), act = page("training:resources") }
         if lb.aiwait == "1" then
             items[#items + 1] = { label = NETUI.viaServer(roomMode) and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制房间地址（发给朋友）", "COPY MY ADDRESS"),
                                   act = function() netuiCmd("copy"); netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end }
@@ -9033,6 +10298,14 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
 end
 UI.defaultItems = netuiDefaultItems
 -- F3b-5：影之刃零的面板页按名字注册回核心（内容还在上面各段里）；排位四页在排位扩展包 ext/ranked/client.lua 里注册（F4b；11-13 搬进扩展包）
+UI.page("training", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.items(lb, items, page) end, { "联机 · 木桩训练", "ONLINE · DUMMY TRAINING" })
+UI.page("training:actions", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.actions(lb, items, page) end, { "木桩 · 重复出招", "DUMMY · REPEATED MOVES" })
+UI.page("training:defense", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.defense(lb, items, page) end, { "木桩 · 防御闪避", "DUMMY · GUARD AND DODGE" })
+UI.page("training:health", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.health(lb, items, page) end, { "木桩 · 血量杀气", "DUMMY · HEALTH AND CHI" })
+UI.page("training:resources", function(lb, tn, items, page)
+    if lb.mode ~= "ai" or (BASEHOOK.mp and BASEHOOK.mp.inMp and BASEHOOK.mp.inMp()) then return false end
+    if TRAINING then TRAINING.items(lb, items, page, netuiFlash) end
+end, { "本地AI · 特殊资源", "LOCAL AI · RESOURCES" })
 UI.page("aiload", function(lb, tn, items, page) NETUI.aiLoadItems(lb, items, page) end, { "联机 · AI 装备", "ONLINE · AI LOADOUT" })     -- §114 AI 装备
 UI.page("aipick", function(lb, tn, items, page) NETUI.aiPickItems(lb, items, page) end, { "联机 · AI 装备 · 选择", "ONLINE · AI LOADOUT · PICK" })
 UI.page("dstat", function(lb, tn, items, page) if not DSTAT then return false end; DSTAT.items(lb, items, page, netuiFlash) end, { "联机 · 招式伤害统计", "ONLINE · DAMAGE PER MOVE" })     -- §342
@@ -9042,6 +10315,7 @@ UI.page("phrases", function(lb, tn, items, page) if not CHAT.phraseItems(lb, ite
 UI.page("thanks", function(lb, tn, items, page)     -- v0.27.21 感谢名单（设置里的一页）：参与测试并反馈了 bug 的玩家
         items[#items + 1] = { label = T("特别感谢：", "SPECIAL THANKS:") }     -- 11-15 用户：伊格尼斯单独列出，感谢一直以来对数值平衡的贡献
         items[#items + 1] = { label = "  " .. T("伊格尼斯 —— 一直以来对数值平衡做出的贡献", "伊格尼斯 - for the ongoing contributions to damage balance") }
+        items[#items + 1] = { label = "  " .. T("Decision of Fate 与其小伙伴 —— 技术与测试支持", "Decision of Fate and friends - for technical and testing support") }     -- 11-23 用户加
         items[#items + 1] = { label = T("参与测试并反馈了 bug 的玩家（B 站）：", "PLAYERS WHO TESTED AND REPORTED BUGS (BILIBILI):") }
         for _, n in ipairs({ "成步堂芦苇", "谦逊的刘恒宇", "亦如黎明中的花朵_", "絡訸", "化境", "一一清梦以及他的小伙伴们", "、（你没看错）" }) do items[#items + 1] = { label = "  " .. n } end
         items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
@@ -9828,6 +11102,14 @@ local function matchStep(p1, tn)
     PP.poll()
     holdStep(tn)
     aiSwapStep(p1, tn)
+    if TRAINCTX and TRAINCTX.restartAt then
+        if not (NET.rdummy and NET.rtrainHpRegen == false and TRAINING.allowed()) then
+            TRAINCTX.restartAt = nil
+        elseif not MATCH.role and tn >= TRAINCTX.restartAt and tn - NET.lastRecvAt < 1 then
+            TRAINCTX.restartAt = nil
+            startMatchNow()
+        end
+    end
     local lost = tn - NET.lastRecvAt
     lobbyStep(p1, tn, lost)
     if MATCH.role == "client" then
@@ -9907,7 +11189,7 @@ local function matchStep(p1, tn)
             end
             RT.track(hp)          -- §173 本回合受到的伤害（时间到时比）
             local regen = hp and hp > DEAD_HP and MATCH.fightHp and hp ~= MATCH.fightHp and savedByBreakRegen(p1, hp, tn)
-            if hp and (hp <= DEAD_HP or regen) and MATCH.dead ~= MATCH.round then
+            if hp and (hp <= DEAD_HP or regen) and MATCH.dead ~= MATCH.round and not (TRAINING and TRAINING.infinite("hp")) then
                 MATCH.dead = MATCH.round
                 if regen then
                     out("◆ 我在第 %d 回合倒下（血量 %.2f -> %.2f：致命一刀同时破防，慈母护符补回的血不算）",
@@ -11034,7 +12316,7 @@ return { step = matchStep, start = matchStart, saveArena = saveArena, place = pl
          -- §141.14 退出观战时把玩家安全放到主机站过的地面旁边（safePlace 是这里的局部函数）
          safePlace = safePlace,
          -- 多人混战 ②d（pbz_multi.lua）：倒下判定（含慈母护符那种"致命一刀同时破防回血"）、倒地动作停在最后一帧
-         mpDead = function(p1, hp, tn) return hp <= DEAD_HP or savedByBreakRegen(p1, hp, tn) end, fallDown = fallDown,
+         mpDead = function(p1, hp, tn) return not (TRAINING and TRAINING.infinite("hp")) and (hp <= DEAD_HP or savedByBreakRegen(p1, hp, tn)) end, fallDown = fallDown,
          peerName = function() local lb = netuiRead(now()) or {}; return (lb.peername or "") ~= "" and lb.peername or nil end }
 end)()
 
@@ -11372,6 +12654,7 @@ function OPPBAR.step(tn)
     if not sameObj(bar, OPPBAR.bar) then
         OPPBAR.bar, OPPBAR.last, OPPBAR.nameAt, OPPBAR.tries = bar, {}, tn, 0
         out("对手血条：已显示（%s）", short(pathOf(bar)))
+        if G.bossBarSweep then G.bossBarSweep(nil, { bar }) end     -- §443 同一个 HUD 上没人认领的空血条收起来
     end
     -- 替身自己的属性变了 → 血条被拉回替身的值了，重写
     local pHp, pSh = hpOf(pup), attrOf(pup, "Shachi")
@@ -11543,6 +12826,7 @@ local function onTick()
     if valid(p1) and not STD.cleaned and ST.stableTicks > 30 then STD.cleanup() end     -- §144 上次没还原的强制配装
     if not valid(p1) then
         if ST.stableTicks > 0 then out("玩家角色不可用（读档/切图？），暂停") end
+        if DAMAGEPARTS then DAMAGEPARTS.reset() end
         ST.stableTicks = 0
         REC.on = false
         RECM.stopReplay("玩家不可用")
@@ -11561,6 +12845,8 @@ local function onTick()
 
     RECM.recordStep()
     RECM.replayStep()
+    if SHADOWPASSIVES then FMATCH.guard(SHADOWPASSIVES, 'err', 'shadow passives', SHADOWPASSIVES.step, p1, now()) end
+    if DAMAGEPARTS then FMATCH.guard(DAMAGEPARTS, 'err', 'damage part probe', DAMAGEPARTS.step, p1, now()) end
     netStep()
     FMATCH.guard(OPPBAR, "err", "对手血条", OPPBAR.step, now())
     if ST.uiProbeAt and ST.ticks >= ST.uiProbeAt then
@@ -11653,6 +12939,9 @@ function M4.forgetWorld()
     GCD.reset("换世界")          -- §184 只清 Lua 状态（记着的技能实例是旧世界的）
     DCD.reset("换世界")          -- §200
     STG.forget()                 -- §228 锁着的输入下一次 STG.frame 开回
+    if CTRREC then CTRREC.reset() end -- Drop observations only; never touch old-world objects.
+    if CTRD then CTRD.forget() end
+    if SEG1121 then SEG1121.reset() end
     ARN.forget()                 -- §238 标记跟着旧世界没了；锁着的输入下一个事件开回
     if HLFX then pcall(HLFX.clear, "换世界", true) end   -- §246 换世界：只丢 Lua 引用，不碰旧世界对象（同 ARN.forget 的规矩）
     M4.forgetSafe()
@@ -12040,7 +13329,59 @@ bind(Key.INS, function() UIM.next("Insert") end, "界面三态")       -- §314 
 -- §352 本地 AI 按真人那套：我还在放的招（act=）、替身挨打 / 被控（pst=）（base_aisync.lua）
 AISYNC = BASEPARTS.load("aisync", { out = function(...) return out(...) end, NET = NET, ST = ST, G = G, isAttackAbility = isAttackAbility,
     attrOf = function(...) return attrOf(...) end })      -- §353 psq=：替身本机杀气
-DSTAT = BASEPARTS.load("dstat", { out = function(...) return out(...) end, NET = NET })     -- §342.4 T / 颜色模块里经 EXTCTX 现取（这里的 T / COL_* 是 nil）
+DSTAT = BASEPARTS.load("dstat", { out = function(...) return out(...) end, NET = NET, G = G,
+    touchTotal = function(id) return (TOUCH.dmg and TOUCH.dmg[id]) or (TOUCH.lingerDmg and TOUCH.lingerDmg[id]) end })     -- §342.4 T / 颜色模块里经 EXTCTX 现取（这里的 T / COL_* 是 nil）
+TRAINUI = BASEPARTS.load("training_ui", {
+    command = function(...) local X = EXTCTX; if X and X.netuiCmd then return X.netuiCmd(...) end end,
+    status = function() return NET.rtrainUnsupported end })
+TRAINCTX = {}
+function TRAINCTX.roomScope()
+    local X = EXTCTX
+    local lb = X and X.NETUI and X.NETUI.lobby or {}
+    local known = lb.mode ~= nil and lb.mode ~= ""
+    local ranked = lb.mode == "ranked" or lb.rk == "1"
+    return { enabled = known and not ranked, training = known and not ranked, ranked = ranked }
+end
+function TRAINCTX.scope()
+    local mp = BASEHOOK.mp
+    if mp and mp.inMp and mp.inMp() and mp.trainingScope then return mp.trainingScope() end
+    local X = EXTCTX
+    local lb = X and X.NETUI and X.NETUI.lobby or {}
+    local ai = lb.mode == "ai" and lb.rk ~= "1" and NET.rai ~= false
+    return { kind = "local_ai", enabled = ai, training = ai, ranked = not ai, authoritative = true,
+        spectator = false, localSlot = 1, session = ai and ("ai:" .. tostring(MATCH.id or 0)) or nil }
+end
+function TRAINCTX.emptyBreak(pup)
+    if not (TRAINING and TRAINING.allowed() and NET.rdummy and MATCH.state == "fight"
+        and NET.rtrainChi == "empty" and not NET.rtrainAiChi) then
+        TRAINCTX.emptyBreakToken = nil
+        return
+    end
+    if not valid(pup) then return end
+    local token = tostring(MATCH.id) .. ":" .. tostring(MATCH.round) .. ":" .. pathOf(pup)
+    if TRAINCTX.emptyBreakToken == token then return end
+    TRAINCTX.emptyBreakToken = token
+    setAttr(pup, "Shachi", 0)
+    local ok = RECM.activateOnPuppet(pup, "GA_Hun_BreakEscape_C", NET.sub, "木桩空杀气破防")
+    if not ok then out("木桩空杀气：本轮破防技能未激活，不重复强制播放") end
+end
+TRAINING = BASEPARTS.load("training", { G = G, DSTAT = DSTAT, NET_DIR = NET_DIR,
+    T = function(a, b) local X = EXTCTX; return X and X.T and X.T(a, b) or a end,
+    scope = TRAINCTX.scope,
+    members = function()
+        local mp = BASEHOOK.mp
+        if mp and mp.inMp and mp.inMp() and mp.trainingMembers then return mp.trainingMembers() end
+        return {}
+    end,
+    actors = function()
+        local mp = BASEHOOK.mp
+        if mp and mp.inMp and mp.inMp() and mp.trainingActors then return mp.trainingActors() end
+        return { { actor = puppet(), kind = "ai" } }
+    end,
+    onConfig = function(cfg, wire)
+        local X, s = EXTCTX, TRAINCTX.scope()
+        if X and X.netuiCmd and s.kind == "local_ai" and s.authoritative then X.netuiCmd("aicfg", wire) end
+    end })
 
 DIAG = BASEPARTS.load("diag", { ST = ST, NET_DIR = NET_DIR, G = G,
     isAttackAbility = isAttackAbility, playNamed = playNamed, dge = function() return DGE end,
@@ -12054,7 +13395,7 @@ DIAG = BASEPARTS.load("diag", { ST = ST, NET_DIR = NET_DIR, G = G,
 -- 函数里引用的还是同一张表）。跑的时候 PEER.on = true：不判定、不回报、不改攻击力；"你"（锁定、瞄准、光柱）= 另一个替身（PEER.tgt）。
 -- 全局（主代码块 local 已满 200 个）
 PEER = { on = false, cur = nil,
-         MODS = { "NET", "AIR", "DGE", "INF", "CHG", "ANIM", "ZMX", "BOWN", "BOWAIM", "BOWEYE", "ULT", "PHEAL", "LAT", "PRED",
+         MODS = { "NET", "AIR", "DGE", "DDIR", "INF", "CHG", "ANIM", "ZMX", "BOWN", "BOWAIM", "BOWEYE", "ULT", "PHEAL", "LAT", "PRED",
                   "NPM", "RMS", "SUMMON", "PUPFC" },
          -- ST / LO 太大、大部分是本机自己的：只换替身用的这些
          STK = { "ticks", "secondPC", "secondPawn", "pupAtkAt", "lockSetKey", "lockAim", "lockLogAt", "lockLogs", "pupEdgeAt",
@@ -12070,6 +13411,7 @@ PEER = { on = false, cur = nil,
          -- 常量（EDGE_SCALE / ZM_HEAL …）、按类 / 路径做键的缓存（edgeCache / sigCache / abIndex / geMiss / appc）、只限制日志条数的计数共用
          LOK = { "appliedAt", "appliedKey", "appliedAttKey", "atkDm", "atkScale", "dressed", "gaveTried", "guardAt", "has", "lastEdge",
                  "offKey", "stMain", "stOutfit", "stShachi", "switchBad", "switchOffAt", "swtHold", "wgeKey", "wgeFor", "wgeOn",
+                 "wgePendingKey", "wgeRetryAt", "wgeRetryFrom",
                  "pasKey", "pasReportAt", "dressErr", "pasErr", "wgeErr", "outfitErr", "scaleWhy", "lvNote" },
          LO_INIT = { atkScale = 1.0 } }     -- 新替身那份的初值（其余 nil，代码里都按 "or {}" / "or 0" 用）
 
@@ -12091,7 +13433,7 @@ PEER.LOT = LO         -- tests/test_spec_peer.py 看 LO 上的函数有没有被
 -- 全局模块：换的时候直接把全局名字指向这个替身自己那张表（只放状态；函数经元表取原模块的），换回来再指回原表 ——
 -- 不抄字段，换一次几微秒（11-10 第一版逐个抄 259 个字段，一次 1.2 毫秒，观战每秒 240 次 ≈ 280 毫秒，不能用）。
 -- NET / AIR 是主代码块的 local（函数里是上值，换不了名字）：逐个换字段，不新建表
-PEER.GLOB = { "DGE", "INF", "CHG", "ANIM", "ZMX", "BOWN", "BOWAIM", "BOWEYE", "ULT", "PHEAL", "LAT", "PRED", "NPM", "RMS", "SUMMON", "PUPFC" }
+PEER.GLOB = { "DGE", "DDIR", "INF", "CHG", "ANIM", "ZMX", "BOWN", "BOWAIM", "BOWEYE", "ULT", "PHEAL", "LAT", "PRED", "NPM", "RMS", "SUMMON", "PUPFC" }
 PEER.ORIG = {}
 for _, n in ipairs(PEER.GLOB) do PEER.ORIG[n] = _G[n] end
 
@@ -12114,7 +13456,9 @@ function PEER.new(tag, pup, ctl)
     for _, k in ipairs({ "rab", "raccban", "rai", "raim", "raimAt", "rarm", "ratt", "rav", "rbar", "rbo", "rbrkAt", "rdead", "rdm",
                          "remoteHp", "remoteHpm", "reye", "rgd", "rlk", "rlvS", "rlvW", "rmap", "rnm", "rof", "rpas", "rsh", "rshm",
                          "rwc", "rwcCur", "rwcOff", "rwcPin", "rwcs", "rwge", "rzmb", "rmt", "rarena", "rasp", "rrdy", "rquit", "rrly", "rStanceAt", "reequipIn",
-                         "pos", "vel", "brkIn", "hrIn", "medIn", "subIn", "lastHrAt", "lastHrTag" }) do n[k] = nil end     -- 对方的
+                         "pos", "vel", "brkIn", "hrIn", "medIn", "subIn", "lastHrAt", "lastHrTag",
+                         "trvIn", "rtrv", "rtrvAt" }) do n[k] = nil end     -- 对方的（§436 trv= 场景动作）
+    st.m.NPM.travFly, st.m.NPM.zOffAt, st.m.NPM.trav = nil, nil, nil       -- §436 这个替身自己的悬空 / 高度计时从头来
     n.lastSeq, n.lastRecvAt, n.driving, n.sub, n.wTried, n.rx, n.evIn, n.evLost = -1, -100, false, {}, nil, 0, 0, 0
     n.results, n.resId, n.resV, n.resAtk, n.remoteHp, n.rflag, n.rres = {}, 0, {}, {}, nil, {}, {}
     st.m.INF.r, st.m.INF.pup = nil, {}

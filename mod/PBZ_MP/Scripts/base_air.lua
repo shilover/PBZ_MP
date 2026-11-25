@@ -18,7 +18,16 @@ local out, hpOf, attrOf, montageOf = ctx.out, ctx.hpOf, ctx.attrOf, ctx.montageO
 --         （AI 控制的替身 Jump() 不起作用）。初速按对方现在的竖直速度和高度差折算：同一个角色类、同样的重力，弧线和对方一样。
 --         drivePuppet 只改 XY、保留 Velocity.Z，瞬移也是摆到对方的 Z，都不会把替身拉回地面
 --   空中招事件到了而替身还在地上：先起跳，招排队，等替身离地（最多 WAIT 秒）再放；排队期间后面的事件也排着，保持顺序
+-- 11-23 对决 17:09:16（用户"锤子实际测试还不行"）：对方 跳 → 长柄金瓜空中下砸，两个事件同一包到。替身刚放跳跃技能那一下
+-- 移动组件报 IsFalling = true（AI 替身的 Jump 起不来，0.23 秒后"还在地上"），onEvent 当成"已在空中"直接放 → 技能走空中分支
+-- 播下落姿势 SpecialAttack_07_03，替身其实没离地、等不到落地，卡在下落姿势 11.73 秒（技能到回合结束才没）。
+--   ① 跳跃技能刚放（JUMP_GRACE 内）报的"在空中"不算数：照样先 Launch 起跳、招排队
+--   ② 兜底：空中招放出来时替身在空中，之后落了地 STUCK 秒、动作还是放出来时那个（落地没接上落地动作）
+--      → 补一个小跳让它真落一次地；再 STUCK2 秒还这样就取消这招（只在这种卡住的情况）
 local AIR = { LIFT_VZ = 150.0, LIFT_DZ = 60.0, MAX_VZ = 2000.0, WAIT = 0.35, JUMP_GRACE = 0.2, LAND_GRACE = 0.3,
+              STUCK = 0.8, STUCK2 = 1.2, KICK_VZ = 350.0, STUCK_MAX = 8.0, mv = false, stuckN = 0,
+              -- ② 只管"空中一段动作、落地换另一段"的招（一段动作跨落地的空中招落地后本来就还在原动作上，不能当卡住）
+              LAND_NEXT = { GA_JinGua_Air_C = "Hun_ShaChi_JinGua_SpecialAttack_08_Montage" },
               queue = {}, launched = false, launchAt = -100, jumpGAAt = -100, gaLogged = -100, gaLogs = 0,
               rair = nil, rvz = 0.0, n = 0, airOf = G.airOf, launch = G.launch }
 
@@ -64,10 +73,12 @@ function AIR.fire(p1, pup, e, tn)
     -- §223 观战替身（PEER.on）：对方那边已经按规则放出来了才会发来，照放（不挡倒计时 / 闪避冷却）；
     -- 不判定、不回报（addResult / openJudge 自己看 PEER.on）
     local spec = PEER.on
+    CHG.onAnyFire(pup, e, tn, isAttackAbility(e.name))        -- §409.1 对方放了下一招 → 上一招的按住续转停
     if not spec then
         BAL.noteStance(BAL.rStance, e.name, tn)                    -- §186.3 对方放了架势
         if CDL.puppet(e, tn) then addResult("miss", e.id, 0, tn); return true end      -- §173.7 倒计时里替身不出招
         if DCD.puppet(e, tn) then addResult("miss", e.id, 0, tn); return true end      -- §200 对方闪避冷却中：替身不放
+        if MCD.puppet(e, tn) then addResult("miss", e.id, 0, tn); return true end      -- §426 对方招式冷却中：替身不放
     end
     if not RECM.replayable(e.name) then addResult("miss", e.id, 0, tn); return true end   -- §182 旧版对方发来的不该放的（处决等）替身不放
     if BOWN.defer(pup, e, tn, AIR.fire) then return true end      -- §139.3 独眼弓 R2：等对方松手再射
@@ -82,6 +93,9 @@ function AIR.fire(p1, pup, e, tn)
     -- §106 武器平衡：放之前就把这招的系数写进替身攻击力（以前等下一次驱动，前摇极短的招可能先出伤害）
     -- §203 summon 行里有的招不算攻击也记（玉双环鬼魅闪身：残影反打的追踪飞环按闪身那一下的系数 + 留场秒数算，闪身本身不进 isAttackAbility）
     if (isAttackAbility(e.name) or BAL.SUMMON[e.name]) and BAL.onFire(BAL.resolve(e.name, BAL.rStance, tn), tn) then LO.rescale(pup, tn) end   -- §186.3 架势里按强化版
+    DDIR.before(pup, e, tn)                                  -- §421 影武闪避招：替身挂上对方的闪避方向
+    if HJHC then HJHC.before(pup, e, tn) end                 -- §446 火铳连射：记第一发 / 第二发放之前替身的状态
+    if LUTE and LUTE.preFire then pcall(LUTE.preFire, p1, pup, e, tn) end      -- §449 破阵曲：放之前读一次技能实例（只读）
     local inp = INP.press(pup, e.name, e.id)                -- §140 实验：先按住键
     local ok, real, pend = RECM.activateOnPuppet(pup, e.name, NET.sub, (spec and "观战 " .. PEER.cur.tag .. " " or "") .. "远端#" .. e.id)
     PEER.note(ok)
@@ -103,8 +117,10 @@ function AIR.fire(p1, pup, e, tn)
     if ok and inp then INP.log("输入实验：远端#%d 替身技能接上 Ability Input Component：%s", e.id, G.linkAbilityInput(pup, e.name)) end
     if not ok and inp then INP.release(e.id, "没放出来") end
     if ok and not pend then ZMX.onFire(pup, e, tn) end                               -- §119 紫冥剑 DB：起手停住等对方召唤
+    if ok and not pend and LDASH and e.name == LDASH.GA then LDASH.start("替身", pup, tn, "远端#" .. e.id) end   -- §448 移商换羽
     if ok and not pend and CHG.watched(e.name) then CHG.watch(pup, "替身", e.name, tn, e.id) end
     if ok and not pend and e.name:find("_Jump", 1, true) then AIR.jumpGAAt = tn end
+    if ok and not pend and AIR.LAND_NEXT[e.name] then AIR.watchMove(pup, e, tn) end      -- ② 卡在下落姿势的兜底
     return ok
 end
 
@@ -121,7 +137,11 @@ function AIR.onEvent(p1, pup, e, tn)
     if #AIR.queue == 0 then
         if not AIR.isAirMove(e.name) then return false end
         local st = AIR.airOf(pup)
-        if not st or st.falling then return false end         -- 已经在空中（或读不到移动组件）：照常放
+        if not st then return false end                        -- 读不到移动组件：照常放
+        -- ① 跳跃技能刚放那一下的 IsFalling 不可信（AI 替身其实起不来）：当成在地上，照样先起跳
+        local justJumped = st.falling and not AIR.launched and (tn - AIR.jumpGAAt) < AIR.JUMP_GRACE
+        if st.falling and not justJumped then return false end   -- 真在空中：照常放
+        if justJumped then out("空中招 %s：替身刚放跳跃技能 %.2f 秒、报在空中不算数，照样先起跳再放", e.name, tn - AIR.jumpGAAt) end
         if PUPCC.held(pup) then return false end              -- §237 被控住不先起跳：照常放（游戏自己挡）
         if tn - AIR.launchAt > AIR.WAIT then
             local loc = try("pup loc", function() return pup:K2_GetActorLocation() end)
@@ -133,10 +153,50 @@ function AIR.onEvent(p1, pup, e, tn)
     return true
 end
 
+-- ② 空中招放出来了：记下来看它落地后有没有接上落地动作
+function AIR.watchMove(pup, e, tn)
+    local st = AIR.airOf(pup)
+    AIR.mv = { id = e.id, name = e.name, at = tn, m0 = "", air0 = st and st.falling or false, ground = nil, kick = nil }
+end
+
+function AIR.stuckStep(pup, st, tn)
+    local w = AIR.mv
+    if not w then return end
+    if tn - w.at > AIR.STUCK_MAX then AIR.mv = false; return end
+    local m = montageOf and montageOf(pup) or ""
+    if w.m0 == "" then                                         -- 放出来 0.1 秒后的动作 = 这招自己的（刚放那一帧可能还是上一个）
+        if tn - w.at < 0.1 or m == "" then return end
+        w.m0 = m
+    end
+    if st.falling then w.air0, w.ground = true, nil; return end
+    if not w.air0 then AIR.mv = false; return end              -- 在地上放出来的（地面版落地砸）：游戏自己会走完，不管
+    if m ~= w.m0 then AIR.mv = false; return end               -- 落地接上了别的动作：正常
+    w.ground = w.ground or tn
+    if LO and LO.activeInstance and not LO.activeInstance(pup, w.name) then AIR.mv = false; return end
+    if not w.kick then
+        if tn - w.ground < AIR.STUCK then return end
+        w.kick, w.ground = tn, nil
+        AIR.stuckN = AIR.stuckN + 1
+        local ok = AIR.launch(pup, { X = 0.0, Y = 0.0, Z = AIR.KICK_VZ })
+        out("!! 远端#%d %s 替身落地 %.1f 秒还卡在 %s（落地没接上）→ 补一个小跳让它真落一次地：LaunchCharacter %s（第 %d 次）",
+            w.id, w.name, AIR.STUCK, w.m0, ok and "成功" or "失败", AIR.stuckN)
+    elseif tn - w.kick >= AIR.STUCK + AIR.STUCK2 and w.ground and tn - w.ground >= AIR.STUCK then
+        AIR.mv = false
+        local gone = {}
+        if G.cancelAbilities then
+            local okC, r = pcall(G.cancelAbilities, pup, function(n) return n == w.name end)
+            if okC and type(r) == "table" then gone = r end
+        end
+        out("!! 远端#%d %s 补跳后还卡在 %s → 取消这招（%s）", w.id, w.name, w.m0,
+            #gone > 0 and table.concat(gone, ",") or "没取消到")
+    end
+end
+
 -- 每帧（netStep 驱动替身之后）：按对方状态起跳、放排队的招
 function AIR.step(p1, pup, tn)
     local st = AIR.airOf(pup)
     if not st then return end
+    if AIR.mv then AIR.stuckStep(pup, st, tn) end
     local loc = try("pup loc", function() return pup:K2_GetActorLocation() end)
     local dz = (NET.pos and loc) and (NET.pos.Z - loc.Z) or 0.0
     -- 这一跳结束：对方不在空中（或旧版不知道）、替身落了地
@@ -209,6 +269,112 @@ function DGE.step(pup, tn)
         out("  对方闪避 %s，替身是 %s → 换成对方的：%s（换过 %d 次，本来就对 %d 次）", w.m, cur ~= "" and cur or "（没动作）",
             ok and "已播" or "播放失败（本机没有这个动作）", DGE.fixed, DGE.same)
     end
+end
+
+-- §421 影之武装闪避招的方向（用户 11.23"羽弓 闪避中的射击好像没成功同步过去"）。
+-- 闪避射击 GA_UnnamedBow_Dash（和继承 GA_ShachiAbility_Dash_Base 的游龙叉 / 雷枪 / 虎炮 / 琵琶 / 黄金火铳冲刺招）在
+-- GetTimelineToUse 里问角色身上有没有 Ability.Action.Hun.Dash.Direction.F/B/L/R/N（松散标签），还读摇杆
+-- （GetCurrentMoveInputRaw）。替身没有摇杆、自己的闪避是原地后撤 → 走后撤那一支：11-23 日志真人播
+-- ArrowMan_DuYan_SpecialAttack_03_C（往右闪），替身播 04_B，箭的组数 / 方向都不对，15:37 三发对方一次没回报受击。
+-- 做法：发送方每次闪避时读自己身上的方向标签，状态包带 ddir=<F/B/L/R/N>（读不到 "-"）；接收方记下对方最近一次闪避的方向
+-- （没有 ddir= 的旧版按 dg= 的闪避动作名推），对方 FRESH 秒内闪避过、又放这几招时，先撤掉替身身上别的方向标签、挂上对方的，
+-- KEEP 秒后撤回自己挂的。只在放这几招时动标签，不轮询（DDIR.step 只在挂着时看一眼时间）
+DDIR = { FRESH = 1.5, KEEP = 2.5, LOG_MAX = 30, logs = 0, mineLogs = 0, MINE_LOG_MAX = 20,
+         PREFIX = "Ability.Action.Hun.Dash.Direction.", DIRS = { "F", "B", "L", "R", "N" },
+         GA = { GA_UnnamedBow_Dash_C = 1, GA_YouLongCha_Dash_C = 1, GA_ThunderSpear_Dash_C = 1, GA_TigerCannon_Dash_C = 1,
+                GA_Lute_Dash_C = 1, GA_HuangJinHuoChong_Dash_C = 1 },
+         nIn = nil, dir = nil, at = -100, src = nil, held = nil, fixed = 0, none = 0 }
+
+function DDIR.tagList()
+    local l = {}
+    for i, d in ipairs(DDIR.DIRS) do l[i] = DDIR.PREFIX .. d end
+    return l
+end
+
+-- 标签全名列表 → "R,B"（只留方向字母）
+function DDIR.short(list)
+    local s = {}
+    for _, t in ipairs(list or {}) do s[#s + 1] = t:sub(#DDIR.PREFIX + 1) end
+    return #s > 0 and table.concat(s, ",") or "无"
+end
+
+-- 闪避动作名 → 方向（旧版对方没有 ddir= 时的退路）。Dash_BS = 没推摇杆的原地后撤，按 N
+function DDIR.fromMontage(m)
+    if type(m) ~= "string" then return nil end
+    if m:find("_Dash_BS", 1, true) then return "N" end
+    return m:match("Dodge_([FBLR])") or m:match("_Roll_([FBLR])") or m:match("_Dash_([FBLR])$") or m:match("_Dash_([FBLR])_")
+end
+
+-- 发送方：闪避动作刚换上时读一次自己身上的方向标签（5 个 HasMatchingGameplayTag）。返回 "F"/"B"/"L"/"R"/"N"/"-"
+function DDIR.mine(p1, hm)
+    local hit = G.tagsMatching and G.tagsMatching(p1, DDIR.tagList()) or nil
+    local d = (hit and hit[1]) and hit[1]:sub(#DDIR.PREFIX + 1) or "-"
+    if DDIR.mineLogs < DDIR.MINE_LOG_MAX then
+        DDIR.mineLogs = DDIR.mineLogs + 1
+        out("§421 我闪避 %s：方向标签 %s（按动作推是 %s）", tostring(hm), hit and DDIR.short(hit) or "读不到",
+            tostring(DDIR.fromMontage(hm)))
+    end
+    return d
+end
+
+-- 接收方：放这个包的出招事件之前看 dg= / ddir=（同一个包里先闪避后出招也赶得上）。第一次收到只记次数（同 DGE）
+function DDIR.onPacket(t, tn)
+    local n, m = (t.dg or ""):match("^(%d+):([%w_%-]+)$")
+    n = tonumber(n)
+    if not n then return end
+    if DDIR.nIn and n > DDIR.nIn then
+        local d = type(t.ddir) == "string" and t.ddir:match("^([FBLRN])$") or nil
+        if d then DDIR.dir, DDIR.src = d, "对方标签"
+        else DDIR.dir, DDIR.src = DDIR.fromMontage(m), "按动作 " .. m end
+        DDIR.at = tn
+    end
+    DDIR.nIn = n
+end
+
+-- AIR.fire 放招之前：只有这几招动替身的方向标签
+function DDIR.before(pup, e, tn)
+    if not DDIR.GA[e.name] or REP.on or not G.looseTag then return end
+    if DDIR.held then DDIR.release() end
+    local d, age = DDIR.dir, tn - (DDIR.at or -100)
+    if not d or age > DDIR.FRESH then
+        DDIR.none = DDIR.none + 1
+        if DDIR.logs < DDIR.LOG_MAX then
+            DDIR.logs = DDIR.logs + 1
+            out("§421 远端#%d %s：对方 %.1f 秒内没有闪避方向（%s），按替身自己的", e.id, e.name, DDIR.FRESH,
+                d and string.format("上一次 %s 在 %.1f 秒前", d, age) or "没收到过")
+        end
+        return
+    end
+    local want = DDIR.PREFIX .. d
+    local had = G.tagsMatching(pup, DDIR.tagList()) or {}
+    local removed, has = {}, false
+    for _, tg in ipairs(had) do
+        if tg == want then has = true
+        elseif G.looseTag(pup, tg, false) then removed[#removed + 1] = tg end
+    end
+    local added = (not has) and G.looseTag(pup, want, true) or false
+    if added then DDIR.held = { pup = pup, tag = want, at = tn } end
+    DDIR.fixed = DDIR.fixed + 1
+    if DDIR.logs < DDIR.LOG_MAX or DDIR.fixed % 20 == 0 then
+        DDIR.logs = DDIR.logs + 1
+        out("§421 远端#%d %s：替身闪避方向 → %s（%s，%.2f 秒前）；替身原有 %s，撤掉 %s；%s（第 %d 次）", e.id, e.name, d,
+            tostring(DDIR.src), age, DDIR.short(had), DDIR.short(removed),
+            has and "本来就是这个方向" or (added and "已挂上" or "挂不上"), DDIR.fixed)
+    end
+end
+
+-- 撤回自己挂的（技能结束时游戏自己可能已经撤了：先看还在不在）
+function DDIR.release()
+    local h = DDIR.held
+    DDIR.held = nil
+    if not (h and valid(h.pup)) then return end
+    local still = G.tagsMatching(h.pup, { h.tag }) or {}
+    if #still > 0 then G.looseTag(h.pup, h.tag, false) end
+end
+
+function DDIR.step(pup, tn)
+    local h = DDIR.held
+    if h and tn - h.at > DDIR.KEEP then DDIR.release() end
 end
 
 -- §160 冰冻以挨打方为准（内测 2026-11-08 16:24 v0.30.2："落下白影的武技，他身上那个 y 的追加攻击键都出来了，但对面还是在移动"）。
@@ -687,6 +853,7 @@ end
 -- §362.1 开打也收一次（用户 11-16："开完大招迅速投降重开一把，石蒜花没有立即刷新掉"）
 -- §362.2 按角色类收：自己 + 所有替身（多人房每人一个）放的一次扫完；p1 拿不到时退回只收替身的
 function RT.stopBullets(p1, pup, phase)
+    if CART and CART.live and #CART.live > 0 then pcall(CART.kill, phase) end   -- §442 力荡判定
     if not G.stopBullets then return end
     local who, a = "自己和替身", p1
     if not valid(a) then who, a = "替身", pup end
@@ -1113,6 +1280,24 @@ end
 function CHR.log(...)
     if CHR.logs < CHR.LOGS then CHR.logs = CHR.logs + 1; out(...) end
 end
+-- §255.1 中间步不出伤害：为了让替身到对的形态而放的寒冰 / 混沌切形态斩，对方屏幕上没有这两招（11-16 12:27 日志：
+-- 对方只出一招钢刃，替身先后放了 Skill_04 / Skill_05 / Skill_06）。放中间步前把替身攻击缩放置 0（LO.rescale 认 CHR.muted），
+-- 原招真放之前恢复（base_replay 在 CHR.lead 返回"不用切了"时调 CHR.unmute）；最多 MUTE_MAX 秒自己到期。
+CHR.MUTE_MAX = 3.0
+CHR.muteUntil = nil
+function CHR.muted(tn)
+    return CHR.muteUntil ~= nil and type(tn) == "number" and tn < CHR.muteUntil
+end
+function CHR.mute(pup)
+    CHR.muteUntil = now() + CHR.MUTE_MAX
+    if LO and LO.rescale and valid(pup) then pcall(LO.rescale, pup, now()) end
+end
+function CHR.unmute(pup)
+    if CHR.muteUntil == nil then return false end
+    CHR.muteUntil = nil
+    if LO and LO.rescale and valid(pup) then pcall(LO.rescale, pup, now()) end
+    return true
+end
 function CHR.tag(f) return "CharacterState.AbilityState.ChaosBlade." .. f end
 -- 替身现在的形态："Fire" / "Ice" / "Normal" / "none"；读不到标签返回 nil。切到一半两个都在时按新的算（Fire > Ice > Normal）
 function CHR.cur(pup)
@@ -1159,6 +1344,7 @@ function CHR.lead(pup, use, how, map, fire, n, sub)
     local ga = nxt and CHR.GA[nxt]
     if not ga or ga == use then return false end
     if not map[ga] then LO.give(pup, ga, map, true) end
+    CHR.mute(pup)
     local ok = fire(ga)
     if not ok then
         -- 上一步的切形态动作还没放完时下一步可能被挡：隔 0.2 秒再试（最多 MAXBUSY 次），不算一步
@@ -1255,7 +1441,8 @@ function CHFX.step(tn)
             local buff, eff = LO.CHAOS_FORM[q.form], LO.CHAOS_EFFECT[q.form]
             local bn = buff and buff:match("([%w_]+)$")
             local en = eff and eff:match("([%w_]+)$")
-            local tags = G.tagsMatching and G.tagsMatching(q.pup, { "CharacterState.AbilityState.ChaosBlade." .. q.form })
+            -- §345 漏改（11-22 日志"GE_Chaos_PhysicsBuff 1 份 / 标签不在 → 补 … 补了 3 次还是缺"）：物理形态标签叫 Normal
+            local tags = G.tagsMatching and G.tagsMatching(q.pup, { "CharacterState.AbilityState.ChaosBlade." .. (q.form == "Physics" and "Normal" or q.form) })
             local tagOn = tags and #tags > 0
             local miss = {}
             -- §245 以形态标签为准（WeaponBuff 形态 GE 可能挂在武器 ASC 上，geCounts 看不见，但标签在）；

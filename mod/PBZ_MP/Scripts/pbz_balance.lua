@@ -1,6 +1,6 @@
 -- PvP 每招独立的伤害系数（HANDOVER §106.4）。**可以手改**：改完重新部署（deploy.bat 会拷这个文件）。
 -- 替身放某招期间，替身的攻击力 Attack / ShachiAttack 乘这招的系数（伤害、杀气伤害一起按比例缩放，游戏自己算）；
--- 1 = 原版，0.5 = 一半，2 = 两倍。同一招的几段伤害一起缩，不能分段调。挨打的一方按这张表算，所以两边的表要一样。
+-- 1 = 原版，0.5 = 一半，2 = 两倍。moves 同招各段一起缩；segments 仅对明确伤害来源单独乘，无法识别或混合来源不猜。两边的表要一样。
 -- 注释 "实测 n=…，一下约 …% 血"：docs/BALANCE_EVAL.md 表 3，对方攻击 600、倍率 100%、满血约 3085 时**原版**一下打掉多少（全段中位）。
 -- family：只给这张表里**没有**的招（游戏更新后新出的招）当初值 / 兜底；改 family 不会改下面已经列出的招。
 -- 重新生成 / 补新招：python -X utf8 -I tools/gen_balance.py（已有的数保留）。
@@ -29,6 +29,7 @@
 --   键是 <武器>_<召唤物>，现在只有 ZiMingJian_HuoQiang（紫冥剑 DB 召唤火枪，main.lua GCD 段），其它键没人认；0–60 秒。一行写完，工具按一行读写。
 --   这一行整个没有（旧表 / 旧版主机下发的数值表没有 cd=）按 0.1 秒（§212 前是 15）；有这一行但没写某个键 = 那件不冷却。
 --   §212（2026-11-10 用户"火枪冷却去掉"）：ZiMingJian_HuoQiang 15 → 0.1——枪还在场时照样不能再召（GCD 在场挡要秒数 > 0 才开，写 0 会连在场挡一起关）。
+--   §426 GA_ 开头的键 = 那一招放出来起算的冷却（冷却里本机取消、不发，替身不放）：GA_Hun_Double_BBBB_C = 双刃第四段 5 秒（用户 11-24 定）；§435 用户改成冷却组 JueYingTrack = 1（绝影 ABB / AAABB / BBBB 共用 1 秒，组表在 base_wrules MCD.GROUP，原 BBBB 5 秒撤掉）
 --   §200 瞬影冷却也放这一行（用户 11-10："瞬影闪避结束后给 10 秒 cd"）：ShunYingDodge = 瞬影（天赋瞬身，架势 + 闪避，GA_Hun_SpecialDash_*）
 --   结束后多少秒才能再放，只挡瞬影自己；main.lua DCD 段。没写（旧表 / 旧版主机下发的 cd= 里没有）= 默认 10 秒，和火枪"没写 = 不冷却"不一样；要关就写 0。
 --   §200.10（用户 11-10"能给普通的闪避增加杀气消耗么 但是不给他冷却限制了"）：普通闪避 Dodge / 灵蛇剑架势闪避 SnakeDodge 的冷却撤了（这一行不再有这两个键；
@@ -73,16 +74,28 @@
 -- §370（2026-11-17 第五轮"布局火枪 +50%"，和"全部特殊攻击 +75%、整把基础 −20%"相乘）：火枪每发 1 → 1 × 0.8 × 1.75 × 1.5 = 2.1。
 --   布局 DB 定值 0.2 → 0.28（data/move_manual.csv）；锤 / 铁壁 ×1.25、幻化大锤火焰 ×0.75 是代码里分件乘（base_wrules.lua ZDB），不在这张表。
 --   线上下发表还是 1（f9a858d2），这里只是 main 的模组文件；下发前要用户确认（HANDOVER §370）。
+-- 11.21：data/balance_1121.csv 固定当前基线；gen_balance.py --apply-1121 精确相乘且重复执行不叠乘。
+-- segments：独立 BD 伤害倍率（不是整招摊开）；青铜仅 HoldB_Release_02_03 / BA_02 剑气，荡寇 Stand 两段 / DashIn_02，断肢 C_01/02/03。
+-- 11.20 影武分段（相对整招系数再乘；精确值和依据 data/move_override_1120.csv + docs/SHADOW_BALANCE_1120.md 11.22 节）：巨斧不蓄 Release_01_01 / 蓄力冲击波，
+--   虎炮不蓄 Normal 档爆炸、火力全开第一段 Ultimate_01，狮头拿出冲击波 Start，独眼弓普射 P1 / 满蓄 P3，游龙叉普通投掷，金瓜旋锤收尾，贪狼下砸，
+--   拙壁盾反伤冲击波，磷火龙卷地火（不算攻击动作），泥头车力荡 TurnAttack。同帧混了别的来源 / 挨打方身上有异常时不改（SEG1121 规则），按整招系数
+-- 11-24 绝影分身 −75%（用户）：分身是召唤物 BP_Monster_Hun_Summon_Double，放的是 Mobs/000_Hun 的 GA_Hun_Double_C_JueYing_Summon，
+--   判定全是带 _Summon 后缀的那 6 个（资产 deep.json：Crow_Summon / Crow_Near_Summon / Sweep_Summon / C_End_Summon / C_01_Summon / C_02_Summon），
+--   本体的绝影大招 / 连招用不带 _Summon 的，按判定名 ×0.25 只动分身那一下（挨打方 SEG1121.fix、我打本地 AI SEG1121.mine 同一套）。
+--   §438 双开实测（11-24 23:32）分身的普通招判定名和本体同名、没有 _Summon → 按出手者（伤害载荷 LastOwnerAvatar = BP_Monster_Hun_Summon_Double）认，伪判定名 JueYingClone ×0.25。
+-- TipsyLight / TipsyHeavy / DrunkHeavy / ChaosFireHeavy：共享判定按攻击者形态补乘；只认新鲜载荷，不按命中序数或场上子弹猜。
+-- 载荷对象池复用、同帧混合倍率或读不到来源时不补；需要游戏内逐段验证，离线测试不代表实机来源链已验证。
 -- §228 cost 里的 StaggerHits / StaggerSec = 精防硬直（房间设置 stg 开着时）：连续被精防几次触发、触发后关输入几秒（0.2–10）。随 co= 下发；没写 = 3 / 1（2026-11-11 用户定 1 秒，以前 2）。
 return {
 family = { Air = 0.85, Double = 0.85, SlitheringSword = 0.42, YanYueDao = 0.5, ZhanMa = 0.5, ZiMingJian = 0.8 },
 summon = { GA_Hun_AdvancedDash_Double_Jade_C = 3, GA_Hun_Jade_B_Dash_C = 4, GA_Hun_Jade_C_Range_C = 5, GA_Hun_Jade_DB_C = 3, GA_Hun_ZiMingJian_New_AAAAA_C = 4, GA_Hun_ZiMingJian_New_AAABB_C = 4, GA_Hun_ZiMingJian_New_AABB_C = 4, GA_Hun_ZiMingJian_New_ABB_C = 4, GA_Hun_ZiMingJian_New_BBB_C = 4, GA_Hun_ZiMingJian_New_CCC_C = 15, GA_Hun_ZiMingJian_New_CC_C = 15, GA_Hun_ZiMingJian_New_DB_C = 15 },
-cooldown = { ShunYingDodge = 10, ZiMingJian_HuoQiang = 0.1 },
+cooldown = { JueYingTrack = 1, ShunYingDodge = 10, ZiMingJian_HuoQiang = 0.1 },
 cost = { Dodge = 50, SnakeDodge = 50, StaggerHits = 3, StaggerSec = 1, SwitchKeepShachi = 1 },
 dot = { ChiRen = 0.25, GA_GlobalActionAbility_LieZhan_CB_C = 0.05, GA_GlobalActionAbility_LieZhan_C_C = 0.05, GA_Hun_ChiRen_AAAABB_C = 0.25, GA_Hun_ChiRen_AAAAB_C = 0.25, GA_Hun_ChiRen_AAAA_C = 0.25, GA_Hun_ChiRen_AAABB_C = 0.25, GA_Hun_ChiRen_AAAB_C = 0.33, GA_Hun_ChiRen_AAA_C = 0.16, GA_Hun_ChiRen_AABB_C = 0.16, GA_Hun_ChiRen_AAB_C = 0.25, GA_Hun_ChiRen_AA_C = 0.16, GA_Hun_ChiRen_ABB_C = 0.25, GA_Hun_ChiRen_AB_C = 0.25, GA_Hun_ChiRen_A_C = 0.16, GA_Hun_ChiRen_A_Draw_C = 0.16, GA_Hun_ChiRen_A_Snap_C = 0.25, GA_Hun_ChiRen_BBB_C = 0.25, GA_Hun_ChiRen_BB_C = 0.25, GA_Hun_ChiRen_BD_C = 0.25, GA_Hun_ChiRen_BSup_C = 0.5, GA_Hun_ChiRen_B_DashDraw_C = 0.25, GA_Hun_ChiRen_B_Dash_C = 0.25, GA_Hun_ChiRen_B_Draw_C = 0.33, GA_Hun_ChiRen_B_Snap_C = 0.25, GA_Hun_ChiRen_C_C = 0.54, GA_Hun_ChiRen_SWT_C = 0.16, GA_Hun_Iron_AAAAA_C = 0.59, GA_Hun_Iron_AAAA_C = 0.66, GA_Hun_Iron_AAABB_C = 0.78, GA_Hun_Iron_AAAB_C = 0.78, GA_Hun_Iron_AAA_C = 0.59, GA_Hun_Iron_AABB_C = 0.78, GA_Hun_Iron_AAB_C = 0.78, GA_Hun_Iron_AA_C = 0.66, GA_Hun_Iron_ABB_C = 0.78, GA_Hun_Iron_AB_C = 0.7, GA_Hun_Iron_A_C = 0.59, GA_Hun_Iron_A_DashDraw_C = 0.59, GA_Hun_Iron_A_Dash_C = 0.59, GA_Hun_Iron_A_Draw_C = 0.59, GA_Hun_Iron_A_Snap_C = 0.59, GA_Hun_Iron_BBB_C = 0.78, GA_Hun_Iron_BB_C = 0.78, GA_Hun_Iron_BChargeAttack_C = 1.0, GA_Hun_Iron_BCharge_C = 0.52, GA_Hun_Iron_B_C = 0.7, GA_Hun_Iron_B_DashDraw_C = 0.7, GA_Hun_Iron_B_Dash_C = 0.7, GA_Hun_Iron_B_Draw_C = 0.78, GA_Hun_Iron_BreakAct_02_C = 1.0, GA_Hun_Iron_C_C = 0.38, GA_Hun_Iron_SWT_C = 1.0, Iron = 1.0 },
 ctrl = { frost = 1 },
 chill = { dmg = 0 },
 sdmg = { ZiMingJian_HuoQiang = 2.1 },
+segments = { JueYingClone = 0.25, B_Hun_Horizontal_BladeWave_Stand_01 = 1.75, B_Hun_Horizontal_BladeWave_Stand_02 = 1.75, B_Hun_Horizontal_BladeWave_DashIn_02 = 3.8, B_Hun_JigSaw_C_01 = 1.5, B_Hun_JigSaw_C_02 = 1.5, B_Hun_JigSaw_C_03 = 1.5, BD_Hun_BronzeSword_HoldB_Release_02_03 = 1.145, BD_Hun_BronzeSword_BA_02 = 1.5, TipsyLight = 0.72, TipsyHeavy = 0.71, DrunkHeavy = 1.63, ChaosFireHeavy = 1.5, BD_Hun_BrutalAxe_Release_01_01 = 0.67213, BD_Hun_BrutalAxe_Release_02_Shock = 0.393443, BD_Hun_BrutalAxe_Release_03_Shock_01 = 0.393443, BD_Hun_BrutalAxe_Release_03_Shock_02 = 0.393443, B_TigerCannon_Normal = 1.6, B_TigerCannon_Explosion_Normal = 1.6, B_TigerCannon_Ultimate_01 = 0.08, B_LionHead_Start = 0.083333, B_LionHead_Start_Chaos = 0.083333, BD_GA_DuYan_Bow_Normal_P1_01 = 1.36744, BD_GA_DuYan_Bow_Normal_P3_01 = 0.930233, B_YouLongCha_Normal = 1.57424, BulletData_JinGua_RoAttack_03 = 0.550847, BulletData_TanLang_Normal_03 = 0.294118, BD_ZhuoBiDun_CounterAttack_Wave = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_02 = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_Sub = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_Sub_02 = 0.48, BD_Hun_HuoLiuXing_DB_GroundFire_01 = 1.35135, BD_NiTouChe_Overlap_TurnAttack = 0.0816, BulletData_JinGua_ExtraAttack_02 = 2.22222, BD_Hun_JinGua_Release_03_Charge2 = 0.43, BD_Hun_JinGua_Release_03_Charge3 = 0.64, BulletData_TieKuangQuanTao_Charge_A_Lv2_02 = 0.83, BulletData_TieKuangQuanTao_Charge_AA_Lv2 = 0.83, BulletData_TieKuangQuanTao_Charge_AAA_Lv2 = 0.83, BD_Hun_BrutalAxe_Release_02_01 = 0.5, BD_Hun_BrutalAxe_Release_02_02 = 0.5, BD_Hun_BrutalAxe_Release_03_01 = 0.7, BD_Hun_BrutalAxe_Release_03_02 = 0.7, BD_Hun_BrutalAxe_Release_03_03 = 0.7, B_GA_UnnamedBow_Dash_L_01 = 0.566667, B_GA_UnnamedBow_Dash_L_02 = 0.566667, B_GA_UnnamedBow_Dash_L_03 = 0.566667, B_GA_UnnamedBow_Dash_R_01 = 0.566667, B_GA_UnnamedBow_Dash_R_02 = 0.566667, BD_GA_Hun_Double_JueYing_C_Crow_Summon = 0.25, BD_GA_Hun_Double_JueYing_C_Crow_Near_Summon = 0.25, BD_GA_Hun_Double_JueYing_C_Sweep_Summon = 0.25, BD_GA_Hun_JueYing_C_End_Summon = 0.25, B_Hun_JueYing_C_01_Summon = 0.25, B_Hun_JueYing_C_02_Summon = 0.25 },
 moves = {
 
 -- ==== 黑伤双刃 · 空中（Air，3 招）
@@ -136,48 +149,48 @@ moves = {
   GA_Hun_BronzeSword_B_Hold_C = 0.5,
   GA_Hun_BronzeSword_B_Snap_C = 0.81,
   GA_Hun_BronzeSword_C_C = 2.22,
-  GA_Hun_BronzeSword_SWT_C = 0.9,  -- 实测 n=3，一下约 13% 血
+  GA_Hun_BronzeSword_SWT_C = 0.792,  -- 实测 n=3，一下约 13% 血
 
 -- ==== 刺骨混沌（Chaos，46 招）
   GA_Hun_Chaos_AAAAA_C = 0.65,  -- 实测 n=1，一下约 19% 血
   GA_Hun_Chaos_AAAA_C = 0.52,
-  GA_Hun_Chaos_AAABB_Fire_C = 0.29,
+  GA_Hun_Chaos_AAABB_Fire_C = 0.435,
   GA_Hun_Chaos_AAABB_Ice_C = 0.18,
   GA_Hun_Chaos_AAABB_Physics_C = 0.31,
-  GA_Hun_Chaos_AAAB_Fire_C = 0.29,
+  GA_Hun_Chaos_AAAB_Fire_C = 0.435,
   GA_Hun_Chaos_AAAB_Ice_C = 0.18,
   GA_Hun_Chaos_AAAB_Physics_C = 0.31,
   GA_Hun_Chaos_AAA_C = 0.5,  -- 实测 n=2，一下约 15% 血
-  GA_Hun_Chaos_AABB_Fire_C = 0.12,
+  GA_Hun_Chaos_AABB_Fire_C = 0.18,
   GA_Hun_Chaos_AABB_Ice_C = 0.38,
   GA_Hun_Chaos_AABB_Physics_C = 0.58,
-  GA_Hun_Chaos_AAB_Fire_C = 0.25,
+  GA_Hun_Chaos_AAB_Fire_C = 0.375,
   GA_Hun_Chaos_AAB_Ice_C = 0.43,
   GA_Hun_Chaos_AAB_Physics_C = 0.59,
   GA_Hun_Chaos_AA_C = 0.38,  -- 实测 n=4，一下约 12% 血
-  GA_Hun_Chaos_ABB_Fire_C = 0.22,
+  GA_Hun_Chaos_ABB_Fire_C = 0.33,
   GA_Hun_Chaos_ABB_Ice_C = 0.43,
   GA_Hun_Chaos_ABB_Physics_C = 0.44,
-  GA_Hun_Chaos_AB_Fire_C = 0.35,  -- 实测 n=1，一下约 47% 血
+  GA_Hun_Chaos_AB_Fire_C = 0.525,  -- 实测 n=1，一下约 47% 血
   GA_Hun_Chaos_AB_Ice_C = 0.43,  -- 实测 n=1，一下约 72% 血
   GA_Hun_Chaos_AB_Physics_C = 0.69,
   GA_Hun_Chaos_A_C = 0.6,  -- 实测 n=3，一下约 28% 血
   GA_Hun_Chaos_A_DashDraw_C = 0.46,
   GA_Hun_Chaos_A_Dash_C = 0.46,
   GA_Hun_Chaos_A_Draw_C = 0.39,
-  GA_Hun_Chaos_BBB_Fire_C = 0.24,  -- 实测 n=1，一下约 17% 血
+  GA_Hun_Chaos_BBB_Fire_C = 0.36,  -- 实测 n=1，一下约 17% 血
   GA_Hun_Chaos_BBB_Ice_C = 0.43,
   GA_Hun_Chaos_BBB_Physics_C = 0.58,  -- 实测 n=1，一下约 1% 血
-  GA_Hun_Chaos_BB_Fire_C = 0.11,  -- 实测 n=1，一下约 14% 血
+  GA_Hun_Chaos_BB_Fire_C = 0.165,  -- 实测 n=1，一下约 14% 血
   GA_Hun_Chaos_BB_Ice_C = 0.43,
   GA_Hun_Chaos_BB_Physics_C = 0.28,  -- 实测 n=1，一下约 6% 血
   GA_Hun_Chaos_B_DashDraw_C = 0.35,
   GA_Hun_Chaos_B_Dash_C = 0.15,
   GA_Hun_Chaos_B_Draw_C = 0.34,
-  GA_Hun_Chaos_B_Fire_C = 0.31,  -- 实测 n=5，一下约 2% 血
+  GA_Hun_Chaos_B_Fire_C = 0.465,  -- 实测 n=5，一下约 2% 血
   GA_Hun_Chaos_B_Hold_Fire_C = 1.09,
   GA_Hun_Chaos_B_Hold_Ice_C = 0.61,  -- 实测 n=1，一下约 71% 血
-  GA_Hun_Chaos_B_Hold_Physics_C = 0.52,
+  GA_Hun_Chaos_B_Hold_Physics_C = 0.6916,
   GA_Hun_Chaos_B_Ice_C = 0.43,  -- 实测 n=2，一下约 46% 血
   GA_Hun_Chaos_B_Physics_C = 0.4,  -- 实测 n=2，一下约 25% 血
   GA_Hun_Chaos_C_C = 0.25,  -- 实测 n=5，一下约 15% 血
@@ -215,18 +228,18 @@ moves = {
 -- ==== 痴者残剑（ChiZheCanJian，29 招）
   GA_Hun_ChiZheCanJian_A_Snap_C = 0.53,
   GA_Hun_ChiZheCanJian_B_Snap_C = 0.5,
-  GA_Hun_ChiZheCanJian_C_C = 0.51,
-  GA_Hun_ChiZheCanJian_C_ToZui_C = 0.51,  -- §249 估：无实测；同武器 C 蓄力重击 0.79（C_C），转醉段先按同一系数，待实测
-  GA_Hun_ChiZheCanJian_C_Zui_C = 0.34,
-  GA_Hun_ChiZheCanJian_Drunk_AAAAA_C = 0.42,
-  GA_Hun_ChiZheCanJian_Drunk_AAAA_C = 0.42,
-  GA_Hun_ChiZheCanJian_Drunk_AAA_C = 0.33,
-  GA_Hun_ChiZheCanJian_Drunk_AA_C = 0.42,
-  GA_Hun_ChiZheCanJian_Drunk_A_C = 0.42,
+  GA_Hun_ChiZheCanJian_C_C = 0.408,
+  GA_Hun_ChiZheCanJian_C_ToZui_C = 0.408,  -- §249 估：无实测；同武器 C 蓄力重击 0.79（C_C），转醉段先按同一系数，待实测
+  GA_Hun_ChiZheCanJian_C_Zui_C = 0.272,
+  GA_Hun_ChiZheCanJian_Drunk_AAAAA_C = 0.3024,
+  GA_Hun_ChiZheCanJian_Drunk_AAAA_C = 0.3024,
+  GA_Hun_ChiZheCanJian_Drunk_AAA_C = 0.2376,
+  GA_Hun_ChiZheCanJian_Drunk_AA_C = 0.3024,
+  GA_Hun_ChiZheCanJian_Drunk_A_C = 0.3024,
   GA_Hun_ChiZheCanJian_Drunk_A_DashChild_C = 0.28,
-  GA_Hun_ChiZheCanJian_Drunk_BBB_C = 0.34,
-  GA_Hun_ChiZheCanJian_Drunk_BB_C = 0.31,
-  GA_Hun_ChiZheCanJian_Drunk_B_C = 0.09,
+  GA_Hun_ChiZheCanJian_Drunk_BBB_C = 0.5542,
+  GA_Hun_ChiZheCanJian_Drunk_BB_C = 0.5053,
+  GA_Hun_ChiZheCanJian_Drunk_B_C = 0.1467,
   GA_Hun_ChiZheCanJian_Normal_AAAAA_C = 0.56,
   GA_Hun_ChiZheCanJian_Normal_AAAA_C = 0.46,
   GA_Hun_ChiZheCanJian_Normal_AAA_C = 0.39,
@@ -238,10 +251,10 @@ moves = {
   GA_Hun_ChiZheCanJian_Normal_B_C = 0.67,
   GA_Hun_ChiZheCanJian_Normal_B_DashChild_C = 0.45,
   GA_Hun_ChiZheCanJian_PerfectDodge_C = 1.0,
-  GA_Hun_ChiZheCanJian_SWT_C = 0.98,
-  GA_Hun_ChiZheCanJian_Tipsy_BBB_C = 0.34,
-  GA_Hun_ChiZheCanJian_Tipsy_BB_C = 0.34,  -- 实测 n=1，一下约 49% 血
-  GA_Hun_ChiZheCanJian_Tipsy_B_C = 0.34,  -- 实测 n=2，一下约 26% 血
+  GA_Hun_ChiZheCanJian_SWT_C = 0.7938,
+  GA_Hun_ChiZheCanJian_Tipsy_BBB_C = 0.2414,
+  GA_Hun_ChiZheCanJian_Tipsy_BB_C = 0.2414,  -- 实测 n=1，一下约 49% 血
+  GA_Hun_ChiZheCanJian_Tipsy_B_C = 0.2414,  -- 实测 n=2，一下约 26% 血
 
 -- ==== 黑伤双刃（Double，41 招）
   GA_Hun_Double_AAAAAA_C = 0.49,
@@ -309,12 +322,12 @@ moves = {
   GA_Hun_DualHook_BBB_C = 0.57,  -- 实测 n=1，一下约 18% 血
   GA_Hun_DualHook_BB_C = 0.46,
   GA_Hun_DualHook_B_C = 0.68,
-  GA_Hun_DualHook_B_DashDraw_C = 0.49,
-  GA_Hun_DualHook_B_Dash_C = 0.65,
+  GA_Hun_DualHook_B_DashDraw_C = 0.392,
+  GA_Hun_DualHook_B_Dash_C = 0.52,
   GA_Hun_DualHook_B_Draw_C = 0.9,
   GA_Hun_DualHook_B_Pursure_C = 0.52,
   GA_Hun_DualHook_B_Snap_C = 0.9,
-  GA_Hun_DualHook_C_C = 0.33,
+  GA_Hun_DualHook_C_C = 0.3003,
   GA_Hun_DualHook_DB_SWT_C = 0.59,
   GA_Hun_DualHook_PerfectDodge_GEx_C = 0.9,
   GA_Hun_DualHook_PerfectDodge_HeavyAttack_C = 0.9,
@@ -322,15 +335,15 @@ moves = {
 
 -- ==== 白山风雷剑（FengLeiJian，30 招）
   GA_Hun_FengLeiJian_AAAA_C = 0.45,
-  GA_Hun_FengLeiJian_AAABB_C = 0.53,
-  GA_Hun_FengLeiJian_AAAB_C = 0.5,
+  GA_Hun_FengLeiJian_AAABB_C = 0.4505,
+  GA_Hun_FengLeiJian_AAAB_C = 0.425,
   GA_Hun_FengLeiJian_AAA_C = 0.74,
-  GA_Hun_FengLeiJian_AABAB_C = 0.4,
+  GA_Hun_FengLeiJian_AABAB_C = 0.34,
   GA_Hun_FengLeiJian_AABA_C = 0.42,
-  GA_Hun_FengLeiJian_AABB_C = 0.36,
-  GA_Hun_FengLeiJian_AAB_C = 0.81,
+  GA_Hun_FengLeiJian_AABB_C = 0.306,
+  GA_Hun_FengLeiJian_AAB_C = 0.6885,
   GA_Hun_FengLeiJian_AA_C = 0.25,
-  GA_Hun_FengLeiJian_AB_C = 0.76,
+  GA_Hun_FengLeiJian_AB_C = 0.646,
   GA_Hun_FengLeiJian_A_C = 0.31,
   GA_Hun_FengLeiJian_A_DashDraw_C = 1.02,
   GA_Hun_FengLeiJian_A_Dash_C = 0.48,
@@ -338,17 +351,17 @@ moves = {
   GA_Hun_FengLeiJian_A_Snap_C = 0.91,
   GA_Hun_FengLeiJian_Air_A_C = 1.36,
   GA_Hun_FengLeiJian_Air_A_Draw_C = 1.36,
-  GA_Hun_FengLeiJian_Air_B_C = 0.42,
-  GA_Hun_FengLeiJian_Air_B_Draw_C = 0.21,
-  GA_Hun_FengLeiJian_BBBB_C = 0.36,
-  GA_Hun_FengLeiJian_BBB_C = 0.35,
-  GA_Hun_FengLeiJian_BB_C = 0.57,
-  GA_Hun_FengLeiJian_B_C = 0.51,
-  GA_Hun_FengLeiJian_B_DashDraw_C = 0.47,
-  GA_Hun_FengLeiJian_B_Dash_C = 0.68,
-  GA_Hun_FengLeiJian_B_Draw_C = 0.51,
-  GA_Hun_FengLeiJian_B_Hold_C = 0.57,
-  GA_Hun_FengLeiJian_B_Snap_C = 0.9,
+  GA_Hun_FengLeiJian_Air_B_C = 0.357,
+  GA_Hun_FengLeiJian_Air_B_Draw_C = 0.1785,
+  GA_Hun_FengLeiJian_BBBB_C = 0.306,
+  GA_Hun_FengLeiJian_BBB_C = 0.2975,
+  GA_Hun_FengLeiJian_BB_C = 0.4845,
+  GA_Hun_FengLeiJian_B_C = 0.4335,
+  GA_Hun_FengLeiJian_B_DashDraw_C = 0.3995,
+  GA_Hun_FengLeiJian_B_Dash_C = 0.578,
+  GA_Hun_FengLeiJian_B_Draw_C = 0.4335,
+  GA_Hun_FengLeiJian_B_Hold_C = 0.4845,
+  GA_Hun_FengLeiJian_B_Snap_C = 0.765,
   GA_Hun_FengLeiJian_C_C = 0.31,
   GA_Hun_FengLeiJian_SWT_Power_C = 0.26,
 
@@ -394,31 +407,31 @@ moves = {
   GA_Hun_GuiTouBlade_SWT_C = 0.44,
 
 -- ==== 黑魔伤（淬炼黑伤）（HeiMoShang，27 招）
-  GA_Hun_HeiMoShang_AAAAAA_C = 0.52,  -- 实测 n=1，一下约 38% 血
-  GA_Hun_HeiMoShang_AAAAABB_C = 0.52,
-  GA_Hun_HeiMoShang_AAAAAB_C = 0.57,  -- 实测 n=1，一下约 43% 血
-  GA_Hun_HeiMoShang_AAAAA_C = 0.48,  -- 实测 n=1，一下约 35% 血
-  GA_Hun_HeiMoShang_AAAAB_Alt_C = 0.83,
-  GA_Hun_HeiMoShang_AAAA_C = 0.61,  -- 实测 n=2，一下约 53% 血
-  GA_Hun_HeiMoShang_AAABB_C = 1.16,
-  GA_Hun_HeiMoShang_AAAB_C = 0.75,  -- 实测 n=1，一下约 16% 血
-  GA_Hun_HeiMoShang_AAA_C = 1.0,  -- 实测 n=5，一下约 12% 血
-  GA_Hun_HeiMoShang_AABB_C = 0.43,  -- 实测 n=1，一下约 12% 血
-  GA_Hun_HeiMoShang_AAB_C = 0.33,  -- 实测 n=2，一下约 15% 血
-  GA_Hun_HeiMoShang_AA_C = 0.55,  -- 实测 n=6，一下约 16% 血
-  GA_Hun_HeiMoShang_ABB_C = 0.73,  -- 实测 n=1，一下约 66% 血
-  GA_Hun_HeiMoShang_AB_C = 1.07,  -- 实测 n=9，一下约 18% 血
-  GA_Hun_HeiMoShang_A_C = 0.69,  -- 实测 n=9，一下约 22% 血
-  GA_Hun_HeiMoShang_A_DashDraw_C = 0.61,
-  GA_Hun_HeiMoShang_A_Dash_C = 0.81,  -- 实测 n=4，一下约 25% 血
-  GA_Hun_HeiMoShang_A_Draw_C = 0.93,
-  GA_Hun_HeiMoShang_BBBB_C = 0.54,  -- 实测 n=4，一下约 30% 血
-  GA_Hun_HeiMoShang_BBB_C = 1.08,  -- 实测 n=7，一下约 21% 血
-  GA_Hun_HeiMoShang_BB_C = 0.61,  -- 实测 n=11，一下约 20% 血
-  GA_Hun_HeiMoShang_B_C = 0.71,  -- 实测 n=15，一下约 7% 血
-  GA_Hun_HeiMoShang_B_DashDraw_C = 0.49,
-  GA_Hun_HeiMoShang_B_Dash_C = 0.3,  -- 实测 n=1，一下约 14% 血
-  GA_Hun_HeiMoShang_B_Draw_C = 0.8,
+  GA_Hun_HeiMoShang_AAAAAA_C = 0.546,  -- 实测 n=1，一下约 38% 血
+  GA_Hun_HeiMoShang_AAAAABB_C = 0.546,
+  GA_Hun_HeiMoShang_AAAAAB_C = 0.5985,  -- 实测 n=1，一下约 43% 血
+  GA_Hun_HeiMoShang_AAAAA_C = 0.504,  -- 实测 n=1，一下约 35% 血
+  GA_Hun_HeiMoShang_AAAAB_Alt_C = 0.8715,
+  GA_Hun_HeiMoShang_AAAA_C = 0.6405,  -- 实测 n=2，一下约 53% 血
+  GA_Hun_HeiMoShang_AAABB_C = 1.218,
+  GA_Hun_HeiMoShang_AAAB_C = 0.7875,  -- 实测 n=1，一下约 16% 血
+  GA_Hun_HeiMoShang_AAA_C = 1.05,  -- 实测 n=5，一下约 12% 血
+  GA_Hun_HeiMoShang_AABB_C = 0.4515,  -- 实测 n=1，一下约 12% 血
+  GA_Hun_HeiMoShang_AAB_C = 0.3465,  -- 实测 n=2，一下约 15% 血
+  GA_Hun_HeiMoShang_AA_C = 0.5775,  -- 实测 n=6，一下约 16% 血
+  GA_Hun_HeiMoShang_ABB_C = 0.7665,  -- 实测 n=1，一下约 66% 血
+  GA_Hun_HeiMoShang_AB_C = 1.1235,  -- 实测 n=9，一下约 18% 血
+  GA_Hun_HeiMoShang_A_C = 0.7245,  -- 实测 n=9，一下约 22% 血
+  GA_Hun_HeiMoShang_A_DashDraw_C = 0.6405,
+  GA_Hun_HeiMoShang_A_Dash_C = 0.8505,  -- 实测 n=4，一下约 25% 血
+  GA_Hun_HeiMoShang_A_Draw_C = 0.9765,
+  GA_Hun_HeiMoShang_BBBB_C = 0.567,  -- 实测 n=4，一下约 30% 血
+  GA_Hun_HeiMoShang_BBB_C = 1.134,  -- 实测 n=7，一下约 21% 血
+  GA_Hun_HeiMoShang_BB_C = 0.6405,  -- 实测 n=11，一下约 20% 血
+  GA_Hun_HeiMoShang_B_C = 0.7455,  -- 实测 n=15，一下约 7% 血
+  GA_Hun_HeiMoShang_B_DashDraw_C = 0.5145,
+  GA_Hun_HeiMoShang_B_Dash_C = 0.315,  -- 实测 n=1，一下约 14% 血
+  GA_Hun_HeiMoShang_B_Draw_C = 0.84,
   GA_Hun_HeiMoShang_C1_C = 0.1,  -- 实测 n=1，一下约 113% 血
   GA_Hun_HeiMoShang_SWT_C = 0.46,  -- 实测 n=4，一下约 77% 血
 
@@ -446,6 +459,9 @@ moves = {
   GA_Hun_Horizontal_CounterAttack_01_C = 0.4,
   GA_Hun_Horizontal_CounterAttack_02_C = 0.62,
   GA_Hun_Horizontal_SWT_Power_C = 1.0,
+
+-- ==== 泥头车（影之武装 · 马车，§143 / 11.20）（HorseCart，1 招）
+  GA_HorseCart_Charge_C = 1.2,
 
 -- ==== 残钢刃（Iron，27 招）
   GA_Hun_Iron_AAAAA_C = 0.65,
@@ -477,31 +493,31 @@ moves = {
   GA_Hun_Iron_SWT_C = 0.83,  -- 实测 n=1，一下约 6% 血
 
 -- ==== 玉双环（Jade，27 招）
-  GA_Hun_Jade_AAAAAA_C = 0.92,
-  GA_Hun_Jade_AAAAA_C = 0.78,
-  GA_Hun_Jade_AAAA_C = 0.74,
-  GA_Hun_Jade_AAABB_C = 0.32,
-  GA_Hun_Jade_AAAB_C = 0.27,  -- 实测 n=1，一下约 21% 血
-  GA_Hun_Jade_AAA_C = 0.36,  -- 实测 n=2，一下约 12% 血
-  GA_Hun_Jade_AABB_C = 0.3,
-  GA_Hun_Jade_AAB_C = 0.19,
-  GA_Hun_Jade_AA_C = 0.62,  -- 实测 n=2，一下约 10% 血
-  GA_Hun_Jade_ABB_C = 0.59,
-  GA_Hun_Jade_AB_C = 0.34,  -- 实测 n=2，一下约 29% 血
-  GA_Hun_Jade_A_C = 0.62,  -- 实测 n=3，一下约 24% 血
-  GA_Hun_Jade_A_DashDraw_C = 0.74,
-  GA_Hun_Jade_A_Dash_C = 0.62,
-  GA_Hun_Jade_A_Draw_C = 0.45,
-  GA_Hun_Jade_A_Snap_C = 0.61,
-  GA_Hun_Jade_BBBB_C = 0.31,  -- 实测 n=3，一下约 22% 血
-  GA_Hun_Jade_BBB_C = 0.73,  -- 实测 n=3，一下约 6% 血
-  GA_Hun_Jade_BB_C = 0.49,  -- 实测 n=6，一下约 18% 血
-  GA_Hun_Jade_B_C = 0.49,  -- 实测 n=5，一下约 8% 血
-  GA_Hun_Jade_B_DashDraw_C = 1.48,
-  GA_Hun_Jade_B_Dash_C = 0.24,
-  GA_Hun_Jade_B_Draw_C = 0.75,
-  GA_Hun_Jade_B_Snap_C = 0.55,
-  GA_Hun_Jade_C_Range_C = 0.59,
+  GA_Hun_Jade_AAAAAA_C = 0.966,
+  GA_Hun_Jade_AAAAA_C = 0.819,
+  GA_Hun_Jade_AAAA_C = 0.777,
+  GA_Hun_Jade_AAABB_C = 0.336,
+  GA_Hun_Jade_AAAB_C = 0.2835,  -- 实测 n=1，一下约 21% 血
+  GA_Hun_Jade_AAA_C = 0.378,  -- 实测 n=2，一下约 12% 血
+  GA_Hun_Jade_AABB_C = 0.315,
+  GA_Hun_Jade_AAB_C = 0.1995,
+  GA_Hun_Jade_AA_C = 0.651,  -- 实测 n=2，一下约 10% 血
+  GA_Hun_Jade_ABB_C = 0.6195,
+  GA_Hun_Jade_AB_C = 0.357,  -- 实测 n=2，一下约 29% 血
+  GA_Hun_Jade_A_C = 0.651,  -- 实测 n=3，一下约 24% 血
+  GA_Hun_Jade_A_DashDraw_C = 0.777,
+  GA_Hun_Jade_A_Dash_C = 0.651,
+  GA_Hun_Jade_A_Draw_C = 0.4725,
+  GA_Hun_Jade_A_Snap_C = 0.6405,
+  GA_Hun_Jade_BBBB_C = 0.3255,  -- 实测 n=3，一下约 22% 血
+  GA_Hun_Jade_BBB_C = 0.7665,  -- 实测 n=3，一下约 6% 血
+  GA_Hun_Jade_BB_C = 0.5145,  -- 实测 n=6，一下约 18% 血
+  GA_Hun_Jade_B_C = 0.5145,  -- 实测 n=5，一下约 8% 血
+  GA_Hun_Jade_B_DashDraw_C = 1.554,
+  GA_Hun_Jade_B_Dash_C = 0.252,
+  GA_Hun_Jade_B_Draw_C = 0.7875,
+  GA_Hun_Jade_B_Snap_C = 0.5775,
+  GA_Hun_Jade_C_Range_C = 0.7965,
   GA_Hun_Jade_PerfectDodge_C = 0.9,
   GA_Hun_Jade_SWT_C = 0.11,  -- 实测 n=1，一下约 35% 血
 
@@ -550,7 +566,7 @@ moves = {
   GA_Hun_FengLeiJian_FengLeiState_SpecailAttack_02_C = 0.35,
   GA_Hun_Horizontal_BladeWave_C = 0.46,
   GA_Hun_Iron_Buff_C = 0.84,
-  GA_Hun_Jade_DB_C = 0.15,
+  GA_Hun_Jade_DB_C = 0.225,
   GA_Hun_Long_BSup_C = 0.95,
   GA_Hun_LuanYing_Buff_C = 0.51,
   GA_Hun_LuanYing_P2_Buff_C = 0.41,
@@ -561,7 +577,7 @@ moves = {
   GA_Hun_SlitheringSword_DB5_C = 0.4,
   GA_Hun_SnakeDual_DB_C = 0.16,
   GA_Hun_XieShan_DB_C = 0.48,  -- 实测 n=1，一下约 8% 血
-  GA_Hun_YanYueDao_SpecialSkill_C = 0.58,
+  GA_Hun_YanYueDao_SpecialSkill_C = 0.435,
   GA_Hun_ZhanMa_DB_C = 1.18,  -- 实测 n=2，一下约 118% 血
   GA_Hun_ZiMingJian_New_DB_C = 0.3,
 
@@ -646,7 +662,7 @@ moves = {
   GA_Hun_PoJun_B_Dash_C = 0.43,
   GA_Hun_PoJun_B_Draw_C = 0.65,
   GA_Hun_PoJun_B_Snap_C = 0.37,
-  GA_Hun_PoJun_C_C = 0.24,
+  GA_Hun_PoJun_C_C = 0.2568,
   GA_Hun_PoJun_PerfectDodge_C = 0.85,
   GA_Hun_PoJun_SWT_02_C = 0.65,
   GA_Hun_PoJun_SWT_C = 0.65,
@@ -705,7 +721,7 @@ moves = {
   GA_Hun_SlitheringSword_B_DashDraw_C = 0.4,
   GA_Hun_SlitheringSword_B_Dash_C = 0.53,
   GA_Hun_SlitheringSword_B_Snap_C = 0.72,
-  GA_Hun_SlitheringSword_C_C = 0.56,  -- 实测 n=2，一下约 138% 血
+  GA_Hun_SlitheringSword_C_C = 0.504,  -- 实测 n=2，一下约 138% 血
   GA_Hun_SlitheringSword_DA_C = 0.25,
   GA_Hun_SlitheringSword_EvalutionCombo_New_C = 0.38,
   GA_Hun_SlitheringSword_PerfectDodge_C = 0.72,
@@ -745,7 +761,7 @@ moves = {
   GA_Hun_SnakeDual_BA_C = 1.14,
   GA_Hun_SnakeDual_BB_C = 0.49,
   GA_Hun_SnakeDual_B_C = 0.6,
-  GA_Hun_SnakeDual_B_Dash_C = 0.64,
+  GA_Hun_SnakeDual_B_Dash_C = 1.28,
   GA_Hun_SnakeDual_B_Fast_C = 0.41,
   GA_Hun_SnakeDual_B_Snap_C = 0.66,
   GA_Hun_SnakeDual_C_C = 0.37,
@@ -847,35 +863,35 @@ moves = {
   GA_Hun_YanYueDao_B_Snap_Reinforced_C = 0.29,
   GA_Hun_YanYueDao_C_C = 0.36,
   GA_Hun_YanYueDao_PerfectDodge_C = 0.5,
-  GA_Hun_YanYueDao_SWT_C = 0.5,  -- 实测 n=6，一下约 74% 血
+  GA_Hun_YanYueDao_SWT_C = 0.8,  -- 实测 n=6，一下约 74% 血
   GA_Hun_YanYueDao_Stance_C = 0.5,  -- §249 估：无实测；同武器架势 / C / SWT 都 0.5，先按 0.5，待实测
 
 -- ==== 妖锯（YuuBlade，25 招）
-  GA_Hun_YuuBlade_AAAAA_C = 1.02,  -- 实测 n=4，一下约 38% 血
-  GA_Hun_YuuBlade_AAAAB_C = 0.74,
-  GA_Hun_YuuBlade_AAAA_C = 0.57,  -- 实测 n=5，一下约 16% 血
-  GA_Hun_YuuBlade_AAAB_C = 0.51,
-  GA_Hun_YuuBlade_AAA_C = 0.64,  -- 实测 n=2，一下约 15% 血
-  GA_Hun_YuuBlade_AAB_C = 0.61,
-  GA_Hun_YuuBlade_AA_C = 0.51,  -- 实测 n=3，一下约 10% 血
-  GA_Hun_YuuBlade_AB_C = 0.87,  -- 实测 n=2，一下约 18% 血
-  GA_Hun_YuuBlade_A_C = 0.64,  -- 实测 n=1，一下约 6% 血
-  GA_Hun_YuuBlade_A_DashDraw_C = 0.49,
-  GA_Hun_YuuBlade_A_Dash_C = 0.67,
-  GA_Hun_YuuBlade_A_Draw_C = 1.16,
-  GA_Hun_YuuBlade_A_Snap_C = 0.86,
-  GA_Hun_YuuBlade_BBBB_C = 0.92,  -- 实测 n=1，一下约 4% 血
-  GA_Hun_YuuBlade_BBB_C = 0.77,  -- 实测 n=4，一下约 9% 血
-  GA_Hun_YuuBlade_BB_C = 0.35,  -- 实测 n=2，一下约 34% 血
-  GA_Hun_YuuBlade_B_C = 0.79,  -- 实测 n=2，一下约 8% 血
-  GA_Hun_YuuBlade_B_DashDraw_C = 0.69,
-  GA_Hun_YuuBlade_B_Dash_C = 0.69,
-  GA_Hun_YuuBlade_B_Draw_C = 0.66,
-  GA_Hun_YuuBlade_B_Snap_C = 1.15,
-  GA_Hun_YuuBlade_C_C = 0.3,
-  GA_Hun_YuuBlade_FastHeavyAttack_C = 0.7,
-  GA_Hun_YuuBlade_FastLightAttack_C = 0.64,
-  GA_Hun_YuuBlade_SWT_C = 1.04,  -- 实测 n=4，一下约 8% 血
+  GA_Hun_YuuBlade_AAAAA_C = 1.071,  -- 实测 n=4，一下约 38% 血
+  GA_Hun_YuuBlade_AAAAB_C = 0.777,
+  GA_Hun_YuuBlade_AAAA_C = 0.5985,  -- 实测 n=5，一下约 16% 血
+  GA_Hun_YuuBlade_AAAB_C = 0.5355,
+  GA_Hun_YuuBlade_AAA_C = 0.672,  -- 实测 n=2，一下约 15% 血
+  GA_Hun_YuuBlade_AAB_C = 0.6405,
+  GA_Hun_YuuBlade_AA_C = 0.5355,  -- 实测 n=3，一下约 10% 血
+  GA_Hun_YuuBlade_AB_C = 0.9135,  -- 实测 n=2，一下约 18% 血
+  GA_Hun_YuuBlade_A_C = 0.672,  -- 实测 n=1，一下约 6% 血
+  GA_Hun_YuuBlade_A_DashDraw_C = 0.5145,
+  GA_Hun_YuuBlade_A_Dash_C = 0.7035,
+  GA_Hun_YuuBlade_A_Draw_C = 1.218,
+  GA_Hun_YuuBlade_A_Snap_C = 0.903,
+  GA_Hun_YuuBlade_BBBB_C = 0.966,  -- 实测 n=1，一下约 4% 血
+  GA_Hun_YuuBlade_BBB_C = 0.8085,  -- 实测 n=4，一下约 9% 血
+  GA_Hun_YuuBlade_BB_C = 0.3675,  -- 实测 n=2，一下约 34% 血
+  GA_Hun_YuuBlade_B_C = 0.8295,  -- 实测 n=2，一下约 8% 血
+  GA_Hun_YuuBlade_B_DashDraw_C = 0.7245,
+  GA_Hun_YuuBlade_B_Dash_C = 0.7245,
+  GA_Hun_YuuBlade_B_Draw_C = 0.693,
+  GA_Hun_YuuBlade_B_Snap_C = 1.2075,
+  GA_Hun_YuuBlade_C_C = 0.315,
+  GA_Hun_YuuBlade_FastHeavyAttack_C = 0.735,
+  GA_Hun_YuuBlade_FastLightAttack_C = 0.672,
+  GA_Hun_YuuBlade_SWT_C = 1.092,  -- 实测 n=4，一下约 8% 血
 
 -- ==== 亡命斩马刀（ZhanMa，25 招）
   GA_Hun_ZhanMa_AAAA_C = 0.76,
@@ -1002,71 +1018,71 @@ moves = {
 
 -- ==== 影之武装 · 巨凶斧（BrutalAxe，3 招）
   GA_BrutalAxe_Combo_C = 0.36,
-  GA_BrutalAxe_Normal_C = 0.26,
-  GA_BrutalAxe_Sprint_C = 0.35,
+  GA_BrutalAxe_Normal_C = 0.793,
+  GA_BrutalAxe_Sprint_C = 0.247,
 
 -- ==== 影之武装 · 操偶铃铛（CaoOuSiXian，1 招）
   GA_CaoOuSiXian_Normal_01_C = 0.35,
 
 -- ==== 影之武装 · 独眼弓（DuYan，2 招）
-  GA_DuYan_Bow_Laser_C = 0.19,
-  GA_DuYan_Bow_Normal_C = 0.12,
+  GA_DuYan_Bow_Laser_C = 0.266,
+  GA_DuYan_Bow_Normal_C = 0.3354,
 
 -- ==== 影之武装 · 黄金火铳（HuangJinHuoChong，4 招）
-  GA_HuangJinHuoChong_Dash_C = 0.13,  -- 实测 n=1，一下约 378% 血
-  GA_HuangJinHuoChong_DeflectCounter_C = 0.16,
-  GA_HuangJinHuoChong_Normal_02_C = 0.06,
-  GA_HuangJinHuoChong_Normal_04_C = 0.06,
+  GA_HuangJinHuoChong_Dash_C = 0.585,  -- 实测 n=1，一下约 378% 血
+  GA_HuangJinHuoChong_DeflectCounter_C = 0.5814,
+  GA_HuangJinHuoChong_Normal_02_C = 0.27,
+  GA_HuangJinHuoChong_Normal_04_C = 0.27,
 
 -- ==== 影之武装 · 火流星（HuoLiuXing，6 招）
-  GA_Hun_HuoLiuXing_AAAA_C = 0.06,
-  GA_Hun_HuoLiuXing_AAA_C = 0.06,
-  GA_Hun_HuoLiuXing_AA_C = 0.06,
-  GA_Hun_HuoLiuXing_A_C = 0.06,
-  GA_Hun_HuoLiuXing_A_Short_C = 0.95,
-  GA_Hun_HuoLiuXing_DB_C = 0.19,
+  GA_Hun_HuoLiuXing_AAAA_C = 0.4158,
+  GA_Hun_HuoLiuXing_AAA_C = 0.092169,
+  GA_Hun_HuoLiuXing_AA_C = 0.092169,
+  GA_Hun_HuoLiuXing_A_C = 0.092169,
+  GA_Hun_HuoLiuXing_A_Short_C = 1.459342,
+  GA_Hun_HuoLiuXing_DB_C = 0.162393,
 
 -- ==== 影之武装 · 剑客召集令（JianKeZhaoJiLing，1 招）
   GA_JianKeZhaoJiLing_Normal_01_C = 3.0,
 
 -- ==== 影之武装 · 长柄金瓜（JinGua，4 招）
-  GA_JinGua_Air_C = 0.3,
-  GA_JinGua_ExtraAttack_C = 0.3,
-  GA_JinGua_Normal_C = 0.32,
-  GA_JinGua_RoAttack_C = 0.55,
+  GA_JinGua_Air_C = 0.4248,
+  GA_JinGua_ExtraAttack_C = 0.27,
+  GA_JinGua_Normal_C = 0.64,
+  GA_JinGua_RoAttack_C = 0.649,
 
 -- ==== 影之武装 · 苦叶寺珠串（KuYeSiZhuChuan，1 招）
   GA_KuYeSiZhuChuan_Normal_01_C = 0.35,
 
 -- ==== 影之武装 · 烈焰狮头（LionHead，4 招）
-  GA_LionHead_C = 0.18,
-  GA_LionHead_Dash_C = 0.21,
-  GA_LionHead_DoubleFireBall_C = 0.15,
-  GA_LionHead_FireBall_C = 0.12,
+  GA_LionHead_C = 1.08,
+  GA_LionHead_Dash_C = 0.798,
+  GA_LionHead_DoubleFireBall_C = 0.39,
+  GA_LionHead_FireBall_C = 0.312,
 
 -- ==== 影之武装 · 催心琵琶（Lute，5 招）
-  GA_Hun_Lute_AAA_C = 0.11,
-  GA_Hun_Lute_AA_C = 0.11,
-  GA_Hun_Lute_A_C = 0.11,
-  GA_Hun_Lute_SKill_C = 0.54,
-  GA_Lute_Dash_C = 0.27,
+  GA_Hun_Lute_AAA_C = 0.3212,
+  GA_Hun_Lute_AA_C = 0.572,
+  GA_Hun_Lute_A_C = 0.616,
+  GA_Hun_Lute_SKill_C = 0.432,
+  GA_Lute_Dash_C = 0.18225,
 
 -- ==== 影之武装 · 妙手飞刀（MiaoShouFeiDao，8 招）
-  GA_MiaoShouFeiDao_DB_C = 0.45,
+  GA_MiaoShouFeiDao_DB_C = 0.4725,
   GA_MiaoShouFeiDao_Escape_01_C = 0.15,
   GA_MiaoShouFeiDao_Escape_02_C = 0.15,
   GA_MiaoShouFeiDao_Escape_03_C = 0.15,
-  GA_MiaoShouFeiDao_Escape_C = 0.35,
-  GA_MiaoShouFeiDao_Normal_01_C = 0.07,
-  GA_MiaoShouFeiDao_Normal_02_C = 0.07,
-  GA_MiaoShouFeiDao_Normal_03_C = 0.07,
+  GA_MiaoShouFeiDao_Escape_C = 0.9954,
+  GA_MiaoShouFeiDao_Normal_01_C = 0.1246,
+  GA_MiaoShouFeiDao_Normal_02_C = 0.1246,
+  GA_MiaoShouFeiDao_Normal_03_C = 0.1246,
 
 -- ==== 影之武装 · 墨血无痕（MoJian，6 招）
   GA_Hun_MoJian_PerfectDodge_C = 0.35,
-  GA_Hun_Mojian_AAA_C = 0.11,
+  GA_Hun_Mojian_AAA_C = 0.23606,
   GA_Hun_Mojian_AA_C = 0.11,
-  GA_Hun_Mojian_A_C = 0.11,
-  GA_Hun_Mojian_A_Short_C = 0.59,
+  GA_Hun_Mojian_A_C = 0.176,
+  GA_Hun_Mojian_A_Short_C = 0.944,
   GA_Hun_Mojian_UpRunGEx_01_C = 0.18,
 
 -- ==== 影之武装 · 影之武装通用（ShachiAbility，1 招）
@@ -1074,56 +1090,57 @@ moves = {
 
 -- ==== 影之武装 · 追命锁镰（ShachiHook，13 招）
   GA_Hun_ShachiHook_Base_C = 0.35,
-  GA_Hun_ShachiHook_CAA_C = 0.17,
-  GA_Hun_ShachiHook_CA_C = 0.17,
-  GA_Hun_ShachiHook_CBB_C = 0.27,
-  GA_Hun_ShachiHook_CB_C = 0.27,
-  GA_Hun_ShachiHook_CCCC_C = 0.2,
-  GA_Hun_ShachiHook_CCC_C = 0.2,
-  GA_Hun_ShachiHook_CC_C = 0.2,
-  GA_Hun_ShachiHook_CDD_C = 0.59,
-  GA_Hun_ShachiHook_CD_C = 0.59,
-  GA_Hun_ShachiHook_C_C = 0.2,
-  GA_Hun_ShachiHook_Drag_C = 2.99,
-  GA_Hun_ShachiHook_HookMove_C = 0.47,
+  GA_Hun_ShachiHook_CAA_C = 0.255,
+  GA_Hun_ShachiHook_CA_C = 0.255,
+  GA_Hun_ShachiHook_CBB_C = 0.405,
+  GA_Hun_ShachiHook_CB_C = 0.405,
+  GA_Hun_ShachiHook_CCCC_C = 0.391248,
+  GA_Hun_ShachiHook_CCC_C = 0.19305,
+  GA_Hun_ShachiHook_CC_C = 0.2574,
+  GA_Hun_ShachiHook_CDD_C = 0.885,
+  GA_Hun_ShachiHook_CD_C = 0.885,
+  GA_Hun_ShachiHook_C_C = 0.2574,
+  GA_Hun_ShachiHook_Drag_C = 2.2425,
+  GA_Hun_ShachiHook_HookMove_C = 0.2585,
 
 -- ==== 影之武装 · 贪狼（TanLang，3 招）
-  GA_TanLang_ExtraAttack_C = 0.14,
-  GA_TanLang_Normal_C = 0.38,
-  GA_TanLang_SpeicalAttack_C = 0.13,  -- 实测 n=1，一下约 119% 血
+  GA_TanLang_ExtraAttack_C = 1.54,
+  GA_TanLang_Normal_C = 0.86564,
+  GA_TanLang_SpeicalAttack_C = 0.5629,  -- 实测 n=1，一下约 119% 血
 
 -- ==== 影之武装 · 雷霆枪（ThunderSpear，7 招）
-  GA_ThunderSpear_Dash_C = 0.26,
+  GA_ThunderSpear_Dash_C = 0.2236,
   GA_ThunderSpear_DeflectCounter_C = 0.27,
-  GA_ThunderSpear_DodgeAttack_01_C = 0.21,
-  GA_ThunderSpear_Normal_01_C = 0.06,
-  GA_ThunderSpear_Normal_02_C = 0.06,
-  GA_ThunderSpear_Normal_03_C = 0.06,
-  GA_ThunderSpear_SpecialAttack_04_C = 0.55,
+  GA_ThunderSpear_DodgeAttack_01_C = 0.3675,
+  GA_ThunderSpear_Normal_01_C = 0.09177,
+  GA_ThunderSpear_Normal_02_C = 0.09177,
+  GA_ThunderSpear_Normal_03_C = 0.09177,
+  GA_ThunderSpear_SpecialAttack_04_C = 1.1,
 
 -- ==== 影之武装 · 铁矿拳套（TieKuangQuanTao，4 招）
-  GA_TieKuangQuanTao_Charge_AAA_C = 0.13,  -- 实测 n=41，一下约 340% 血
-  GA_TieKuangQuanTao_Charge_AA_C = 0.13,  -- 实测 n=18，一下约 204% 血
-  GA_TieKuangQuanTao_Charge_A_C = 0.13,  -- 实测 n=31，一下约 204% 血
-  GA_TieKuangQuanTao_GuardPoint_C = 0.13,  -- §249 估：无实测；影武铁矿拳套其余招 0.13，先按 0.13，待实测（被打算触发）
+  GA_TieKuangQuanTao_Charge_AAA_C = 0.26,  -- 实测 n=41，一下约 340% 血
+  GA_TieKuangQuanTao_Charge_AA_C = 0.26,  -- 实测 n=18，一下约 204% 血
+  GA_TieKuangQuanTao_Charge_A_C = 0.26,  -- 实测 n=31，一下约 204% 血
+  GA_TieKuangQuanTao_GuardPoint_C = 0.26,  -- §249 估：无实测；影武铁矿拳套其余招 0.13，先按 0.13，待实测（被打算触发）
 
--- ==== 影之武装 · 虎炮（TigerCannon，4 招）
-  GA_TigerCannon_C = 0.17,
+-- ==== 影之武装 · 虎炮（TigerCannon，5 招）
+  GA_TigerCannon_C = 0.357,
   GA_TigerCannon_Counter_C = 0.35,
-  GA_TigerCannon_Dash_C = 0.18,
-  GA_TigerCannon_Ultimate_C = 0.08,
+  GA_TigerCannon_Dash_C = 0.3843,
+  GA_TigerCannon_QuickCharge_C = 0.3213,  -- 11.20 二重咆哮：修复漏判，继承父GA规范基准0.17*2.7；非旧日志倍率保证
+  GA_TigerCannon_Ultimate_C = 0.66,
 
 -- ==== 影之武装 · 羽弓（UnnamedBow，3 招）
-  GA_UnnamedBow_C = 0.12,
-  GA_UnnamedBow_Dash_C = 0.52,
-  GA_UnnamedBow_DeflectCounter_C = 0.35,
+  GA_UnnamedBow_C = 0.32844,
+  GA_UnnamedBow_Dash_C = 1.789515,
+  GA_UnnamedBow_DeflectCounter_C = 0.4025,
 
 -- ==== 影之武装 · 血滴子（XueDiZi，5 招）
-  GA_XueDiZi_AAA_C = 0.35,
-  GA_XueDiZi_AA_C = 0.16,
-  GA_XueDiZi_A_C = 0.16,
-  GA_XueDiZi_EvolutionAttack_C = 0.66,
-  GA_XueDiZi_SpecialAttack_C = 2.57,
+  GA_XueDiZi_AAA_C = 0.42,
+  GA_XueDiZi_AA_C = 0.192,
+  GA_XueDiZi_A_C = 0.192,
+  GA_XueDiZi_EvolutionAttack_C = 0.315,
+  GA_XueDiZi_SpecialAttack_C = 0.34695,
 
 -- ==== 影之武装 · 血色铃铛（残留）（XueSeLingDang，1 招）
   GA_XueSeLingDang_Normal_01_C = 0.35,
@@ -1133,15 +1150,15 @@ moves = {
   GA_XuKongHuaShan_Skill_C = 0.35,
 
 -- ==== 影之武装 · 游龙叉（YouLongCha，2 招）
-  GA_YouLongCha_Dash_C = 0.09,
-  GA_YouLongCha_Normal_C = 0.1,
+  GA_YouLongCha_Dash_C = 0.28638,
+  GA_YouLongCha_Normal_C = 0.317613,
 
 -- ==== 影之武装 · 游龙头（YouLongHead，2 招）
-  GA_YouLongHead_WaterCannon_C = 0.08,
-  GA_YouLongHead_Water_C = 0.69,
+  GA_YouLongHead_WaterCannon_C = 0.20148,
+  GA_YouLongHead_Water_C = 2.86651,
 
 -- ==== 影之武装 · 拙壁盾（ZhuoBiDun，2 招）
   GA_ZhuoBiDun_C = 0.35,
-  GA_ZhuoBiDun_Slide_C = 0.42,
+  GA_ZhuoBiDun_Slide_C = 0.30954,
 }
 }

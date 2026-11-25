@@ -471,8 +471,32 @@ local function bossBarStep(s, tn, claimed)
         s.barTryAt = tn + 2.0
         local ok, err = G.bossBarShow(s.pup)
         s.barReg = ok
+        s.barHud = ok and G.hudLayout and G.hudLayout() or nil
         out("混战原型 %s 血条：RegisterBossHPBar %s", s.tag, ok and "成功" or tostring(err))
         return false
+    end
+    -- 11.23 mp_probe(40)：换图后注册到了旧 HUD 上、一整局都没血条。每秒看一次在屏幕上的 HUD 换没换，换了就重新注册
+    if G.hudLayout and tn >= (s.barHudAt or 0) then
+        s.barHudAt = tn + 1.0
+        local h = G.hudLayout()
+        if h and not G.sameObj(h, s.barHud) then
+            out("混战原型 %s 血条：HUD 换了（%s），重新注册", s.tag, short(pathOf(h)))
+            if s.barHud then G.bossBarHide(s.pup, s.barHud) end      -- §443 旧 HUD 上那条也撤掉（以前只撤新 HUD 的）
+            G.bossBarHide(s.pup)
+            s.barReg, s.bar, s.barMiss, s.barTryAt = false, nil, 0, 0
+            return false
+        end
+    end
+    -- §450 11-25 mp_probe(43)：对决观众两位选手认领到同一条（…_2147451782），两人的血量每帧轮流写进去、另一条按替身自己的血量画
+    -- → "突然满了又掉很多血"。认领到的血条 Init 之后绑的是别人（Character 不是这个替身）→ 放掉重找（不重新注册，自己那条还在）
+    if valid(s.bar) and G.bossBarChar and tn >= (s.barOwnAt or 0) then
+        s.barOwnAt = tn + 1.0
+        local c = G.bossBarChar(s.bar)
+        if c and not G.sameObj(c, s.pup) then
+            out("§450 混战原型 %s 血条：认领的 %s 绑的是 %s，不是这个替身，放掉重找", s.tag, short(pathOf(s.bar)), short(pathOf(c)))
+            s.bar, s.barMiss, s.barKey = nil, 0, nil
+            return false
+        end
     end
     if not valid(s.bar) then
         s.bar = G.bossBarOf(s.pup, true, claimed)
@@ -481,12 +505,26 @@ local function bossBarStep(s, tn, claimed)
             if s.barMiss == 15 then
                 out("!! 混战原型 %s 血条：注册了但找不到控件", s.tag)
                 for _, l in ipairs(G.bossBarDiag(s.pup)) do out("  %s", l) end
+                -- 以前到这就一直等着；现在重新注册，最多再试 3 次（找到血条后 barRetry 清零）
+                s.barRetry = (s.barRetry or 0) + 1
+                if s.barRetry <= 3 then
+                    out("混战原型 %s 血条：重新注册（第 %d 次）", s.tag, s.barRetry)
+                    G.bossBarHide(s.pup)
+                    s.barReg, s.barMiss, s.barTryAt = false, 0, 0
+                end
             end
             return false
         end
+        s.barRetry = 0
         s.barShOn = nil      -- §295 杀气那条显不显示：下面按房间设置写
         s.nameAt = nil
         out("混战原型 %s 血条：%s", s.tag, short(pathOf(s.bar)))
+        -- §443 同一个 HUD 上没人认领的空血条（换 HUD 时留下的，11-25 截图左上那条无名血条）收起来
+        if G.bossBarSweep then
+            local keep = { s.bar }
+            for _, c in ipairs(claimed or {}) do keep[#keep + 1] = c end
+            G.bossBarSweep(nil, keep)
+        end
     end
     local hp, hm = G.attrOf(s.pup, "Health"), G.attrOf(s.pup, "Health_Max")
     local sc, sm = G.attrOf(s.pup, "Shachi"), G.attrOf(s.pup, "Shachi_Max")
@@ -498,6 +536,35 @@ local function bossBarStep(s, tn, claimed)
     if not s.nameAt or tn - s.nameAt > 1.0 then s.nameAt = tn; v.name = s.name end
     G.bossBarSet(s.bar, v)
     return true
+end
+
+-- §450 对决观众两条 Boss 血条（同旧版观战 pbz_spec 那两道保护，以前多人这边一道都没有）：
+-- ① 撞了同一个控件：控件绑的是谁（Character）谁留着；看不出来就后面那位放掉。放掉 = 清认领、下一拍重找（自己的注册还在，不撤）
+function MP.barDedupe(bosses)
+    for i = 1, #bosses do
+        for j = i + 1, #bosses do
+            local a, b = bosses[i], bosses[j]
+            if valid(a.bar) and valid(b.bar) and G.sameObj(a.bar, b.bar) then
+                local c = G.bossBarChar and G.bossBarChar(a.bar)
+                local lose = (c and G.sameObj(c, b.pup)) and a or b
+                out("§450 %s 和 %s 认领到同一条血条 %s（绑的 %s），%s 放掉重找", a.tag, b.tag, short(pathOf(a.bar)),
+                    c and short(pathOf(c)) or "看不出", lose.tag)
+                lose.bar, lose.barMiss, lose.barKey = nil, 0, nil
+            end
+        end
+    end
+end
+-- ② 先给第一位注册、认领到了再给第二位注册（同一拍注册两条，先认领的人会拿到对方那条还没绑角色的）。
+-- 第一位 6 秒还没认领到就不等了（不能因为一边坏了另一边也没有血条）
+MP.BAR_WAIT_FIRST = 6.0
+function MP.barGate(bosses, i, tn)
+    local first = bosses[1]
+    if i == 1 or #bosses < 2 or not first then return true end
+    if valid(first.bar) then first.barWaitAt = nil; return true end
+    local b = bosses[i]
+    if b.barReg then return true end                        -- 已经注册过的照常认领 / 刷新
+    first.barWaitAt = first.barWaitAt or tn
+    return tn - first.barWaitAt >= MP.BAR_WAIT_FIRST
 end
 
 -- ============================================================ 你挨打 / 格挡统计（看动作名的变化，只读）
@@ -1160,6 +1227,7 @@ local function netDrop(s, why)
 end
 
 function MP.netStop(why)
+    NETP.feedDiag = nil
     if not NETP.on then return end
     NETP.on = false
     NETP.noMpAt = nil
@@ -1796,7 +1864,9 @@ local barsStep = wrap("·多人血条", function(tn)
             tagDrop(s)
         end
     end
-    for _, b in ipairs(bosses) do
+    if #bosses > 1 then MP.barDedupe(bosses) end        -- §450 两条认领到同一个控件：后认的 / 不是它的那位放掉重找
+    for i, b in ipairs(bosses) do
+      if MP.barGate(bosses, i, tn) then                  -- §450 先给第一位注册、认领好，再给第二位注册（同旧版观战）
         -- 两条 Boss 血条时互相让开对方已经认领的控件
         local cl = claimed
         if #bosses > 1 then
@@ -1811,6 +1881,7 @@ local barsStep = wrap("·多人血条", function(tn)
         elseif tn - (b.nameAt or 0) > 1.0 then
             bossBarStep(b, tn, cl)
         end
+      end
         tagDrop(b)       -- 有 Boss 血条的人别再叠一个头顶条
     end
     for _, s in ipairs(overhead) do
@@ -2002,12 +2073,25 @@ local function netEnsureLoop()
     end
 end
 
+-- 只记生成链的阶段变化；等待条件同一原因最多十秒一次，不输出坐标或包原文。
+local function feedNote(pid, reason, t, tn, sess)
+    NETP.feedDiag = NETP.feedDiag or {}
+    local prev = NETP.feedDiag[pid]
+    if prev and prev.reason == reason and (reason == "驱动中" or tn - prev.at < 10) then return end
+    NETP.feedDiag[pid] = { reason = reason, at = tn }
+    sess = sess or (ctx.session and ctx.session()) or {}
+    out("多人收包诊断：来源 %d，我是 %s 号，角色 %s，结果 %s（seq=%s，坐标=%s/%s）", pid,
+        tostring(sess.mpid or 0), tostring(sess.role or "?"), reason, tostring(tonumber(t.seq) or 0),
+        tonumber(t.x) and "有" or "缺", tonumber(t.y) and "有" or "缺")
+end
+
 -- main.lua netRecv：src=<数字> 的包
 function MP.feed(t, tn)
     local pid = tonumber(t.src)
     if not pid then return end
     local sess0 = ctx.session and ctx.session() or {}
-    if tonumber(sess0.mpid) == pid then return end           -- 自己的（不该来，保险）
+    if not (NETP.feedDiag and NETP.feedDiag[pid]) then feedNote(pid, "到达多人模块", t, tn, sess0) end
+    if tonumber(sess0.mpid) == pid then feedNote(pid, "自身编号，忽略", t, tn, sess0); return end
     RULE.peerSeen = RULE.peerSeen or {}
     RULE.peerSeen[pid] = true
     if t.mtp then
@@ -2036,6 +2120,7 @@ function MP.feed(t, tn)
         end
     end
     if checkHostChange then checkHostChange(tn) end
+    if MP.training and pid == hostPid() and not isHost() then MP.training.receive(t, true) end
     if DUEL and DUEL.isDuel() then
         DUEL.onPacket(t, tn)
         -- §295 选手拿对手包里的规则指纹比（房主当观众时不发状态包，不能只比房主的）；和替身无关，放在生成替身之前
@@ -2044,19 +2129,21 @@ function MP.feed(t, tn)
             if (me == DUEL.fa and pid == DUEL.fb) or (me == DUEL.fb and pid == DUEL.fa) then ctx.rfpPeer(t.rfp) end
         end
         if not DUEL.allowSpawn(pid) then
+            feedNote(pid, "对决观众或非当前选手，不生成", t, tn, sess0)
             if pid == hostPid() and not isHost() and ctx.recvRules then ctx.recvRules(t) end
             return
         end
     end
     local L = live()
     if not L then
+        feedNote(pid, "缺少替身驱动模块", t, tn, sess0)
         if not NETP.noLive then NETP.noLive = true; out("!! 多人：观战模块没有 _live（pbz_spec.lua 太旧？），没法驱动替身") end
         return
     end
     if MP.on then MP.stop("联机多人的包到了") end
-    if ST.stableTicks < 90 then return end                 -- 世界还在加载
+    if ST.stableTicks < 90 then feedNote(pid, "等待世界加载", t, tn, sess0); return end
     local p1 = getP1()
-    if not valid(p1) then return end
+    if not valid(p1) then feedNote(pid, "等待本机角色", t, tn, sess0); return end
     local s = NETP.side[pid]
     -- 自己在哪张图：每 2 秒读一次（以前每个包都 GetWorld 一遍）
     if not NETP.mapAt or tn - NETP.mapAt > 2.0 or tn < NETP.mapAt then NETP.mapAt, NETP.myMap = tn, G.mapName and G.mapName(p1) or nil end
@@ -2082,9 +2169,11 @@ function MP.feed(t, tn)
         return
     end
     if not s then
+        if not (tonumber(t.x) and tonumber(t.y)) then feedNote(pid, "缺少完整坐标，等待状态包", t, tn, sess0); return end
         s = netSpawn(pid, t)
-        if not s then return end
+        if not s then feedNote(pid, "替身生成失败", t, tn, sess0); return end
     end
+    feedNote(pid, "驱动中", t, tn, sess0)
     netEnsureLoop()
     if t.nm and t.nm ~= "" and not s.nick then s.nick = t.nm end
     if t.mph and t.mph ~= "" then
@@ -2215,6 +2304,34 @@ local ST_NAME = { idle = "没开打", cd = "倒计时", fight = "交手中", ["e
 
 local function ses() return ctx.session and ctx.session() or {} end
 function MP.inMp() return ses().mp == "1" end
+-- Main supplies explicit training/ranked policy; MP supplies authenticated identity.
+function MP.setTraining(rules, policy)
+    MP.training, MP.trainingPolicy = rules, policy
+end
+function MP.trainingScope()
+    local p = MP.trainingPolicy and MP.trainingPolicy() or {}
+    local s = {}
+    for k, v in pairs(p) do s[k] = v end
+    s.kind = "room"
+    if not MP.inMp() then MP.trainingConnected = false; s.enabled = false; return s end
+    if not MP.trainingConnected then MP.trainingEpoch = (MP.trainingEpoch or 0) + 1; MP.trainingConnected = true end
+    s.session = tostring(s.session or MP.trainingEpoch) .. ":host:" .. hostPid()
+    s.authoritative, s.localSlot = isHost(), myPid()
+    s.spectator = MP.myWatch == true or ses().mpwatch == "1"
+    s.deferHP = not (DUEL and DUEL.isDuel())
+    return s
+end
+function MP.trainingActors()
+    local actors = { { actor = getP1(), slot = myPid(), kind = "player" } }
+    for _, m in ipairs(MP.trainingMembers()) do
+        local side = NETP.side[m.pid]
+        if m.isAi and side and valid(side.pup) then actors[#actors + 1] = { actor = side.pup, slot = m.pid, kind = "ai", owned = isHost() } end
+    end
+    return actors
+end
+function MP.trainingMembers()
+    return MP.inMp() and MP.members() or {}
+end
 myPid = function() return tonumber(ses().mpid) or 0 end
 hostPid = function()
     local s = ses()
@@ -2256,6 +2373,10 @@ factionFor = function(s)
         local me = myPid()
         local opp = (me == DUEL.fa and DUEL.fb) or (me == DUEL.fb and DUEL.fa) or 0
         if DUEL.state == "fight" and opp > 0 and s.idx == opp then return FOE end
+        -- §450 观众（不上场的人）：交手中两位选手互为敌对——第一位敌方、第二位玩家方（同旧版观战 §223.2）。
+        -- 11-25 mp_probe(43)：两位都是玩家方，绝影分身的阵营跟着主人也是玩家方，身边没有敌人 → 站着不打。
+        -- 观众自己藏着；交手中第一位（敌方）和他的分身可能打到观众，所以交手中观众也挂锁血（DUEL.shouldLockSelf，§450.1）
+        if DUEL.state == "fight" and me ~= DUEL.fa and me ~= DUEL.fb and s.idx == DUEL.fa then return FOE end
         return FRIEND
     end
     -- §306 T3 / T6：出生保护期间敌方替身一律临时改玩家阵营（打不到我、我也打不到他），
@@ -2568,6 +2689,27 @@ function MP.stepView(d)
     if ctx.notice then ctx.notice(T("视角：", "CAMERA: ") .. SPEC.modeName(now_), "", 1.5) end
     return true
 end
+-- §436.2 观战镜头跟的点 / 朝向平滑（11-24 用户："主控端停止移动后替身会跑出去再退回来，镜头跟着正反晃"）：
+-- 指数跟随，位置 POS_TAU、朝向 YAW_TAU 秒；换人看 / 隔了 GAP 秒没跟 / 一下差 JUMP 以上（替身被摆到远处）就直接跳过去。
+-- 纯计算（测试用）：sm = 存状态的表（SPEC），idx = 看的是谁，l = 替身位置，yaw = 替身朝向（度），tn = 现在
+MP.SPEC_POS_TAU, MP.SPEC_YAW_TAU, MP.SPEC_GAP, MP.SPEC_JUMP = 0.12, 0.25, 0.5, 800.0
+function MP.specSmooth(sm, idx, l, yaw, tn)
+    local c = sm.sm
+    local dt = c and (tn - c.at) or nil
+    if not c or c.idx ~= idx or not dt or dt < 0 or dt > MP.SPEC_GAP
+        or (l.X - c.X) ^ 2 + (l.Y - c.Y) ^ 2 + (l.Z - c.Z) ^ 2 > MP.SPEC_JUMP ^ 2 then
+        sm.sm = { idx = idx, X = l.X, Y = l.Y, Z = l.Z, yaw = yaw, at = tn }
+        return { X = l.X, Y = l.Y, Z = l.Z }, yaw
+    end
+    local kp = 1.0 - math.exp(-dt / MP.SPEC_POS_TAU)
+    local ky = 1.0 - math.exp(-dt / MP.SPEC_YAW_TAU)
+    c.X, c.Y, c.Z = c.X + (l.X - c.X) * kp, c.Y + (l.Y - c.Y) * kp, c.Z + (l.Z - c.Z) * kp
+    local d = (yaw - c.yaw + 180.0) % 360.0 - 180.0          -- 走近的那边转
+    c.yaw = c.yaw + d * ky
+    c.at = tn
+    return { X = c.X, Y = c.Y, Z = c.Z }, c.yaw
+end
+
 -- 每帧：镜头放到目标身后 4.5 米、高 2 米，看着他
 local function specFrame()
     if not (SPEC.on and valid(SPEC.cam)) then return end
@@ -2585,7 +2727,9 @@ local function specFrame()
     local s = list[SPEC.idx]
     local l = loc(s.pup)
     if not l then return end
-    local yaw = math.rad(G.yawOf and G.yawOf(s.pup) or 0)
+    local yawDeg = G.yawOf and G.yawOf(s.pup) or 0
+    l, yawDeg = MP.specSmooth(SPEC, s.idx, l, yawDeg, now())     -- §436.2 镜头不再每帧死贴替身（替身一抖镜头就前后晃）
+    local yaw = math.rad(yawDeg)
     local cx, cy, cz = l.X - math.cos(yaw) * 450.0, l.Y - math.sin(yaw) * 450.0, l.Z + 200.0
     local pitch = math.deg(math.atan(l.Z + 60.0 - cz, 450.0))
     pcall(function() SPEC.cam:K2_SetActorLocationAndRotation({ X = cx, Y = cy, Z = cz }, { Pitch = pitch, Yaw = math.deg(yaw), Roll = 0.0 }, false, {}, true) end)
@@ -3461,9 +3605,10 @@ function MP.wire(tn)
     end
     if not MP.inMp() then return "" end
     if DUEL and DUEL.isDuel() then
-        return DUEL.wire(tn)
+        return DUEL.wire(tn) .. (MP.training and MP.training.wire() or "")
     end
     local s = string.format("mpd=%d:%d:%d\n", RULE.mid, RULE.deaths, RULE.my)
+    if MP.training then s = s .. MP.training.wire() end
     s = s .. string.format("mtp=%d\n", tonumber(MP.myTeamPick) or 0)    -- §306 T6：我选的队（0 自动 / 1 / 2 / 3）
     if MP.myWatch and not (DUEL and DUEL.isDuel()) then s = s .. "mwo=1\n" end    -- §318 只看不上场
     s = s .. "mt3=1\n"                                                    -- §317 我认得三队（房主开三队前查）
@@ -3862,12 +4007,19 @@ local function ruleTick(tn)
         end
         RULE.lastHp = hp
 
+        -- Attribute the real damage first; refill only after that sample is consumed.
+        local infiniteHP = MP.training and MP.training.infinite("hp")
+        if infiniteHP then
+            local restored = MP.training.refillHP(p1)
+            if restored then hp, RULE.lastHp = restored, restored end
+        end
+
         -- 倒地判定
         if RULE.my == 0 then
             if tn < RULE.invulnTill then
                 local mx = G.attrOf(p1, "Health_Max")
                 if hp and mx and hp < mx - 0.5 then G.refill(p1) end      -- 复活后 INVULN 秒打不掉血
-            elseif hp and ctx.mpDead and ctx.mpDead(p1, hp, tn) then
+            elseif not infiniteHP and hp and ctx.mpDead and ctx.mpDead(p1, hp, tn) then
                 RULE.deaths = RULE.deaths + 1
                 local killer = (RULE.lastHitAt and tn - RULE.lastHitAt <= 8.0) and (RULE.lastHitBy or 0) or 0
                 RULE.killer = killer
@@ -4612,8 +4764,19 @@ end
 -- §309（11-14 实测）：成员名单挪到单独一页（多人 mod 用 ui.addPage 登记，返回首页）。原来直接列在房间面板里，
 -- 房主面板 3 人以上就超过面板行数上限（17），"房间设置… / 系统设置…"被挤出去、鼠标键盘都点不到。
 -- 没有页服务（测试 / 老布局）时面板里照旧直接列（MP.panel 调这个）
+function MP.resourceEntry(items, T_)
+    local s = MP.trainingScope()
+    if MP.resourcesPage and MP.uiGo and MP.training and MP.training.allowed() and s.authoritative == true then
+        local session = s.session
+        items[#items + 1] = { label = (T_ or T)("特殊资源设定…", "SPECIAL RESOURCES..."), act = function()
+            local current = MP.trainingScope()
+            if MP.training.allowed() and current.authoritative == true and current.session == session then MP.uiGo(MP.resourcesPage) end
+        end }
+    end
+end
 function MP.memberRows(items, T_)
     T_ = T_ or T
+    MP.resourceEntry(items, T_)
     if DUEL and DUEL.isDuel() and DUEL.queueRows then DUEL.queueRows(items, T_); return end     -- 11-15 对决：排队次序 / 战绩（以前列在房间面板里）
     local idle = (not inMatch()) and not (DUEL and DUEL.inMatch())
     -- §306 T6：两队开着、对局外时先算一次预分（房主指定 > 本人选择 > 自动补齐），面板预览和点行改队都用它
@@ -5047,6 +5210,9 @@ do
         inMp = function() return MP.inMp() end,
         isHost = function() return isHost() end,
         myPid = function() return myPid() end,
+        trainingScope = function() return MP.trainingScope() end,
+        trainingActors = function() return MP.trainingActors() end,
+        trainingMembers = function() return MP.trainingMembers() end,
         hostPid = function() return hostPid() end,
         travelF1 = function() return MP.travelF1(now()) end,
         nameOf = function(pid) return nameOf(pid) end,
@@ -5205,6 +5371,7 @@ do
                 G.standUp(s.pup)
             end
         end,
+        syncFactions = function() updatePuppetFactions() end,      -- §450 观众：按 factionFor 重排所有替身阵营
         setPeerFaction = function(pid, isFoe)
             local s = NETP.side[pid]
             if s and valid(s.pup) then setFaction(s.pup, isFoe and FOE or FRIEND) end
@@ -5327,6 +5494,9 @@ function MP.onMapLoad()
     if MP.specView then MP.specView.on, MP.specView.cam = false, nil end
 end
 
+MP.setTraining(TRAINING, function()
+    return TRAINCTX and TRAINCTX.roomScope and TRAINCTX.roomScope() or {}
+end)
 return MP
 end
 

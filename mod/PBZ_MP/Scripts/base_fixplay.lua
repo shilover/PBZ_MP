@@ -22,7 +22,14 @@ ANIM = { CHECK = 0.15, FRESH = 0.4, SWT_CHECK = 0.45, SWT_MAX = 1.6, LOGS = 30, 
 -- §345 断肢锯冲刺攻击（A_Dash / B_Dash / *_DashDraw）起手慢：11-16 实战 A_Dash 29 次里 25 次 0.16 秒还读不到动作，
 --   按"没换动作"取消重放，重放那下从替身当时的位置重新突进，25 次里 23 次落空（没重放的 4 次中 2）。
 --   和切刀斩一样按 gentle 处理：技能还挂着就不取消、不重放，等动作自己出来。
-ANIM.GENTLE = { "^GA_Hun_Jigsaw_[AB]_Dash_C$", "^GA_Hun_Jigsaw_[AB]_DashDraw_C$" }
+-- §445 墨血无痕 AAA：11-25 14:11:54 远端#668 放出后被判"没换动作"→ 取消 + 重放，重放那次 B_Hun_Mojian_AAA_02 没打到。
+--   AAA 起手 0.19 秒是 Snap（Min 125 / Max 350 cm），取消重放会把这一段重来、第一段判定只有 0.1 秒，晚了就错过 → 不取消
+-- §447 幻术琵琶（影之武装）起手先变出琵琶（GAAction_ChangeArmed / NS_Hun_ShaChiWeaponPiPa_ShowUp），这 0.15–0.19 秒动作读不到：
+--   11-23 15:26:52 #360 / 15:28:59 #368 / 17:12:19 #110、11-24 14:12:56 #457 / 14:46:35 #1039、11-25 15:37:55 #205（追帧已看到
+--   Hun_ShaChi_Lute_Attack_A_Montage 0.00 → 0.10）—— GA_Hun_Lute_A_C 每次都被判"没换动作"→ 取消真技能 + 重放，整招从头再来：
+--   第一发音刃晚 0.15–0.2 秒、追帧跳过的 0.1 秒也丢了，重放还要再变一次琵琶。和切刀斩一样：技能还挂着就不取消、不重放
+ANIM.GENTLE = { "^GA_Hun_Jigsaw_[AB]_Dash_C$", "^GA_Hun_Jigsaw_[AB]_DashDraw_C$", "^GA_Hun_Mojian_AAA_C$",
+                "^GA_Hun_Lute_", "^GA_Lute_" }
 function ANIM.isGentle(n)
     if n:find("_SWT", 1, true) then return true end      -- §243 切刀斩：不取消真技能
     for _, p in ipairs(ANIM.GENTLE) do if n:find(p) then return true end end
@@ -443,8 +450,89 @@ function ANIM.log(fmt, ...)
     if ANIM.logs <= ANIM.LOGS or ANIM.logs % 20 == 0 then out(fmt, ...) end
 end
 
+-- ============================================================ §445 墨血无痕 AAA 第一段（B_Hun_Mojian_AAA_02）在线打不到
+-- 用户 11-25"最后一击的第一段没有伤害（和上次的 BUG 表现相同）"。挨打方日志（我被 IGNIZ 打）：
+--   11-23 15:15:46 远端#282、11-25 14:11:54 远端#668：AA 漩涡的 B_Hun_Mojian_AA_08（击退 Middle）-24 → 没有 AAA_02 → AAA_03 -182 / -264；
+--   SEG1121 那一帧的判定名里根本没出现 AAA_02、血也没动 = 本机游戏就没碰到，不是模组吃掉的（§434 改的是攻击方看结果，管不到这里）。
+--   11-24 13:58:26 远端#317 同样 A → AA → 后撤 → AAA，AAA_02 -125 打到了；11-24 23:31 双开 AAA 前没有 AA（没 AA_08 击退）两次都打到。
+-- 资产：GA_Hun_Mojian_AAA 起手 StartDuration 0.19 秒、RM_FocusTarget、Min / Max Snap 125 / 350 cm；AAA_02 = 武器上的扫掠
+--   （半径 50、高 150）、BulletDuration 只有 0.1 秒；AAA_03 半径 120、高 300、0.23 秒。
+-- 推断（没实测确认）：AA_08 在挨打方本机把人击退；发送方那边我的替身不播受击（"已掐掉替身的本机受击"）、位置又晚 100–200 ms，
+--   发送方 AAA 的 Snap 贴的是我被击退前的位置；我这边替身根运动关、全程跟网络位置 → 贴到旧位置，0.1 秒的小扫掠扫空，大的 AAA_03 照中。
+-- 做法：挨打方这边替身放 AAA 后，在第一段之前（动作 0.19–0.45 秒 / 放出 0.2–0.5 秒）离我 > Min Snap + 余量、< Max Snap + 击退余量时，
+--   按游戏自己的 Snap 把替身贴到离我 WANT cm（只动 XY），一招一次。另每 0.1 秒记距离 / 双方动作，下次实测对照。
+--   贴近会让发送方本来没扫到的段也算中，根因没实测确认 → 默认关，只记诊断；放 net/mjaaa_pull_on.txt 才贴
+MJAAA = { NAME = "GA_Hun_Mojian_AAA_C", MON = "Hun_Shachi_MJZ_AAA_attack_Montage",
+          POS_FROM = 0.19, POS_TO = 0.45, T_FROM = 0.20, T_TO = 0.50,      -- 动作位置读不到时按放出秒数
+          MIN = 165, MAX = 500, WANT = 110,                                  -- 125 + 40 余量 / 350 + 150 击退余量
+          SAMPLE = 0.1, UNTIL = 1.4, LOGS = 120, logs = 0,
+          ON = (NET_DIR or "net") .. "/mjaaa_pull_on.txt" }
+function MJAAA.log(fmt, ...)
+    MJAAA.logs = MJAAA.logs + 1
+    if MJAAA.logs <= MJAAA.LOGS then out(fmt, ...) end
+end
+function MJAAA.pullOn()
+    local f = io.open(MJAAA.ON, "r")
+    if f then f:close(); return true end
+    return false
+end
+function MJAAA.onFire(pup, e, tn)
+    if e.name ~= MJAAA.NAME then return end
+    MJAAA.pend = { pup = pup, id = e.id, at = tn, nextS = tn, pulled = false, off = not MJAAA.pullOn() }
+end
+function MJAAA.where(pup)
+    local p1 = G.getP1 and G.getP1()
+    if not (valid(pup) and valid(p1)) then return nil end
+    local okA, a = pcall(function() return pup:K2_GetActorLocation() end)
+    local okB, b = pcall(function() return p1:K2_GetActorLocation() end)
+    if not (okA and a and okB and b) then return nil end
+    return math.sqrt((a.X - b.X) ^ 2 + (a.Y - b.Y) ^ 2), a, b, p1
+end
+-- 沿"我 → 替身"方向把替身放到离我 want cm（同 SNAP.backOff，方向相反：往前贴）
+function MJAAA.pull(pup, d, a, b, want)
+    local dx, dy = a.X - b.X, a.Y - b.Y
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len < 1.0 then return false end
+    local at = { X = b.X + dx / len * want, Y = b.Y + dy / len * want, Z = a.Z }
+    local yaw = math.deg(math.atan(-dy, -dx))                -- 面向我
+    if G.teleportTo then
+        local okT, r = pcall(G.teleportTo, pup, at, yaw)
+        if okT and r ~= false then return true end
+    end
+    return (pcall(function() pup:K2_SetActorLocation(at, false, {}, true) end))
+end
+function MJAAA.step(tn)
+    local p = MJAAA.pend
+    if not p or tn < p.nextS then return end
+    local age = tn - p.at
+    if age > MJAAA.UNTIL or not valid(p.pup) then MJAAA.pend = nil; return end
+    p.nextS = tn + MJAAA.SAMPLE
+    local d, a, b, p1 = MJAAA.where(p.pup)
+    local _, _, pm, pos = LAT.activeMontage(p.pup)
+    local _, _, mm = LAT.activeMontage(p1)
+    local inWin
+    if pm == MJAAA.MON and pos then inWin = pos >= MJAAA.POS_FROM and pos <= MJAAA.POS_TO
+    else inWin = age >= MJAAA.T_FROM and age <= MJAAA.T_TO end
+    local act = "-"
+    if inWin and not p.pulled and d then
+        p.pulled = true
+        if d > MJAAA.MIN and d < MJAAA.MAX then
+            if p.off then act = string.format("该贴近 %.0f→%d（默认关，放 net/mjaaa_pull_on.txt 开）", d, MJAAA.WANT)
+            else
+                local ok = MJAAA.pull(p.pup, d, a, b, MJAAA.WANT)
+                act = string.format("贴近 %.0f→%d %s", d, MJAAA.WANT, ok and "成功" or "失败")
+            end
+        else
+            act = string.format("不贴（%.0f 不在 %d–%d）", d, MJAAA.MIN, MJAAA.MAX)
+        end
+    end
+    MJAAA.log("§445 墨血 AAA 远端#%s +%.2f 秒：离我 %s cm，替身 %s@%s，我 %s；%s", tostring(p.id), age,
+        d and string.format("%.0f", d) or "?", tostring(pm), pos and string.format("%.2f", pos) or "?", tostring(mm), act)
+end
+
 -- AIR.fire 放成功后：before = 放之前替身在播的动作名
 function ANIM.afterFire(pup, e, before, tn)
+    pcall(MJAAA.onFire, pup, e, tn)                         -- §445
     if not isAttackAbility(e.name) or e.name:find("_Air", 1, true) or CHG.isHold(e.name) then ANIM.pend = nil; return end
     ANIM.pend = { pup = pup, name = e.name, id = e.id, before = before, at = tn, stage = 1,
                   gentle = ANIM.isGentle(e.name) }    -- §243 切刀斩 / §345 断肢锯冲刺攻击：不取消真技能
@@ -452,6 +540,7 @@ end
 
 -- 每次驱动：到点看一眼（没有等着的就什么都不读）
 function ANIM.step(tn)
+    if MJAAA.pend then pcall(MJAAA.step, tn) end            -- §445 墨血 AAA 第一段前贴近 + 距离诊断
     local p = ANIM.pend
     if not p or tn - p.at < (p.gentle and ANIM.SWT_CHECK or ANIM.CHECK) then return end
     if not valid(p.pup) then ANIM.pend = nil; return end
