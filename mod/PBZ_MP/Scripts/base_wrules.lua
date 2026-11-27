@@ -938,6 +938,7 @@ function SEG1121.reset()
     SEG1121.hp, SEG1121.seen, SEG1121.seenAi, SEG1121.aiOn = nil, nil, nil, false
     SEG1121.cleanPrev, SEG1121.cleanAiPrev = false, false
     SEG1121.accPrev, SEG1121.accAiPrev, SEG1121.dirtyWhy, SEG1121.dirtyAiWhy = nil, nil, nil, nil
+    if SEG1121.startDone then SEG1121.startDone.fix = nil end   -- "mine" 不清：对局外木桩时这里每帧都会调
 end
 function SEG1121.tag(actor, name)
     if not G.tagsMatching then return nil end
@@ -1040,6 +1041,81 @@ function SEG1121.classify(src, attacker, name)
     end
     return factor ~= 1 and factor or nil
 end
+-- §454 11.25 用户："拿出狮头的瞬间冲击波伤害在对方被燃烧的情况下伤害会变得非常高"。11-25 14:08:38 实机：对方混沌 / 燃烧中，
+-- 这一帧两个伤害载荷（池化对象）的来源都被同帧的跳伤 GE 盖掉（"?DamageSource_GameplayEffect"），读不到 B_LionHead_Start → 不乘 → -535 满额
+-- （14:07:29 干净时同一下 -530 ×0.1667 → -88）。就算读到了，挨打方"不干净"也不乘。
+-- 改：拿出冲击波是一下大伤害、跳伤一下只有几点，挨打方不干净也照乘（误差 = 同帧跳伤的几点）；载荷全被跳伤盖掉时，
+-- 这招放出后 START.win 秒内第一下原始 ≥ START.min 的认成拿出冲击波（每招一次）
+SEG1121.START = { GA_LionHead_C = { seg = "B_LionHead_Start", keys = { B_LionHead_Start = true, B_LionHead_Start_Chaos = true }, win = 1.2, min = 40 } }
+SEG1121.startDone = {}
+-- 11.26 贪狼派生额外攻击（用户"第一段预期 260-270、第二段 350-360"）：两段 BulletData_TanLang_ExtraAttack_01 / _02 原版同倍率 1.25、
+-- 现版每下约 450（11-24 / 11-25 实机 445–453），按分段拆成 265 / 355。这招先放的鬼火 BulletData_TanLang_GhostFire 会挂混沌，
+-- 挨打方几乎总是"不干净"、分段从来乘不上（11-25 15:49:00 _02 -444 满额）。和 §454 拿出冲击波一样：这两段一下几百、混沌跳伤一下几点，
+-- 这一帧读到的判定名全是这两段时挨打方不干净也照乘（误差 = 同帧跳伤的几点）
+-- 11.26 羽弓往后闪避射击 B_GA_UnnamedBow_Dash_B_01（一箭）拉到和完美防御射击一样，同样是一下几百、别因为对方身上有跳伤就不乘
+SEG1121.DIRTY_OK = { BulletData_TanLang_ExtraAttack_01 = true, BulletData_TanLang_ExtraAttack_02 = true, B_GA_UnnamedBow_Dash_B_01 = true }
+-- 11.26 双开实测（17:46:38 远端#6）：第一段载荷读到 _01、×0.5889 → -255；第二段那一帧载荷被鬼火盖成 BulletData_TanLang_GhostFire，
+-- classify 认不出 → -492 满额。改：这招放出后 ORDER.win 秒内，原始 ≥ min 的大伤害按顺序认——载荷里有段名就按段名，
+-- 只有鬼火 / "?" 就按这一招里第几下（第 1 下 = _01，第 2 下 = _02）。返回 系数, 段名；不是返回 nil
+SEG1121.ORDER = { GA_TanLang_ExtraAttack_C = { keys = { "BulletData_TanLang_ExtraAttack_01", "BulletData_TanLang_ExtraAttack_02" },
+                                               filler = { BulletData_TanLang_GhostFire = true }, min = 150, win = 3.0,
+                                               -- 17:55 双开：第二段原始在 432 / 492 之间变（混沌加成有时有、有时没有），固定系数压到 312–355。
+                                               -- 同一招第一段乘过时，第二段 = 第一段乘后 × ratio（355 / 265），不跟加成走；第一段没中才用 segments 里的 _02
+                                               ratio = { [2] = 355 / 265 } } }
+SEG1121.orderSt = {}
+function SEG1121.orderHit(src, name, castAt, tn, raw, slot)
+    local o = name and SEG1121.ORDER[name]
+    if not o or not castAt or tn < castAt or tn - castAt > o.win or raw < o.min then return nil end
+    local st = SEG1121.orderSt[slot]
+    if not st or st.castAt ~= castAt then st = { castAt = castAt, n = 0 }; SEG1121.orderSt[slot] = st end
+    local idx
+    for _, bd in ipairs(src and src.pay or {}) do
+        for i, k in ipairs(o.keys) do if bd == k then idx = i end end
+        if not idx and not o.filler[bd] and not tostring(bd):find("^%?") then return nil end   -- 混了别的判定，不猜
+    end
+    idx = idx or (st.n + 1)
+    if idx > #o.keys then return nil end
+    st.n = math.max(st.n, idx)
+    local key = o.keys[idx]
+    local f = BAL.SEGMENTS and BAL.SEGMENTS[key]
+    if not f or f == 1 then return nil end
+    local r = o.ratio and o.ratio[idx]
+    if r and st.out1 and raw > 0 then f = st.out1 * r / raw end
+    if idx == 1 then st.out1 = raw * f end
+    return f, key
+end
+function SEG1121.dirtyOk(src)
+    local pay = src and src.pay
+    if not pay or #pay == 0 then return false end
+    for _, bd in ipairs(pay) do if not SEG1121.DIRTY_OK[bd] then return false end end
+    return true
+end
+-- 这一帧是不是这招的拿出冲击波：返回 系数, 认法（"pay" 读到判定名 / "guess" 按时间 + 大小认）；不是返回 nil
+function SEG1121.startHit(src, name, castAt, tn, raw, slot)
+    local s = name and SEG1121.START[name]
+    if not s or not castAt or tn < castAt or tn - castAt > s.win then return nil end
+    if SEG1121.startDone[slot] == castAt then return nil end
+    local f = BAL.SEGMENTS and BAL.SEGMENTS[s.seg]
+    if not f or f == 1 then return nil end
+    local named, hit = false, false
+    for _, bd in ipairs(src and src.pay or {}) do
+        if s.keys[bd] then hit = true
+        elseif not tostring(bd):find("^%?") then named = true end
+    end
+    local how
+    if hit and not named then how = "pay"
+    elseif not hit and not named and raw >= s.min then how = "guess"      -- 载荷全是 "?"（被跳伤盖掉）或读不到
+    else return nil end
+    SEG1121.startDone[slot] = castAt
+    return f, how
+end
+function SEG1121.startLog(who, name, how, raw, f, src)
+    SEG1121.startN = (SEG1121.startN or 0) + 1
+    if SEG1121.startN > 40 then return end
+    out("§454 %s %s 拿出冲击波（%s）：-%.0f ×%g → -%.0f；判定 %s", who, name,
+        how == "pay" and "读到判定名，挨打方不干净也乘" or "载荷被跳伤盖掉，按放招后时间 + 大小认",
+        raw, f, raw * f, (src and src.pay and #src.pay > 0) and table.concat(src.pay, "，") or "读不到")
+end
 -- 11.22 影武实机：放影武期间掉血了、分段却没改的，记下这一帧的判定名和原因（核对分段键名用；最多 SEG1121.WHY_MAX 行）
 SEG1121.whyN, SEG1121.WHY_MAX = 0, 60
 function SEG1121.why(src, attacker, f, tn, dirty)
@@ -1088,9 +1164,19 @@ function SEG1121.fixFrame(p1, pup, tn, cleanBefore, accBefore, dirty)
     SEG1121.seen = src and src.seen
     local name = BAL.last and tn - BAL.lastAt < BAL.HOLD and BAL.last or nil
     local f = SEG1121.classify(src, pup, name)
-    if f and cleanBefore then
+    local sf, how = SEG1121.startHit(src, name, BAL.lastAt, tn, previous - hp, "fix")
+    if sf then
+        f, cleanBefore = sf, true
+        SEG1121.startLog("对方", name, how, previous - hp, sf, src)
+    elseif f and cleanBefore then
         local b, bwhy = SEG1121.burst(p1, accBefore)
         if b then cleanBefore, dirty = false, bwhy end
+    end
+    if f and not cleanBefore and SEG1121.dirtyOk(src) then cleanBefore = true end   -- 11.26 贪狼派生两段
+    local of, okey = SEG1121.orderHit(src, name, BAL.lastAt, tn, previous - hp, "fix")
+    if of then
+        f, cleanBefore = of, true
+        out("11.26 贪狼派生按顺序认：-%.0f → %s ×%g", previous - hp, okey, of)
     end
     if not f or not cleanBefore then pcall(SEG1121.why, src, pup, f, tn, dirty); return nil end
     local target = math.max(0, previous - (previous - hp) * f)
@@ -1114,12 +1200,18 @@ function SEG1121.mine(p1, pup, tn, d, name, id)
     local src = G.hitSources(pup, p1, SEG1121.seenAi, true)
     SEG1121.seenAi = src and src.seen
     local f = SEG1121.classify(src, p1, name)
+    local castAt = (id ~= nil and id == NET.myAtkId) and NET.myAtkAt or nil
+    local sf, how = SEG1121.startHit(src, name, castAt, tn, d, "mine")
+    if sf then SEG1121.startLog("我（打本地 AI）", name, how, d, sf, src); return d * sf end
     local dirty = SEG1121.dirtyAiWhy
     if f and SEG1121.cleanAiPrev == true then
         local b, bwhy = SEG1121.burst(pup, SEG1121.accAiPrev)
         if not b then return d * f end
         dirty = bwhy
     end
+    local of, okey = SEG1121.orderHit(src, name, castAt, tn, d, "mine")
+    if of then out("11.26 贪狼派生按顺序认（我打本地 AI）：-%.0f → %s ×%g", d, okey, of); return d * of end
+    if f and SEG1121.dirtyOk(src) then return d * f end                         -- 11.26 贪狼派生两段
     local cart = SEG1121.cartTurn(name, id, d, src)
     if cart then return d * cart end
     pcall(SEG1121.whyMine, src, p1, f, name, d, dirty)

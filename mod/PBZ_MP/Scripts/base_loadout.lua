@@ -405,7 +405,8 @@ CAP = { SLACK = 1.25, REF_ATK = 200, n = 0,
         -- §436 火力全开（用户 11-24："按之前的预期伤害数值给限制"）：11.23 定的预期一招 1500–1550（伤害 20% 房、标准数值、对方攻击 200），
         -- 不破防实测一招累计 1415–1484（11-24 #981 / #1007 / #1011 / #1013 / #1017）；挨打方挡着被破防那一下游戏自己 ×2（-2721，累计 2820 / 2905）。
         -- 按 1550 封顶：TOTAL 是伤害 100% / 攻击 200 口径 → 1550 ÷ 20% = 7750（伤害倍率 / 攻击 / 等级照 CAP.expected 缩放）。系数 0.66 以后再改，这里不会跟着变
-        TOTAL = { GA_GlobalActionAbility_LieZhan_C_C = 1050, GA_TigerCannon_Ultimate_C = 7750 }, TOTAL_SLACK = 1.0 }
+        -- 11.26 用户：火力全开 -20%（预期 1200），系数 0.66 → 0.5337；封顶跟着降到 1250（= 1550 × 0.5337 / 0.66 取整）→ 1250 ÷ 20% = 6250
+        TOTAL = { GA_GlobalActionAbility_LieZhan_C_C = 1050, GA_TigerCannon_Ultimate_C = 6250 }, TOTAL_SLACK = 1.0 }
 -- §359 大招"除了第一刀后面都没伤害"（内测反馈 11-16，v0.34.1 日志）：§197 / §203 列的天玄青铜剑 / 荡寇凶刃 / 玉双环大招，
 -- 原版是只采到一段（青铜剑 1572、荡寇 1952）或打空下限（玉双环 3039）——整招按游戏数据是 6860 / 8884 / 6365（base_capdata.lua
 -- §339.2、data/move_game.csv 1632 × 3.9）。上限 = 原版 × 系数 × …，第一刀就把它吃满，后面每一段都被吃掉（日志"改过之后又吃掉 N 跳"）。
@@ -1788,7 +1789,25 @@ function LO.syncWge(pup, wge, st)
         if not (zmOwn and id == ABUF.ZM_GE)
             and not (SHADOWPASSIVES and SHADOWPASSIVES.blocked(id)) then want[id] = true end
     end
-    for id in pairs(want) do
+    -- 11.26 游龙头"在线第二炮和真人不一样"：替身补效果以前按 pairs 的随机顺序，GE_YouLongHead_WaterCannon 先于 _V2 挂上时
+    -- 替身放出的是单发水炮（动作 Hun_ShaChi_YouLongTou_Skill_01_Start_Montage，11-24 13:57:35 / 11-25 15:46:14），
+    -- 真人是连环水炮（AM_Hun_YouLongHead_WaterCannon_Launch_Normal_V2）；先 _V2 后基础那次（11-23 15:03 / 15:04）替身动作和真人一样。
+    -- 改：按名字排好，<X>_V2 排在 <X> 前面；<X>_V2 这次新挂、<X> 已经挂着时，把 <X> 摘掉跟在后面重挂
+    local order = {}
+    for id in pairs(want) do order[#order + 1] = id end
+    table.sort(order, function(a, b)
+        if a == b .. "_V2" then return true end
+        if b == a .. "_V2" then return false end
+        return a < b
+    end)
+    for _, id in ipairs(order) do
+        local base = id:match("^(.+)_V2$")
+        if base and want[base] and st.wgeOn[base] and not st.wgeOn[id] and not CHG.applied[pp .. "|" .. LO.wgePath(id)] then
+            local ok, removedGE = pcall(LO.removeGE, pup, LO.wgePath(base), "替身武器效果 " .. base .. "（_V2 后到，摘掉重挂）")
+            if ok and removedGE == true then st.wgeOn[base], CHG.applied[pp .. "|" .. LO.wgePath(base)] = nil, nil end
+        end
+    end
+    for _, id in ipairs(order) do
         local ck = pp .. "|" .. LO.wgePath(id)            -- 和 CHG.upgrade 同一个记号：§92.7 补过的不再上
         if not st.wgeOn[id] and not CHG.applied[ck] then
             local ok, applied, handle = pcall(LO.applyGE, pup, LO.wgePath(id), "替身武器效果 " .. id)
@@ -1936,6 +1955,31 @@ function ABUF.rzm()
     return math.max(0, math.min(d, ABUF.ZM_SANE)), math.max(0, math.min(a, ABUF.ZM_SANE))
 end
 
+-- 11-26 AI 木桩 V2：纯加属性饰品的效果（GE_Accessory_<名>_LvN）挂到替身上 / 不要了摘掉。
+-- 每个替身每种效果只挂一份（st.pasGE 记着挂在哪个替身上；换了替身就从头挂）
+function LO.syncPasGE(pup, wantGE, st)
+    local who = pathOf(pup)
+    local rec = st.pasGE
+    if not rec or rec.who ~= who then rec = { who = who, on = {} }; st.pasGE = rec end
+    local added, removed = {}, {}
+    for n, path in pairs(rec.on) do
+        if not wantGE[n] then
+            LO.removeGE(pup, path, "AI 饰品效果：摘掉 " .. n)
+            rec.on[n] = nil; removed[#removed + 1] = n
+        end
+    end
+    for n in pairs(wantGE) do
+        if not rec.on[n] then
+            local base, lv = n:match("^GE_Accessory_(.+)_Lv(%d)$")
+            local path = base and ACC.gePath(base, lv)
+            if path and LO.applyGE(pup, path, "AI 饰品效果：挂 " .. n) then rec.on[n] = path; added[#added + 1] = n end
+        end
+    end
+    if #added + #removed > 0 then
+        out("替身饰品效果同步：挂上 %s；摘掉 %s", #added > 0 and table.concat(added, " ") or "-", #removed > 0 and table.concat(removed, " ") or "-")
+    end
+end
+
 -- §223 观战替身也用这一套：pas / st 同 LO.syncWge
 function LO.syncPas(pup, pas, st)
     if st == nil then pas, st = NET.rpas, LO end
@@ -1955,10 +1999,12 @@ function LO.syncPas(pup, pas, st)
         return
     end
     st.pasKey, st.pasReportAt = key, ST.ticks + 60
-    local want = {}
+    local want, wantGE = {}, {}
     for n in pas:gmatch("[%w_]+") do                          -- §170.1 饰品按房间设置换级 / 失效
         local t = ACC.pasName(n, accMode)
-        if t then want[t] = true end
+        -- 11-26 AI 木桩 V2：AI 装备里的纯加属性饰品发的是效果短名 GE_Accessory_<名>_LvN（真人的 pas= 只有技能）→ 按效果挂到替身上
+        if t and t:find("^GE_Accessory_") then wantGE[t] = true
+        elseif t then want[t] = true end
     end
     if std then
         for _, n in ipairs(STD.TALENT_GA) do want[n] = true end      -- §144 天赋按基准
@@ -1966,6 +2012,7 @@ function LO.syncPas(pup, pas, st)
     end
     local asc = ascOf(pup)
     if not valid(asc) then return end
+    LO.syncPasGE(pup, wantGE, st)
     local have, cleared = {}, {}
     local items = rawProp(rawProp(asc, "ActivatableAbilities"), "Items")
     local specs = {}

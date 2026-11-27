@@ -105,9 +105,12 @@ namespace ForNet
             public Dictionary<string, string> Training = TrainingDefaults();
             static Dictionary<string, string> TrainingDefaults()
             {
-                return new Dictionary<string, string> { { "trainAction", "none" }, { "trainGuard", "none" }, { "trainDodge", "0" }, { "trainInterval", "2" }, { "trainRepeat", "1" }, { "trainReturn", "1" }, { "trainHpRegen", "1" }, { "trainChi", "normal" }, { "trainAiHp", "0" }, { "trainAiChi", "0" } };
+                // §456 木桩新增：trainUlt = 精纯杀气（inf / 3 / 2 / 1），trainSp = 暗源（inf / 6 / 3 / 2 / 1）；模组按它给替身补 / 每回合定数
+                return new Dictionary<string, string> { { "trainAction", "none" }, { "trainGuard", "none" }, { "trainDodge", "0" }, { "trainInterval", "2" }, { "trainRepeat", "1" }, { "trainReturn", "1" }, { "trainHpRegen", "1" }, { "trainChi", "normal" }, { "trainAiHp", "0" }, { "trainAiChi", "0" }, { "trainUlt", "inf" }, { "trainSp", "inf" } };
             }
             public string Train(string key) { return Training[key]; }
+            // §456 重复间隔 0.2–8 秒（以前 0.1–30 的档位表撤了）；旧存档里超出范围的值按边界收，不再整条拒掉
+            public const double IntervalMin = 0.2, IntervalMax = 8.0;
             public bool SetTraining(string k, string v)
             {
                 if (!Training.ContainsKey(k)) return false;
@@ -115,7 +118,15 @@ namespace ForNet
                 if (k == "trainAction") { if (Array.IndexOf(TrainingActions, v) < 0) return false; }
                 else if (k == "trainGuard") { if (v != "none" && v != "hold" && v != "perfect") return false; }
                 else if (k == "trainChi") { if (v != "normal" && v != "empty" && v != "locked" && v != "refill") return false; }
-                else if (k == "trainInterval") { if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out n) || double.IsNaN(n) || n < 0.1 || n > 30) return false; }
+                // 11-26 AI 木桩 V2：两项都加 normal（通常 = 模组不补也不定数）
+                else if (k == "trainUlt") { if (v != "normal" && v != "inf" && v != "1" && v != "2" && v != "3") return false; }
+                else if (k == "trainSp") { if (v != "normal" && v != "inf" && v != "1" && v != "2" && v != "3" && v != "6") return false; }
+                else if (k == "trainInterval")
+                {
+                    if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out n) || double.IsNaN(n) || double.IsInfinity(n)) return false;
+                    n = Math.Round(Math.Max(IntervalMin, Math.Min(IntervalMax, n)), 1);
+                    v = n.ToString("0.#", CultureInfo.InvariantCulture);     // 3 → "3"、2.34 → "2.3"（整数照旧存）
+                }
                 else if (v != "0" && v != "1") return false;
                 Training[k] = v; return true;
             }
@@ -162,7 +173,7 @@ namespace ForNet
             public Loadout Clone() { var c = (Loadout)MemberwiseClone(); c.Training = new Dictionary<string, string>(Training); return c; }
 
             // F5：基底经 IAiLoad 存取，键名 / 顺序和以前写死在联机程序里的一字不差
-            static readonly string[] Cmd = { "w", "e", "o", "med", "acc", "fol", "trainAction", "trainGuard", "trainDodge", "trainInterval", "trainRepeat", "trainReturn", "trainHpRegen", "trainChi", "trainAiHp", "trainAiChi" };
+            static readonly string[] Cmd = { "w", "e", "o", "med", "acc", "fol", "trainAction", "trainGuard", "trainDodge", "trainInterval", "trainRepeat", "trainReturn", "trainHpRegen", "trainChi", "trainAiHp", "trainAiChi", "trainUlt", "trainSp" };
             string[] IAiLoad.CmdKeys { get { return Cmd; } }
             bool IAiLoad.Set(string k, string v)
             {
@@ -220,7 +231,7 @@ namespace ForNet
         // 和破防后 BreakStun 秒内（tbrkon=1 期间 / 之后）碰到的刀、杀气见底时碰到的刀都算中招。杀气锁满 / 无限杀气时不破防（那是开关本意）
         const double BreakStun = 1.5;
         internal double dummyBrokeAt = -1;
-        internal readonly HashSet<int> dummyRedIds = new HashSet<int>(), dummyBrkIds = new HashSet<int>();
+        internal readonly HashSet<int> dummyRedIds = new HashSet<int>(), dummyBrkIds = new HashSet<int>(), dummyUnblockIds = new HashSet<int>();
         readonly HashSet<int> dummyBrkSeen = new HashSet<int>();
         internal double[] fpos;
         double stayZ = double.NaN;                       // §354 不跟随时站着的高度（摆到你面前 / 开战点那一刻的）
@@ -284,8 +295,10 @@ namespace ForNet
         {
             if (lv.Dummy)
             {
-                if (Load.Train("trainChi") == "empty" && Load.Train("trainAiChi") != "1") return "hit";
-                if (Load.Train("trainGuard") == "perfect") return "parry";
+                if (Load.Train("trainChi") == "empty") return "hit";
+                // §456 用户 11-26"完美招架对红光技、黑光技也能招架 = 彻底无敌"：不可防御的招（tred= 红光 / tunb= L1+B 特殊技等）
+                // 照真人一样挡不住，算中招；可防御的才精防
+                if (Load.Train("trainGuard") == "perfect") return DummyUnblockable(atk) ? "hit" : "parry";
                 if (Load.Train("trainGuard") == "hold") return DummyHoldFails(atk, tnow) ? "hit" : "block";
                 return "hit";
             }
@@ -298,18 +311,31 @@ namespace ForNet
         // 木桩普通格挡挡不住这一刀：红光招；或替身破防了（破防的那一刀 / 破防后 BreakStun 秒内 / 杀气见底）。杀气锁满 / 无限杀气不破防
         internal bool DummyHoldFails(int atk, double tnow)
         {
-            if (atk > 0 && dummyRedIds.Contains(atk)) return true;
-            if (Load.Train("trainAiChi") == "1" || Load.Train("trainChi") == "locked") return false;
+            if (DummyUnblockable(atk)) return true;
+            if (Load.Train("trainChi") == "locked") return false;
             if (atk > 0 && dummyBrkIds.Contains(atk)) return true;
             if (dummyBrokeAt >= 0 && tnow - dummyBrokeAt < BreakStun) return true;
             return shGate && sh < 1;
         }
 
-        // 读包里的 tred= / tbrk= / tbrkon=（木桩用）
-        void ReadDummyGuard(Dictionary<string, string> me, double tnow)
+        // §456 木桩自动归位只在第 1 回合倒计时（mt=cd:1；拿不到回合号的旧版模组 = 0 也算）
+        internal static bool DummyReturnNow(bool dummy, string trainReturn, bool hold, int mround)
         {
-            dummyRedIds.Clear(); dummyBrkIds.Clear();
+            return dummy && trainReturn == "1" && hold && mround <= 1;
+        }
+
+        // §456 这一招挡不住（红光 tred= / 别的不可防御招 tunb=）
+        internal bool DummyUnblockable(int atk)
+        {
+            return atk > 0 && (dummyRedIds.Contains(atk) || dummyUnblockIds.Contains(atk));
+        }
+
+        // 读包里的 tred= / tunb= / tbrk= / tbrkon=（木桩用）
+        internal void ReadDummyGuard(Dictionary<string, string> me, double tnow)
+        {
+            dummyRedIds.Clear(); dummyBrkIds.Clear(); dummyUnblockIds.Clear();
             foreach (var t in Get(me, "tred").Split(',')) { int v; if (int.TryParse(t, out v)) dummyRedIds.Add(v); }
+            foreach (var t in Get(me, "tunb").Split(',')) { int v; if (int.TryParse(t, out v)) dummyUnblockIds.Add(v); }
             foreach (var t in Get(me, "tbrk").Split(','))
             {
                 int v;
@@ -519,7 +545,75 @@ namespace ForNet
             return null;
         }
 
-        public static readonly string[] TrainingActions = { "none", "light", "light_hold", "heavy", "heavy_hold", "lh", "llh", "lllh", "llllh", "hl", "hll", "hlll", "hllll", "sprint_l", "sprint_lh", "sprint_h", "sprint_h_hold", "sprint_hl", "special", "special_hold", "advanced", "chi", "jump", "jump_l", "jump_h" };
+        // §456 用户 11-26 加：影之武装（点 / 按住 / 连点）、影之武装特攻（点 / 按住 / 连点）、精纯杀气招式（点 / 按住 / 连点）
+        public static readonly string[] TrainingActions = { "none", "light", "light_hold", "heavy", "heavy_hold", "lh", "llh", "lllh", "llllh", "hl", "hll", "hlll", "hllll", "sprint_l", "sprint_lh", "sprint_h", "sprint_h_hold", "sprint_hl", "special", "special_hold", "advanced", "chi", "jump", "jump_l", "jump_h",
+            "edge", "edge_hold", "edge_tap", "edge_sp", "edge_sp_hold", "edge_sp_tap", "ult", "ult_hold", "ult_tap" };
+        public static bool IsEdgeAction(string action) { return action != null && action.StartsWith("edge", StringComparison.Ordinal); }
+        public static bool IsTapAction(string action) { return action != null && action.EndsWith("_tap", StringComparison.Ordinal); }
+        // 点一下 / 连点的每一下也发 rel=（按 0.1 秒）：模组那边按住影武键的招（INP.KEYS）收到 rel= 才松，不然一直按到记录过期 = 每下都变成按住
+        public static double TrainingHoldSec(string action)
+        {
+            if (action == null) return 0;
+            if (action.EndsWith("_hold", StringComparison.Ordinal)) return 1.5;
+            if (IsEdgeAction(action) || action.StartsWith("ult", StringComparison.Ordinal)) return 0.1;
+            return 0;
+        }
+
+        // §456 影之武装 / 影之武装特攻：在装着的影之武装（folder = /ShaqiWeapon/<folder>/）的招里挑。各影武命名不统一，按常见写法依次找：
+        //   普通：A 连段（_A_C → _AA_C …）/ _Normal_01_C（_02 / _03 连段）/ _Normal_C / GA_<影武>_C 本体 / _C_C / _Normal_02_C
+        //   特攻：_DB_C（防御 + 影武）/ SpecialAttack / _Skill_C / _CB_C …；连点 = 特攻 + 它后面的派生段（CB → CBB），没有就连放 3 次
+        public static List<string> TrainingEdgeMoves(string text, string folder, string action)
+        {
+            var res = new List<string>();
+            if (string.IsNullOrEmpty(folder) || !IsEdgeAction(action)) return res;
+            var all = new List<string>();
+            foreach (var set in EdgeMoves(text, folder)) all.AddRange(set);
+            if (all.Count == 0) return res;
+            Func<Func<string, bool>, List<string>> where = f => { var l = new List<string>(); foreach (var n in all) if (f(n)) l.Add(n); l.Sort((a, b) => a.Length != b.Length ? a.Length.CompareTo(b.Length) : string.CompareOrdinal(a, b)); return l; };
+            bool sp = action.StartsWith("edge_sp", StringComparison.Ordinal), tap = IsTapAction(action);
+            if (!sp)
+            {
+                var chain = where(n => Regex.IsMatch(n, @"_A+_C$"));
+                if (chain.Count > 0) { if (tap) res.AddRange(chain); else res.Add(chain[0]); return res; }
+                var numbered = where(n => Regex.IsMatch(n, @"_Normal_0\d_C$"));
+                if (numbered.Count > 0 && numbered[0].EndsWith("_Normal_01_C", StringComparison.Ordinal)) { if (tap) res.AddRange(numbered); else res.Add(numbered[0]); return res; }
+                string one = null;
+                foreach (var f in new Func<string, bool>[] {
+                    n => n.EndsWith("_Normal_C", StringComparison.Ordinal),
+                    n => n == "GA_" + folder + "_C" || n == "GA_Hun_" + folder + "_C",
+                    n => n.EndsWith("_C_C", StringComparison.Ordinal),
+                    n => n.EndsWith("_Normal_02_C", StringComparison.Ordinal),
+                    n => n.EndsWith("_Normal_01_C", StringComparison.Ordinal) })
+                {
+                    var l = where(f); if (l.Count > 0) { one = l[0]; break; }
+                }
+                if (one == null) return res;
+                res.Add(one);
+                if (tap) { res.Add(one); res.Add(one); }
+                return res;
+            }
+            string spn = null;
+            foreach (var f in new Func<string, bool>[] {
+                n => n.EndsWith("_DB_C", StringComparison.Ordinal),
+                n => n.Contains("SpecialAttack") || n.Contains("SpeicalAttack"),
+                n => Regex.IsMatch(n, @"_S[Kk]ill_C$"),
+                n => n.EndsWith("_CB_C", StringComparison.Ordinal),
+                n => n.Contains("WaterCannon") || n.Contains("DoubleFireBall") || n.Contains("_Laser_") || n.Contains("_Slide_") || n.Contains("_RoAttack_"),
+                n => n.EndsWith("_Combo_C", StringComparison.Ordinal) || n.EndsWith("_EvolutionAttack_C", StringComparison.Ordinal) || n.EndsWith("_Ultimate_C", StringComparison.Ordinal) })
+            {
+                var l = where(f); if (l.Count > 0) { spn = l[0]; break; }
+            }
+            if (spn == null) return res;
+            res.Add(spn);
+            if (tap)
+            {
+                var m = Regex.Match(spn, @"^(.*_)([A-Z])([A-Z])_C$");     // CB → CBB / CD → CDD
+                var more = m.Success ? where(n => n != spn && n.StartsWith(m.Groups[1].Value + m.Groups[2].Value + m.Groups[3].Value, StringComparison.Ordinal)
+                                                  && Regex.IsMatch(n.Substring(m.Groups[1].Value.Length), "^" + m.Groups[2].Value + m.Groups[3].Value + "+_C$")) : new List<string>();
+                if (more.Count > 0) res.AddRange(more); else { res.Add(spn); res.Add(spn); }
+            }
+            return res;
+        }
 
         // Resolve only assets in the selected family. Missing derivatives truncate the chain,
         // never substitute another weapon's combo (notably B-start weapons).
@@ -573,6 +667,19 @@ namespace ForNet
                         }
                     }
                     break;
+                case "ult": case "ult_hold": case "ult_tap":
+                    // §456 精纯杀气招式（大招 C）：多数武器是 GA_Hun_<族>_C_C，个别是 C1 / CA / C_Range；按住先找蓄力版，没有就放同一招按住
+                    string ult = first(new[] { "C", "C1", "CA", "C_Range", "C_Zui" });
+                    if (ult == null) break;
+                    if (action == "ult_hold") { result.Add(first(new[] { "C_Hold", "C_Draw", "C_Charge" }) ?? ult); break; }
+                    result.Add(ult);
+                    if (action == "ult_tap")
+                    {
+                        var follow = new List<string>();
+                        foreach (var r in new[] { "C2", "C3", "CC", "CCC" }) { var n = find(r); if (n != null && n != ult) follow.Add(n); }
+                        if (follow.Count > 0) result.AddRange(follow); else { result.Add(ult); result.Add(ult); }
+                    }
+                    break;
                 case "jump": case "jump_l": case "jump_h":
                     result.Add("GA_Hun_Jump_C");
                     if (action != "jump") single = first(new[] { action == "jump_l" ? "Air_A" : "Air_B", action == "jump_l" ? "Air_A_Double" : "Air_B_Double" });
@@ -591,39 +698,48 @@ namespace ForNet
         }
 
         string trainingSignature, trainingUnsupported = "";
+        bool gapPending;                                  // §456 一套招刚放完、重复间隔要从替身收招算
         bool? previousDummy;
         double lastHpLoss = -1, lastChiLoss = -1, previousChi = -1;
         int trainChiEpoch;
         internal string AdvanceTraining(double now, bool hold, bool busy, Loadout ld, string text, out double height, out double vz)
         {
-            string signature = ld.Fam + ":" + ld.Train("trainAction") + ":" + ld.Train("trainRepeat");
-            if (signature != trainingSignature || hold) { trainingSignature = signature; trainingUnsupported = ""; combo.Clear(); events.Clear(); nextHit = now + 0.3; }
+            string action = ld.Train("trainAction");
+            string signature = ld.Fam + ":" + action + ":" + ld.Train("trainRepeat") + ":" + (IsEdgeAction(action) ? edgeName : "");
+            if (signature != trainingSignature || hold) { trainingSignature = signature; trainingUnsupported = ""; combo.Clear(); events.Clear(); nextHit = now + 0.3; gapPending = false; }
+            // §456 重复间隔（0.2–8 秒，用户 11-26 撤了别的写死间隔）从这一套招放完算：替身还在出招（trainBusy=1）就一直往后推
+            double interval = double.Parse(ld.Train("trainInterval"), CultureInfo.InvariantCulture);
+            if (gapPending && combo.Count == 0 && busy) nextHit = Math.Max(nextHit, now + interval);
             if (!hold && !busy && dead == 0 && now >= nextHit)
             {
                 if (combo.Count == 0)
                 {
-                    combo = TrainingMoves(text, ld.Fam, ld.Train("trainAction"), ld.Train("trainRepeat") == "1");
+                    combo = IsEdgeAction(action) ? TrainingEdgeMoves(text, edgeName, action) : TrainingMoves(text, ld.Fam, action, ld.Train("trainRepeat") == "1");
                     if (combo.Count == 0)
                     {
-                        trainingUnsupported = ld.Train("trainAction") == "none" ? "" : ld.Train("trainAction");
-                        if (trainingUnsupported.Length > 0) Log("AI training: unsupported action " + trainingUnsupported + " for " + ld.Fam);
+                        trainingUnsupported = action == "none" ? "" : action;
+                        if (trainingUnsupported.Length > 0) Log("AI training: unsupported action " + trainingUnsupported + " for " + (IsEdgeAction(action) ? "edge " + (edgeName ?? "-") : ld.Fam));
                         nextHit = now + 30;
                     }
                 }
                 if (combo.Count > 0)
                 {
                     var n = combo[0]; combo.RemoveAt(0);
-                    double held = ld.Train("trainAction").EndsWith("_hold", StringComparison.Ordinal) ? 1.5 : 0;
+                    double held = TrainingHoldSec(action);
                     events.Add(new Ev { Id = ++evId, T = now, Name = n, HoldSec = held });
                     if (n == "GA_Hun_Jump_C") hopT0 = now;
-                    double interval = double.Parse(ld.Train("trainInterval"), CultureInfo.InvariantCulture);
-                    nextHit = now + (combo.Count > 0 ? (n == "GA_Hun_Jump_C" ? HopLead : 0.9) : Math.Max(ld.Train("trainRepeat") == "1" ? 1.2 : interval, ld.Train("trainAction").StartsWith("jump") ? 3.0 : (held > 0 ? held + 1.2 : 1.2)));
+                    double hold1 = held > 0.5 ? held : 0;
+                    nextHit = now + (combo.Count > 0 ? (n == "GA_Hun_Jump_C" ? HopLead : IsTapAction(action) ? 0.35 : 0.9) : hold1 + interval);
+                    gapPending = combo.Count == 0;
                 }
             }
             height = 0; vz = 0;
             if (hopT0 >= 0) { double t = now - hopT0; height = HopVz * t - HopG * t * t / 2; vz = HopVz - HopG * t; if (height <= 0 && t > 0.05) { height = 0; vz = 0; hopT0 = -1; } }
             events.RemoveAll(e => now - e.T >= Math.Max(2, e.HoldSec + 2));
-            if (!hold && !busy && dead == 0 && (ld.Train("trainChi") != "empty" || ld.Train("trainAiChi") == "1") && ld.Train("trainGuard") == "hold" && mv.Stance != null && combo.Count == 0 && events.Count == 0)
+            // 按住格挡时举着架势（游戏自己挡、自己扣杀气）。
+            // §456.2 完美招架不举：§456 曾让它也举，结果游戏先按普通格挡挡前几下、扣杀气直到破防，之后才轮到精防
+            // （11-26 实测 800 → 426 → 51 → 1）。完美招架的动作由模组 DEFANIM 按武器播精防动作（§456.1），不靠架势。
+            if (!hold && !busy && dead == 0 && ld.Train("trainChi") != "empty" && ld.Train("trainGuard") == "hold" && mv.Stance != null && combo.Count == 0 && events.Count == 0)
                 events.Add(new Ev { Id = ++evId, T = now, Name = mv.Stance });
             var sb = new StringBuilder();
             foreach (var e in events) if (now - e.T < 2) sb.Append(sb.Length > 0 ? "," : "").Append(e.Id).Append(':').Append(e.Name);
@@ -852,9 +968,11 @@ namespace ForNet
                 combo.Clear(); events.Clear(); nextHit = tnow + 0.3; trainingSignature = null;
             }
             previousDummy = dummy;
-            double[] spot = hold && (!dummy || Load.Train("trainReturn") == "1") ? AspGuest(Get(me, "asp")) : null;
+            // §456 木桩"自动归位"（用户 11-26）：准备后进入对局的那一下（第 1 回合倒计时）归位一次，之后不再归位、也不跟着你走
+            bool dummyReturn = DummyReturnNow(dummy, Load.Train("trainReturn"), hold, mround);
+            double[] spot = hold && (!dummy || dummyReturn) ? AspGuest(Get(me, "asp")) : null;
             double vx, vy, holdZ;
-            bool follow = Load.Follow && (!dummy || Load.Train("trainReturn") == "1");                       // §354
+            bool follow = Load.Follow && !dummy;                                                              // §354
             string map = Get(me, "map");
             if (!follow && map.Length > 0 && map != stayMap) { if (stayMap != null) fpos = null; stayMap = map; }     // 换图：重新摆到你面前
             if (dummy && !follow && map.Length > 0 && fpos != null)
@@ -903,12 +1021,13 @@ namespace ForNet
                 previousChi = sh;
                 if (ld.Train("trainAiHp") == "1") { hp = hpm; dead = 0; }
                 else if (ld.Train("trainHpRegen") == "1" && lastHpLoss >= 0 && tnow - lastHpLoss >= 5) { hp = hpm; dead = 0; }
-                if (ld.Train("trainAiChi") == "1" || ld.Train("trainChi") == "locked") sh = shm;
+                // §456 木桩的"无限杀气"只看杀气状态（locked）；以前另有一个"无限杀气"开关（trainAiChi），木桩里撤了、不再看它
+                if (ld.Train("trainChi") == "locked") sh = shm;
                 else if (ld.Train("trainChi") == "empty") sh = 0;
                 else if (ld.Train("trainChi") == "refill" && lastChiLoss >= 0 && tnow - lastChiLoss >= 5) { sh = shm; trainChiEpoch++; lastChiLoss = -1; }
             }
             if (ld.Train("trainAiHp") == "1") { hp = hpm; dead = 0; }
-            if (ld.Train("trainAiChi") == "1") sh = shm;
+            if (!dummy && ld.Train("trainAiChi") == "1") sh = shm;
             string wcs;
             SyncWeaponAndEdge(ld, me, abilText, out wcs);
             bool near = Math.Sqrt((px - x) * (px - x) + (py - y) * (py - y)) <= Reach;
@@ -923,13 +1042,14 @@ namespace ForNet
             string evStr = dummy
                 ? AdvanceTraining(tnow, hold, Get(me, "pst") == "1" || Get(me, "trainBusy") == "1" || (dummyBrokeAt >= 0 && tnow - dummyBrokeAt < BreakStun), ld, abilText, out hopH, out hopV)
                 : AdvanceCombat(tnow, hold, near, dead == 0 && !pupBusy, dead == 0 && !pupBusy, mstate, Get(me, "medok"), hpm, ld, out hopH, out hopV);
-            if (dummy && ld.Train("trainGuard") == "hold" && dead == 0 && (ld.Train("trainChi") != "empty" || ld.Train("trainAiChi") == "1")) guardUntil = tnow + 0.2;
+            if (dummy && ld.Train("trainGuard") != "none" && dead == 0 && ld.Train("trainChi") != "empty") guardUntil = tnow + 0.2;
 
             // 你的每一刀：按难度的权重随机回报 中招 / 精防 / 普防（举着架势时只有精防 / 普防），晚 ResDelay 秒。
             // §107 模组发了 tc=（你哪几招在游戏里真的碰到了 AI 的身体）：只有碰到的招才掷结果，TouchWait 秒内没碰到 = 落空；
             // 旧版模组没有 tc= → 照旧每招都掷（以前对着空气砍 AI 也掉血就是这个）
             if (dummy) ReadDummyGuard(me, tnow);
             bool dummyHold = dummy && ld.Train("trainGuard") == "hold";
+            bool dummyPerfect = dummy && ld.Train("trainGuard") == "perfect";
             bool touchInfo = me.ContainsKey("tc");
             var touched = new HashSet<int>();
             foreach (var tid in Get(me, "tc").Split(',')) { int v; if (int.TryParse(tid, out v)) touched.Add(v); }
@@ -1006,6 +1126,7 @@ namespace ForNet
                 if (a.Kind == null || tnow - a.Seen < ResDelay) continue;
                 // 木桩普通格挡：判了普防、还没回报的，回报前再看一眼（破防动作 / 杀气常比碰到晚一两帧到）
                 if (dummyHold && a.Kind == "block" && !counted.Contains(a.Rid) && DummyHoldFails(kv.Key, tnow)) a.Kind = "hit";
+                if (dummyPerfect && a.Kind == "parry" && !counted.Contains(a.Rid) && DummyUnblockable(kv.Key)) a.Kind = "hit";     // §456 tred= / tunb= 常比碰到晚一两帧
                 if (dummyHold && a.Kind == "hit" && dummyBrkIds.Contains(kv.Key) && !dummyRedIds.Contains(kv.Key)) a.Broke = true;   // 记住：之后 tbrk= 里没了也不退回 400
                 bool brkHit = a.Broke;
                 if (a.Kind == "hit" && a.Dmg <= 0)
@@ -1049,7 +1170,7 @@ namespace ForNet
             if (dummy)
             {
                 body += "dummy=1\nsqp=1\ntrainChiEpoch=" + trainChiEpoch + "\ntrainUnsupported=" + trainingUnsupported + "\n";
-                foreach (var entry in ld.Training) body += entry.Key + "=" + entry.Value + "\n";
+                foreach (var entry in ld.Training) body += entry.Key + "=" + (entry.Key == "trainAiChi" ? "0" : entry.Value) + "\n";     // §456 木桩不看"无限杀气"开关
                 var releases = new List<string>();
                 foreach (var e in events) if (e.HoldSec > 0 && tnow >= e.T + e.HoldSec) releases.Add(e.Id + ":" + Kv.F(e.HoldSec, "0.0"));
                 body += "rel=" + string.Join(",", releases) + "\n";

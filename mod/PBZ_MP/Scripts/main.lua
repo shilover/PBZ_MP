@@ -651,7 +651,7 @@ function NPM.readMode(tn)
     end
     -- §226 本地 AI：它的位置是联机程序编的（站你前方 4 米、出招不挪），全程跟网络位置 = 冲刺 / 位移招原地打空气
     -- （内测 11-11："AI 打我的时候原地卡住自己，位移招式过不来"）。对 AI 一律动画带位移（§128 冲过头 2 米停住照旧）
-    local m = (NET.rdummy and NET.rtrainReturn == false) and "anim"
+    local m = (TRAINCTX and TRAINCTX.stay()) and "anim"     -- §456 木桩：除了第 1 回合倒计时归位那一下，都站在原地
         or NPM.override or ((NET.flagNow("npos") and not NET.rai) and "net" or "anim")
     if m ~= NPM.mode or not NPM.told then
         NPM.told = true
@@ -735,7 +735,7 @@ end
 local function drivePuppet(pup, pos, vel, yaw)
     local cur = try("pup loc", function() return pup:K2_GetActorLocation() end)
     if not cur then return end
-    if NET.rdummy and NET.rtrainReturn == false and not (PEER and PEER.on) then
+    if TRAINCTX and TRAINCTX.stay() and not (PEER and PEER.on) then     -- §456 木桩只在第 1 回合倒计时归位
         ST.feedLeft, ST.lagSince = 0, nil
         if RMS.pup ~= pathOf(pup) or RMS.cur ~= 1.0 then
             RMS.pup, RMS.cur = pathOf(pup), 1.0
@@ -2757,6 +2757,54 @@ local function hitNameFor(weaponId, side)
     return nil
 end
 
+-- §456 本地 AI / 木桩的格挡动作按替身武器大类挑（用户 11-26"AI 木桩的格挡过程没有动作"）。
+-- 以前一律播荡寇凶刃的两个精防动作（DEFLECT_ANIMS），这两个动作只有存档里用过荡寇才在内存里，
+-- 没加载时 montageByName 拿不到 → "替身格挡 …（失败）"，木桩挡住了却什么都不播。
+-- 现在：精防 = <大类>_PD_L1 / PD_R1，普防 = 唐刀 DefenceNormal_A–D / 长兵、双持 DF_L / DF_R（资产在
+-- /PBZCombatAsset/ActorData/Players/Hun/Montage/<TangBlade|LongBlade|DoubleBlade>/Deflect/，gasgraph 列出来的）；
+-- 内存里没有就按路径加载一次（LO.loadObject，记下来不重复加载）；都不行再退回原来那两个。真人对战不走这里（照旧）
+DEFANIM = { n = 0, cache = {}, logs = 0, ROOT = "/PBZCombatAsset/ActorData/Players/Hun/Montage/",
+    SETS = {
+        Tang = { parry = { "TangBlade/Deflect/New/AM_Hun_Tang_PD_L1", "TangBlade/Deflect/New/AM_Hun_Tang_PD_R1" },
+                 block = { "TangBlade/Deflect/New1/Hun_Tang_DefenceNormal_A_Montage", "TangBlade/Deflect/New1/Hun_Tang_DefenceNormal_B_Montage",
+                           "TangBlade/Deflect/New1/Hun_Tang_DefenceNormal_C_Montage", "TangBlade/Deflect/New1/Hun_Tang_DefenceNormal_D_Montage" } },
+        Long = { parry = { "LongBlade/Deflect/New/AM_Hun_Long_PD_L1", "LongBlade/Deflect/New/AM_Hun_Long_PD_R1" },
+                 block = { "LongBlade/Deflect/New/AM_Hun_Long_DF_L", "LongBlade/Deflect/New/AM_Hun_Long_DF_R" } },
+        Double = { parry = { "DoubleBlade/Deflect/New/AM_Hun_Double_PD_L1", "DoubleBlade/Deflect/New/AM_Hun_Double_PD_R1" },
+                   block = { "DoubleBlade/Deflect/New/AM_Hun_Double_DF_L", "DoubleBlade/Deflect/New/AM_Hun_Double_DF_R" } } } }
+function DEFANIM.list(weaponId, kind)
+    local set = DEFANIM.SETS[weaponId and WEAPON_ANIM_CLASS[weaponId] or "Tang"] or DEFANIM.SETS.Tang
+    return set[kind == "parry" and "parry" or "block"]
+end
+function DEFANIM.asset(rel)
+    local short = rel:match("([^/]+)$")
+    local a = montageByName(short)
+    if a then return a, short end
+    if DEFANIM.cache[rel] == nil then
+        DEFANIM.cache[rel] = (LO and LO.loadObject and LO.loadObject(DEFANIM.ROOT .. rel .. "." .. short)) or false
+        if DEFANIM.logs < 12 then DEFANIM.logs = DEFANIM.logs + 1; out("§456 格挡动作 %s：内存里没有，按路径加载%s", short, DEFANIM.cache[rel] and "成功" or "失败") end
+    end
+    return DEFANIM.cache[rel] or nil, short
+end
+-- §456.1 替身武器 ID：ST.pupWeapon 只在"Add Weapon And SwitchTo"那条路写；对方报了 wc=（SetSlotWeapon 只换替身武器组件，
+-- 本地 AI / 木桩都走这条）时它是 nil → 以前一律退成唐刀（11-26 双开：木桩拿双刃 Double 却播 Hun_Tang_DefenceNormal_*）。
+-- 退一步用对方包里的武器 ID（NET.rwId）
+function DEFANIM.weapon()
+    return ST.pupWeapon or NET.rwId
+end
+-- 给替身播一下格挡动作；返回 是否播了, 动作名
+function DEFANIM.play(pup, kind)
+    local list = DEFANIM.list(DEFANIM.weapon(), kind)
+    DEFANIM.n = DEFANIM.n + 1
+    local a, short = DEFANIM.asset(list[(DEFANIM.n - 1) % #list + 1])
+    if a and valid(pup) and playOn(pup, a) then
+        if sameObj(pup, ST.secondPawn) then ST.pupOwnName, ST.pupOwnFrames = short, 120 end     -- 同 playNamed：别被"掐掉本机反应"误杀
+        return true, short
+    end
+    NET.defIdx = (NET.defIdx or 0) % #DEFLECT_ANIMS + 1
+    return playNamed(pup, DEFLECT_ANIMS[NET.defIdx]), DEFLECT_ANIMS[NET.defIdx]
+end
+
 -- 让 actor（拿着 weaponId）做"被弹开"的硬直；返回一句描述
 local function staggerOn(actor, weaponId)
     local name = staggerNameFor(weaponId)
@@ -3216,6 +3264,8 @@ local function netJudge(p1, tn)
     CAP.flush(NET.lastHit and NET.lastHit.r)          -- §199.9 被吃过跳伤的招结束了 → 记合计
     YQX.fix(p1, tn)                                   -- §361 妖锯妖气爆发只留 5%（在早返回之前：爆发不一定落在招式窗口里）
     HQX.fix(p1, puppet(), tn)                         -- §371 黑魔伤魔剑额外剑气只留 75%（同上，剑气飞过来可能在招式窗口外）
+    if SHIELD and SHIELD.guard then SHIELD.guard(p1, puppet(), tn) end   -- §455 替身自己的盾反不算（在分段 / 判定之前补回）
+    if SLIDE455 and SLIDE455.sync then SLIDE455.sync(NET.fighting()) end  -- §455 悬浮盾第一下交手中按踉跄
     if SEG1121 then SEG1121.fix(p1, puppet(), tn) end
     if #NET.judges == 0 and not NET.pendDef and not NET.lastHit
         and not (NET.fighting() and ST.summonArmAt and tn - ST.summonArmAt <= SUMD.FIELD_HOLD) then return end
@@ -3261,6 +3311,8 @@ local function netJudge(p1, tn)
             if torn then hp = NET.judgeHp - torn end
             local sum = not gun and not zdb and not torn and SUMD.fix(p1, j.name, NET.judgeHp - hp, NET.judgeHp, tn)   -- §242 对方召唤物每下 1 点
             if sum then hp = NET.judgeHp - sum end
+            local cc = not gun and not zdb and not torn and not sum and CARTCAP and CARTCAP.fix(p1, j.id, j.name, NET.judgeHp - hp, NET.judgeHp, tn)   -- §460 马车封顶
+            if cc then hp = NET.judgeHp - cc; sum = cc end
             local hcap = not gun and not sum and CAP.hitFix(p1, j.name, NET.judgeHp - hp, NET.judgeHp, tn)   -- §340 单下受伤上限
             if hcap then hp = NET.judgeHp - hcap end
             local capped = not gun and not sum and CAP.fix(p1, j.name, NET.judgeHp - hp, NET.judgeHp - hp, NET.judgeHp, tn)   -- §197 一招总伤害上限
@@ -3296,6 +3348,8 @@ local function netJudge(p1, tn)
         if torn then hp = NET.judgeHp - torn end
         local sum = not gun and not zdb and not torn and SUMD.fix(p1, NET.lastHit.name, NET.judgeHp - hp, NET.judgeHp, tn)   -- §242
         if sum then hp = NET.judgeHp - sum end
+        local cc = not gun and not zdb and not torn and not sum and CARTCAP and CARTCAP.fix(p1, r.atk, NET.lastHit.name, NET.judgeHp - hp, NET.judgeHp, tn)   -- §460 马车封顶
+        if cc then hp = NET.judgeHp - cc; sum = cc end
         local hcap = not gun and not sum and CAP.hitFix(p1, NET.lastHit.name, NET.judgeHp - hp, NET.judgeHp, tn)   -- §340
         if hcap then hp = NET.judgeHp - hcap end
         local capped = not gun and not sum and CAP.fix(p1, NET.lastHit.name, NET.judgeHp - hp, r.v + (NET.judgeHp - hp), NET.judgeHp, tn, r)   -- §197
@@ -3306,7 +3360,7 @@ local function netJudge(p1, tn)
         local inRes = false                            -- 已经过期删掉的放回去（下一段晚于 RES_KEEP 才来）
         for _, x in ipairs(NET.results) do if x == r then inRes = true; break end end
         if not inRes and r.id then NET.results[#NET.results + 1] = r end
-        if not (capped and capped < 0.5) then          -- §199.9 整跳吃掉的不再记"追加 -0"，合计见 CAP.flush
+        if not (capped and capped < 0.5) and not (cc and cc < 0.5) then          -- §199.9 / §460 封顶吃掉的 CARTCAP 自己记 整跳吃掉的不再记"追加 -0"，合计见 CAP.flush
             out("判定 远端#%d → 中招 追加 -%.0f（这招累计 -%.0f）%s", r.atk, NET.judgeHp - hp, r.v, NET.pupAtkNote())
         end
         if NET.lastHit.ctr then                       -- §347 防反诊断：后面几段
@@ -3409,12 +3463,20 @@ local function applyRemoteResult(p1, r)
             local busy = PRED.busy(puppet(), tn)
             if busy then
                 pupTxt = "替身" .. busy .. "，不播格挡"
+            elseif NET.rai then                                  -- §456 本地 AI / 木桩：按替身武器播精防 / 普防动作
+                local okPup, an = DEFANIM.play(puppet(), kind)
+                pupTxt = string.format("替身格挡 %s（%s%s）", tostring(an), okPup and "已播" or "失败",
+                    okPup and PRED.seek(puppet(), pr.seek) or "")
             else
                 NET.defIdx = (NET.defIdx or 0) % #DEFLECT_ANIMS + 1
                 local okPup = playNamed(puppet(), DEFLECT_ANIMS[NET.defIdx])
                 pupTxt = string.format("替身格挡 %s（%s%s）", DEFLECT_ANIMS[NET.defIdx], okPup and "已播" or "失败",
                     okPup and PRED.seek(puppet(), pr.seek) or "")
             end
+        end
+        if kind == "block" and TRAINCTX and TRAINCTX.blockChi then
+            local okB, msgB = pcall(TRAINCTX.blockChi, puppet(), tn)       -- §456 木桩普防扣杀气（游戏自己没扣时）
+            if msgB then pupTxt = pupTxt .. "；" .. (okB and msgB or ("木桩扣杀气出错 " .. tostring(msgB))) end
         end
         out("◆ 你的第 #%d 招被对方%s%s → 你%s，%s", r.atk, RES_NAME[kind],
             kind == "parry" and string.format("（连续第 %d 次）", n) or "", me, pupTxt)
@@ -3531,6 +3593,14 @@ function PRED.learn(g, isDef)
 end
 
 -- 优先级仲裁：替身现在有更高优先级的动作在播 → 返回原因（不该再播格挡 / 受击 / 预测），否则 nil
+-- §456 预播 / 先到的格挡：本地 AI 按替身武器挑（DEFANIM），真人对战照旧荡寇那两个
+function PRED.playDef(pup, kind)
+    if NET.rai then return DEFANIM.play(pup, kind) end
+    NET.defIdx = (NET.defIdx or 0) % #DEFLECT_ANIMS + 1
+    local a = DEFLECT_ANIMS[NET.defIdx]
+    return playNamed(pup, a), a
+end
+
 function PRED.busy(pup, tn)
     if REP.on then return "在回放" end
     if NET.remoteHp and NET.remoteHp <= 0 then return "已倒地" end
@@ -4275,9 +4345,7 @@ function PRED.onContact(pup, an, mt, name, tn)
             return true
         elseif rk == "parry" or rk == "block" then
             pcall(function() an:Montage_Stop(0.0, mt) end)
-            NET.defIdx = (NET.defIdx or 0) % #DEFLECT_ANIMS + 1
-            local a = DEFLECT_ANIMS[NET.defIdx]
-            local ok = playNamed(pup, a)
+            local ok, a = PRED.playDef(pup, rk)                 -- §456 本地 AI 按武器挑格挡动作
             pRec.m = ok and a or nil
             st.preDef = st.preDef + 1
             PRED.log("预测：我第 #%d 招碰到替身，%s → 播格挡 %s（%s）", atk, reason, a, ok and "已播" or "失败")
@@ -4292,9 +4360,7 @@ function PRED.onContact(pup, an, mt, name, tn)
 
     if kind == "deflect" then
         pcall(function() an:Montage_Stop(0.0, mt) end)
-        NET.defIdx = (NET.defIdx or 0) % #DEFLECT_ANIMS + 1
-        local a = DEFLECT_ANIMS[NET.defIdx]
-        local ok = playNamed(pup, a)
+        local ok, a = PRED.playDef(pup, (NET.rdummy and NET.rtrainGuard == "perfect") and "parry" or "block")     -- §456
         pRec.m = ok and a or nil
         st.preDef = st.preDef + 1
         PRED.log("预测：我第 #%d 招碰到替身，%s → 先播格挡 %s（%s）", atk, reason, a, ok and "已播" or "失败")
@@ -5091,6 +5157,16 @@ function SHIELD.holdOne(h, tn)
     end
     if m == "" and tn - h.at > 0.5 and tn >= (h.retryAt or 0) then
         h.retryAt = tn + SHIELD.RETRY
+        -- 11-26 §458 §439 起替身按着影武键、举盾技能一直在：举到位后游戏用举盾走路姿势（GE_InZhuoBiDunLocomotion）撑着，
+        -- 本来就没有蒙太奇。以前这里把"没动作"当成技能没了，重播举盾停在 0.37 → 盖掉游戏自己的举盾姿势、盾不在手上
+        -- （18:39:15 / 18:40:02 / 18:40:37 三次，蓄力探针同时段技能都还在）。技能还在就不补
+        if LO.activeInstance and LO.activeInstance(pup, h.name) then
+            if not h.liveLogged then
+                h.liveLogged = true
+                SHIELD.hlog("举盾保持：远端#%d 举到位没有动作、技能还在（游戏自己的举盾姿势）→ 不补", h.id)
+            end
+            return
+        end
         if playNamed(pup, SHIELD.ENTRY) then h.entryAt, h.entryN = tn, h.entryN + 1 end
     end
 end
@@ -5135,6 +5211,7 @@ function SHIELD.onSub(p1, pup, sm, tn, age)
     local sc = SHIELD.SUB[sm]
     if not (sc and valid(pup)) then return end
     SHIELD.subN = SHIELD.subN + 1
+    SHIELD.subAt[SHIELD.key(pup)] = tn          -- §455 对方真的出了盾反 / 盾推 / 盾冲：这段时间替身身上的同名动作是真的
     local id = SHIELD.lastId[SHIELD.key(pup)] or 0
     montageByName(sm, true)
     pcall(G.facePlayer, pup)
@@ -5223,6 +5300,92 @@ function SHIELD.onContact(pup, tn)
     return true
 end
 
+-- §455 11.25 用户："通常防御情况下触发反击时判定会延迟的非常厉害……盾牌可以反击的瞬间多了一次伤害判定"。
+-- 11-25 收方日志 14:35：对方 14:35:04 举盾、按了 9.86 秒、14:35:14 松手才盾反（sub= 到了，-314）；可我这边 14:35:06 / 19 / 30 / 59
+-- 替身挡住我的木剑后自己就盾反了（判定 BD_ZhuoBiDun_CounterAttack_KnockBack -314 + 双重反击 _02 -42，前面没有任何"盾反同步"）。
+-- 举盾技能 GA_ZhuoBiDun 格挡后看影武键还按没按着（IsHolding / OnRelease），替身没按着 = 格挡完马上"松手反击"。
+-- 盾反由对方决定（他松手才有）：替身举盾期间，替身播着盾反动作、对方 GUARD_WIN 秒内没发过盾反 sub= → 这一帧我掉的血补回来。
+-- 判法只看替身动作 + 我掉血，不读载荷（便宜）；本地 AI（NET.rai）不管（AI 不发 sub=）。net/shield_guard_off.txt 关
+SHIELD.subAt, SHIELD.CTR_M, SHIELD.GUARD_WIN, SHIELD.GUARD_SEEN, SHIELD.GUARD_MIN = {}, { Hun_ZhuoBi_SpecialAttack_01_A_Montage = true }, 1.5, 1.2, 5.0
+SHIELD.gn, SHIELD.GUARD_OFF = 0, (NET_DIR or "net") .. "/shield_guard_off.txt"
+function SHIELD.guardOff()
+    if SHIELD.guardOffC ~= nil then return SHIELD.guardOffC end
+    local f = io.open(SHIELD.GUARD_OFF, "r")
+    SHIELD.guardOffC = f ~= nil
+    if f then f:close() end
+    return SHIELD.guardOffC
+end
+function SHIELD.guard(p1, pup, tn)
+    local hp = attrOf(p1, "Health")
+    local prev = SHIELD.ghp
+    SHIELD.ghp = hp
+    if NET.rai or not (next(SHIELD.hold) or (SHIELD.fakeAt and tn - SHIELD.fakeAt <= SHIELD.GUARD_SEEN)) then return end
+    if not valid(pup) or SHIELD.guardOff() then return end
+    local key = SHIELD.key(pup)
+    local sub = SHIELD.subAt[key]
+    local legit = sub and tn - sub <= SHIELD.GUARD_WIN
+    local okM, _, _, m = pcall(LAT.activeMontage, pup)
+    if okM and SHIELD.CTR_M[m] and not legit then
+        if not SHIELD.fakeAt or tn - SHIELD.fakeAt > SHIELD.GUARD_SEEN then
+            SHIELD.gn = SHIELD.gn + 1
+            if SHIELD.gn <= 30 then out("§455 替身自己盾反了（%s，对方没发盾反）：这一下的伤害不算", m) end
+        end
+        SHIELD.fakeAt = tn
+    end
+    if legit or not (SHIELD.fakeAt and tn - SHIELD.fakeAt <= SHIELD.GUARD_SEEN) then return end
+    if type(hp) ~= "number" or type(prev) ~= "number" or hp >= prev - SHIELD.GUARD_MIN then return end
+    if setAttr(p1, "Health", prev) then
+        SHIELD.ghp = prev
+        SHIELD.gn = SHIELD.gn + 1
+        if SHIELD.gn <= 30 then out("§455 替身自己的盾反打中我 -%.0f → 补回（对方最近一次盾反 %s）", prev - hp,
+            sub and string.format("%.1f 秒前", tn - sub) or "没有") end
+    end
+end
+
+-- §455 11.25 用户：悬浮盾在线第二下没伤害 = 第一下把人击飞、第二下打在倒地无敌上；"请把【悬浮盾】第一击恢复到原版的效果
+-- （第一段判定踉跄，第二段判定才会击飞对手）"。资产：BD_ZhuoBiDun_Slide_Small.HitStrength = Hitreact.Strength.Income.Launchback.Light
+-- （打怪有韧性兜着是踉跄，打玩家直接击飞：11-25 14:27:32 第一下我播 AM_Hun_Unarmed_LaunchStart_B → LaunchEnd → Getup），
+-- _Final = Launchback.Heavy。做法：交手中把 _Small 的受击强度临时改成 WANT（站着后退的踉跄档），离开交手改回原值（资产在内存里，
+-- 重启游戏也会恢复）。挨打方那台的资产决定挨打反应，所以两边都要是新版。改不上（这版 UE4SS 写不了结构体字段）日志会写；
+-- net/slide_stagger_off.txt 关
+SLIDE455 = { PATH = SHIELD.bd("BD_ZhuoBiDun_Slide_Small"), WANT = "Hitreact.Strength.Income.Normal.Knockback.Middle",
+             on = false, OFF = (NET_DIR or "net") .. "/slide_stagger_off.txt" }
+function SLIDE455.tagOf(bd)
+    local ok, s = pcall(function() return bd.HitStrength.TagName:ToString() end)
+    return ok and type(s) == "string" and s or nil
+end
+function SLIDE455.setTag(bd, name)
+    pcall(function() bd.HitStrength.TagName = FName(name) end)
+    if SLIDE455.tagOf(bd) == name then return true, "改字段" end
+    pcall(function() bd.HitStrength = { TagName = FName(name) } end)
+    if SLIDE455.tagOf(bd) == name then return true, "整个结构体" end
+    return false, "读回是 " .. tostring(SLIDE455.tagOf(bd))
+end
+function SLIDE455.sync(want)
+    want = want and true or false
+    if want == SLIDE455.on then return end
+    SLIDE455.on = want
+    if want then
+        local f = io.open(SLIDE455.OFF, "r")
+        if f then f:close(); return end
+        local bd = G.findOrLoad and G.findOrLoad(SLIDE455.PATH) or nil
+        if not valid(bd) then out("§455 悬浮盾第一下改踉跄：找不到 %s", SLIDE455.PATH); return end
+        local orig = SLIDE455.tagOf(bd)
+        if orig == nil then out("§455 悬浮盾第一下改踉跄：读不到受击强度"); return end
+        if orig == SLIDE455.WANT then return end
+        local ok, how = SLIDE455.setTag(bd, SLIDE455.WANT)
+        if ok then SLIDE455.bd, SLIDE455.orig = bd, orig end
+        out("§455 悬浮盾第一下（交手中）受击强度 %s → %s：%s（%s）", orig, SLIDE455.WANT, ok and "改上了" or "没改上", how)
+    else
+        local bd, orig = SLIDE455.bd, SLIDE455.orig
+        SLIDE455.bd, SLIDE455.orig = nil, nil
+        if orig and valid(bd) then
+            local ok, how = SLIDE455.setTag(bd, orig)
+            out("§455 悬浮盾第一下受击强度改回 %s：%s（%s）", orig, ok and "成功" or "失败", how)
+        end
+    end
+end
+
 -- 每帧（CHG.step 调）：举盾保持 + 盾反判定。都空的时候什么都不做
 function SHIELD.step(tn)
     if next(SHIELD.hold) then SHIELD.holdStep(tn) end
@@ -5290,6 +5453,47 @@ function CART.step(tn)
         end
     end
 end
+-- §460 马车一趟命中封顶（11-26 用户"马车差点秒杀对方，伤害不对"→"封顶吧"）：19:14:47–50 对方一趟车在我这边撞了 7 下
+-- （每下 -374，累计 -2621，满血 3086），19:24:58–19:25:00 我一趟车在对方那边撞了 5 下（-2632）。原版开阔地一次冲撞约 3 下；
+-- 多出来的是我被撞飞后车还在推（替身的车比对方晚收约 1 秒、又一路瞬移跟网络位置），每落地一次再撞一下。
+-- 挨打方这边：同一个远端招号的马车最多认 RAM 下冲撞 + TURN 下力荡（力荡 = §434 生成的力荡判定还在场时的那一下，
+-- 认了就把它收掉，免得打两次）；超出的把血补回去、这一下记 0。按招号记（中途换了判定窗口也接着数），30 秒没动的清掉
+CARTCAP = { RAM = 3, TURN = 1, KEEP = 30.0, s = {}, n = 0 }
+function CARTCAP.log(fmt, ...)
+    CARTCAP.n = CARTCAP.n + 1
+    if CARTCAP.n <= 40 then out(fmt, ...) end
+end
+function CARTCAP.state(id, tn)
+    for k, v in pairs(CARTCAP.s) do if tn - v.at > CARTCAP.KEEP then CARTCAP.s[k] = nil end end
+    local c = CARTCAP.s[id]
+    if not c then c = { ram = 0, turn = 0 }; CARTCAP.s[id] = c end
+    c.at = tn
+    return c
+end
+-- 返回 nil = 照常算；返回 0 = 超出封顶，血已补回
+function CARTCAP.fix(p1, id, name, step, hpBefore, tn)
+    if name ~= CART.GA or id == nil or not hpBefore or not step or step <= 0.5 then return nil end
+    local c = CARTCAP.state(id, tn)
+    if c.turn < CARTCAP.TURN then
+        for i, x in ipairs(CART.live) do
+            if x.id == id then
+                c.turn = c.turn + 1
+                local ok = G.destroyActor(x.e)
+                table.remove(CART.live, i)
+                CARTCAP.log("§460 马车：远端#%d 这一下 -%.0f 算力荡（第 %d 下），力荡判定收掉：%s", id, step, c.turn, ok and "成功" or "已经没了")
+                return nil
+            end
+        end
+    end
+    if c.ram < CARTCAP.RAM then c.ram = c.ram + 1; return nil end
+    if not setAttr(p1, "Health", hpBefore) then return nil end
+    c.over = (c.over or 0) + 1
+    CARTCAP.log("§460 马车：远端#%d 已撞 %d 下 + 力荡 %d 下，这一下 -%.0f 超出封顶 → 补回（这趟第 %d 次）", id, c.ram, c.turn, step, c.over)
+    return 0
+end
+-- 回合清场时清记录
+function CARTCAP.reset() CARTCAP.s = {} end
+
 -- 发送方：动作刚换成 AM_DriveHorseCart（只有马车里会播）
 function CART.mineSub(hm, prev) return hm ~= prev and hm == CART.MON end
 -- 收：对方 sub=AM_DriveHorseCart
@@ -5975,6 +6179,7 @@ function ULT.okFor(id, name)
 end
 
 function ULT.topUp(pup)
+    if TRAINCTX and TRAINCTX.ultCapped and TRAINCTX.ultCapped() then return end     -- §456 木桩精纯杀气定了个数：用完就没有
     local c = attrOf(pup, "UltimateChargeCount")
     if c == nil or c >= 1 then return end
     setAttr(pup, "UltimateChargeCount", 1)
@@ -6543,6 +6748,9 @@ function NET.recvOne(p1, tn, t)
         NET.rtrainReturn = NET.rdummy and t.trainReturn ~= "0"
         NET.rtrainHpRegen = NET.rdummy and t.trainHpRegen ~= "0"
         NET.rtrainChi = NET.rdummy and t.trainChi or nil
+        NET.rtrainGuard = NET.rdummy and t.trainGuard or nil                        -- §456 木桩自动格挡（预播格挡动作挑精防 / 普防）
+        NET.rtrainUlt = NET.rdummy and t.trainUlt or nil                            -- §456 木桩精纯杀气：inf / 3 / 2 / 1
+        NET.rtrainSp = NET.rdummy and t.trainSp or nil                              -- §456 木桩暗源：inf / 6 / 3 / 2 / 1
         NET.rtrainAiChi = NET.rai and t.trainAiChi == "1"
         NET.rtrainUnsupported = NET.rdummy and t.trainUnsupported or nil
     end
@@ -6632,6 +6840,7 @@ function NET.recvOne(p1, tn, t)
         NET.hrIn = hn2
     end
     NET.rwc = (t.wc and t.wc ~= "") and t.wc or nil                                     -- v0.17.0 对方手上的 WeaponConfig
+    if t.w and t.w ~= "" then NET.rwId = t.w end      -- §456.1 对方武器 ID：走 SetSlotWeapon 那条路时 ST.pupWeapon 不写，DEFANIM 靠它挑大类
     if NET.rwcPin then                                  -- §165.4 切刀斩刚换上的那把，1.5 秒内不让旧的 wc= 换回去
         if now() < NET.rwcPin.t then NET.rwc = NET.rwcPin.cfg else NET.rwcPin = nil end
     end
@@ -6780,6 +6989,10 @@ function NET.recvOne(p1, tn, t)
             setAttr(pup, "Shachi", 0)
         end
         if TRAINCTX then TRAINCTX.emptyBreak(pup) end
+        if TRAINCTX and TRAINCTX.packet then
+            local okP, errP = pcall(TRAINCTX.packet, pup, tn)                     -- §456 杀气损耗后不恢复 / 精纯杀气、暗源数量
+            if not okP and not TRAINCTX.packetErr then TRAINCTX.packetErr = true; out("!! §456 木桩资源出错：%s", tostring(errP)) end
+        end
         NET.trainChiEpoch = epoch
     elseif not PEER.on then NET.trainChiEpoch = nil end
     -- §223.6 观战替身：判定结果在 applyRemoteResult / LO.zmHeal 里自己不做；下面的房间设置照记（记进这个替身自己那份，
@@ -7379,7 +7592,9 @@ local HD = (function()
     if ok and FORNET and FORNET.adopt then mk = FORNET.adopt("fornet_hud", mk) end     -- F6：实例登记到宿主（FORNET.mods）
     if not ok then ok, mk = pcall(dofile, ROOT .. "/Scripts/fornet_hud.lua") end
     if not (ok and type(mk) == "function") then error("fornet_hud.lua 加载失败：" .. tostring(mk)) end
-    return mk({ out = out, valid = valid, try = try, rawProp = rawProp, getP1PC = getP1PC, gstat = gstat, LANG = LANG, HUD_SIZE = HUD_SIZE,
+    -- 11-26：fornet_hud 只拿 gstat 问 IsGamePaused（游戏菜单开着就藏屏幕文字 / 准备对局中取消暂停）→ 换成"游戏菜单真开着"，UUU 相机 mod 的暂停不算
+    local menuStat = { IsGamePaused = function() return G.menuOpen() == true end }
+    return mk({ out = out, valid = valid, try = try, rawProp = rawProp, getP1PC = getP1PC, gstat = function() return menuStat end, LANG = LANG, HUD_SIZE = HUD_SIZE,
                 MATCH = MATCH, setText = setText, ST = ST })
   end)()     -- 缩进：这段在 M4 闭包里，test_forget_world 用第 0 列的 end)() 找闭包结尾
 local COL_LABEL, COL_WHITE, COL_GRAY, COL_GREEN, COL_RED, COL_ORANGE = HD.COL_LABEL, HD.COL_WHITE, HD.COL_GRAY, HD.COL_GREEN, HD.COL_RED, HD.COL_ORANGE
@@ -7982,7 +8197,7 @@ function MATCH.uiSync(why, want)
         out("§260 准备 / 对局中不能开界面（%s）：%s", why or "-", tostring(desc))
         -- 兜底：开始屏蔽时游戏已经暂停（开局前菜单就开着）= 不会再触发暂停翻转，这里补一次取消暂停
         if list and #list > 0 then
-            local okP, paused = pcall(function() return gstat():IsGamePaused(getP1PC()) end)
+            local okP, paused = pcall(function() return G.menuOpen() end)     -- 11-26 游戏菜单真开着（UUU 相机 mod 的暂停不算）
             if okP and paused == true then MATCH.uiPaused() end
         end
     else
@@ -8165,7 +8380,7 @@ local function enter(p1, s, tn, why)
         -- v0.26.0 强制归位只对 AI 对手（用户："主要是为了给 AI 在开战前保持一定距离，真人对战不需要"）：
         -- AI 只会跟着你走，不归位就贴着脸开打；真人自己会拉开距离，各自留在原地
         -- §238 用户 11-11："倒计时开始时各自归位"：有检查过的开战点（MATCH.sp）时真人对战也归位
-        if (NET.rai or MATCH.sp) and not (NET.rdummy and NET.rtrainReturn == false) then
+        if (NET.rai or MATCH.sp) and not (NET.rdummy and not TRAINCTX.returns(MATCH.round)) then     -- §456 木桩只在第 1 回合归位
             -- v0.26.2 安全放置（§79）：起点 = 开局时主机站的点（主机自己的出生点就是它，不用缩）
             local a = MATCH.arena
             local anchor = (MATCH.role ~= "host" and a) and { X = a.x, Y = a.y, Z = a.z + 20.0 } or nil
@@ -8192,7 +8407,7 @@ local function enter(p1, s, tn, why)
         NET.rulesBegin(p1, "cd", "第 " .. MATCH.round .. " 回合倒计时", MATCH.round == 1, tn)
         out("== 第 %d 回合 倒计时 %.0f 秒（我 %d : %d 对方）；我是%s，%s ==",
             MATCH.round, CD_SEC, MATCH.me, MATCH.op, MATCH.role == "host" and "主机" or "客机",
-            (NET.rai or MATCH.sp) and not (NET.rdummy and NET.rtrainReturn == false) and string.format("%s，归位到出生点 (%.0f, %.0f) 朝向 %.0f%s", NET.rai and "对手是 AI" or "真人对战",
+            (NET.rai or MATCH.sp) and not (NET.rdummy and not TRAINCTX.returns(MATCH.round)) and string.format("%s，归位到出生点 (%.0f, %.0f) 朝向 %.0f%s", NET.rai and "对手是 AI" or "真人对战",
                 pos.X, pos.Y, yaw, MATCH.sp and string.format("（开战点，两人相距 %.0f 米）", MATCH.sp.d * 2 / 100.0) or "")
                 or "本回合不强制归位")
         if MATCH.state ~= "idle" then return end
@@ -9314,13 +9529,12 @@ do
         if v and UIM.NAMES[v] then UIM.mode = v end
     end
 end
--- 游戏 HUD 按现在的档位摆（1 档藏，暂停时还回去；其余档位显示）
+-- 11-26 游戏菜单真开着（G.menuOpen：UUU 相机 mod 的暂停不算，以前把藏着的 HUD 放回来，客户反馈）
+function UIM.menuOpen() local ok, v = pcall(function() return G.menuOpen() end); return ok and v == true end
+-- 游戏 HUD 按现在的档位摆（1 档藏，打开游戏菜单时还回去；其余档位显示）
 function UIM.applyGame()
     local paused = false
-    if UIM.mode == 1 then
-        local okP, p = pcall(function() return gstat():IsGamePaused(getP1PC()) end)
-        paused = okP and p == true
-    end
+    if UIM.mode == 1 then paused = UIM.menuOpen() end
     local hide = UIM.mode == 1 and not paused
     if not hide and not UIM.gameHidden then return end
     local okC, ok = pcall(function() return G.hudShow(not hide) end)
@@ -9455,20 +9669,78 @@ AIL.OUTFITS = {
     { "Hun_OutFit_FengXue", "风雪", "SNOWSTORM" }, { "Hun_OutFit_ZhuiMing", "追命", "ZHUIMING" },
     { "Hun_OutFit_GuYou", "故友", "OLD FRIEND" }, { "Hun_OutFit_JiGuanMoQu", "机械魔躯", "MECHANICAL BODY" },
 }
--- 饰品：{ 技能（精炼满级那一档）, 中文, 英文 }。只列挂技能的（AI 发 pas=，替身身上挂上这些被动）；纯加属性的饰品替身用不上
--- （替身的攻击属性照抄你的 att=）。防御类按替身在你游戏里实际掉的血生效（§115 td=：AI 按你本机打出的真实伤害扣血）；
--- 喝药类、慈母护符（§60 曾让人死不掉）不列：AI 的喝药是联机程序模拟的
+-- 饰品：{ 值, 中文, 英文 }。11-26 AI 木桩 V2（用户"可携带饰品补全"）：正式能拿到的 66 件全列（名字同 ACC.NAME / catalog）。
+-- 值：挂技能的（29 件）= 精炼满级那一档的技能类名（以前那 20 件的值没变，旧的 netcfg aiacc= 照认）；
+-- 纯加属性的（37 件）= 满级那一档的效果短名 GE_Accessory_<名>_LvN，替身同步时按效果挂上（LO.syncPas）。
+-- 注意：替身的攻击侧属性每 2 秒按 att= 重写（AI 照抄你的），所以加攻击那部分会被盖掉；防御 / 抗性 / 血量等照常生效。
+-- 喝药类（香薰药盒等）AI 的喝药是联机程序模拟的，挂上了也触发不了；慈母护符（§60 曾让真人替身死不掉）AI 血量由联机程序管
 AIL.ACCS = {
-    { "BP_GA_Accessory_Bleed_Lv2_C", "雪与血", "SNOW & BLOOD" }, { "BP_GA_Accessory_Combo_Passive_Lv3_C", "碧血云天", "COMBO" },
-    { "BP_GA_Accessory_Electrified_Passive_C", "月雷华灯", "ELECTRIFY" }, { "BP_GA_Accessory_EvadePhantom_Passive_Lv2_C", "影魅面具", "PHANTOM MASK" },
-    { "BP_GA_Accessory_Ignite_Passive_C", "瑞狮火球", "IGNITE" }, { "BP_GA_Accessory_MartialWeapon_FreeShachi_Passive_Lv3_C", "粗糙煌心", "MARTIAL HEART" },
-    { "BP_GA_Accessory_RangedWeapon_Passive_C", "无相神镜", "RANGED MIRROR" }, { "GA_Accessory_ActHit_Lv2_C", "影动猎杀仪", "ACT HIT" },
-    { "GA_Accessory_AnimMovement_Lv2_C", "舞扇", "DANCING FAN" }, { "GA_Accessory_BigHit_Lv2_C", "绝望护符", "BIG HIT" },
-    { "GA_Accessory_BreakAttack_Lv2_C", "追杀令", "BREAK ATTACK" }, { "GA_Accessory_Chaos_Lv3_C", "混沌狂戒", "CHAOS RING" },
-    { "GA_Accessory_Counter_Lv2_C", "反击护腕", "COUNTER BRACER" }, { "GA_Accessory_Poison_Lv2_C", "猛毒袋", "POISON POUCH" },
-    { "GA_Accessory_Ranged_Lv2_C", "神射之眼", "MARKSMAN'S EYE" }, { "GA_Accessory_ShachiWeapon_Lv3_C", "暗源方块", "SHADOW CUBE" },
-    { "GA_Accessory_UltimateBreak_Lv2_C", "绝技护符", "ULTIMATE CHARM" }, { "GA_Accessory_TimerEndure_Lv2_C", "百战魔躯", "WAR-HARDENED" },
-    { "GA_Accessory_SwitchEndure_Passive_C", "神奇刀鞘", "MAGIC SCABBARD" }, { "GA_Accessory_ResistRanged_Lv2_C", "避箭护符", "ARROWWARD CHARM" },
+    { "GA_Accessory_ActHit_Lv2_C", "影动猎杀仪", "HUNTER'S INSIGHT" },
+    { "GA_Accessory_AnimMovement_Lv2_C", "舞扇", "DANCE FAN" },
+    { "GE_Accessory_Attack_Lv2", "筋力绑带", "BATTLE WRAPS" },
+    { "GA_Accessory_BigHit_Lv2_C", "绝望护符", "TALISMAN OF DESPAIR" },
+    { "BP_GA_Accessory_Bleed_Lv2_C", "雪与血", "SNOW AND BLOOD" },
+    { "GA_Accessory_BreakAttack_Lv2_C", "追杀令", "TOKEN OF PURSUIT" },
+    { "GA_Accessory_BreakDrink_Lv2_C", "静心小葫芦", "CALMING GOURD" },
+    { "GE_Accessory_BreakRecover_Lv2", "沉香念珠", "AGARWOOD PRAYER BEADS" },
+    { "GA_Accessory_BreakRegen_Lv2_C", "慈母护符", "MOTHER'S TALISMAN" },
+    { "GE_Accessory_BreakShield_Lv2", "破盾符", "SHIELDBREAKER TALISMAN" },
+    { "GA_Accessory_Chaos_Lv3_C", "混沌狂戒", "CHAOS RING" },
+    { "BP_GA_Accessory_Combo_Passive_Lv3_C", "碧血云天", "CRIMSON RESOLVE" },
+    { "GE_Accessory_Control_Lv2", "细线球", "FINE THREAD" },
+    { "GA_Accessory_Counter_Lv2_C", "反击护腕", "COUNTERSTRIKE BRACERS" },
+    { "GE_Accessory_Deflect_Lv2", "神机指环", "SHENJI'S RING" },
+    { "GE_Accessory_Double_Lv2", "妙手连环", "QUICK HAND PAIR" },
+    { "GA_Accessory_Drink_Lv2_C", "香薰药盒", "MEDICINE CASE" },
+    { "GA_Accessory_DrinkCost_Lv2_C", "深宅药罐", "MANOR MEDICINE POT" },
+    { "BP_GA_Accessory_Electrified_Passive_C", "月雷华灯", "THUNDERMOON LANTERN" },
+    { "GA_Accessory_ElementRegen_Lv3_C", "灭法拂尘丝", "ACOLYTE WHISK" },
+    { "GE_Accessory_Elemental_Lv2", "羽扇残羽", "FEATHER FAN PLUME" },
+    { "BP_GA_Accessory_EvadePhantom_Passive_Lv2_C", "影魅面具", "WRAITH MASK" },
+    { "GA_Accessory_Execution_Lv2_C", "万杀巧锁", "DEATHLOCK" },
+    { "GA_Accessory_ExecutionSwitchCool_Lv2_C", "刽子手头巾", "EXECUTIONER'S HEADSCARF" },
+    { "GE_Accessory_Frost_Lv2", "灭法冰棱", "ACOLYTE ICICLE" },
+    { "GE_Accessory_Health_Lv2", "珍玩妖织", "JEWEL'S KNOT" },
+    { "GE_Accessory_HealthResistance_Lv3", "古甲残片", "ANCIENT ARMOR FRAGMENT" },
+    { "GE_Accessory_HeavyAttackCost_Lv2", "正气凌然", "LINGRAN'S PENDANT" },
+    { "GE_Accessory_HeavyAttackDamage_Lv2", "残破容器", "BROKEN VESSEL" },
+    { "GE_Accessory_HeavyAttackShachi_Lv2", "独孤绝印", "SEAL OF DUGU" },
+    { "BP_GA_Accessory_Ignite_Passive_C", "瑞狮火球", "AUSPICIOUS LION FIREBALL" },
+    { "GE_Accessory_Long_Lv2", "妙手千钧", "QUICK HAND MIGHT" },
+    { "GE_Accessory_Loot_Lv2", "聚宝盆", "TREASURE BASIN" },
+    { "GE_Accessory_LowHealth_Lv2", "绝地求生令", "DESPERATE STAND" },
+    { "GE_Accessory_LowShachi_Lv2", "同心双鱼佩", "TWIN FISH PENDANT" },
+    { "GE_Accessory_MagicWeapon_Lv3", "百相傩面", "NUO MASK" },
+    { "BP_GA_Accessory_MartialWeapon_FreeShachi_Passive_Lv3_C", "粗糙煌心", "CRUDE RADIANT HEART" },
+    { "GE_Accessory_PerfectFrame_Lv3", "浑源经脉仪", "REFLEX DEVICE" },
+    { "GA_Accessory_Poison_Lv2_C", "猛毒袋", "VENOM POUCH" },
+    { "GE_Accessory_PoisonRegen_Lv2", "活木符", "LIVINGWOOD TALISMAN" },
+    { "GE_Accessory_PowerWeapon_Lv3", "力士神像", "GUARDIAN IDOL" },
+    { "GA_Accessory_RandomDrink_Lv3_C", "开光玉佩", "BLESSED JADE PENDANT" },
+    { "GA_Accessory_Ranged_Lv2_C", "神射之眼", "SHARPSHOOTER'S EYE" },
+    { "BP_GA_Accessory_RangedWeapon_Passive_C", "无相神镜", "FORMLESS DIVINE MIRROR" },
+    { "GE_Accessory_ResistBleed_Lv2", "凝血符", "CONGEAL TALISMAN" },
+    { "GE_Accessory_ResistFire_Lv2", "辟火符", "FLAMEWARD" },
+    { "GE_Accessory_ResistIce_Lv2", "防冰符", "FROSTWARD" },
+    { "GE_Accessory_ResistNonBreak_Lv2", "坚岩护腕", "BOULDERGUARD" },
+    { "GE_Accessory_ResistPoison_Lv2", "食物防腐罐", "PRESERVATION JAR" },
+    { "GA_Accessory_ResistRanged_Lv2_C", "避箭护符", "ARROWWARD" },
+    { "GE_Accessory_ResistThunder_Lv2", "避雷符", "THUNDERWARD" },
+    { "GA_Accessory_Rider_Lv2_C", "斩骑符", "CAVALRYBANE" },
+    { "GE_Accessory_Shachi_Lv2", "弦音护符", "RESONANCE TALISMAN" },
+    { "GE_Accessory_ShachiAttack_Lv2", "白山密令", "BAISHAN WRIT" },
+    { "GE_Accessory_ShachiCool_Lv2", "胭脂盒", "ROUGE BOX" },
+    { "GE_Accessory_ShachiRegen_Lv2", "杀气头巾", "SHA-CHI HEADSCARF" },
+    { "GA_Accessory_ShachiWeapon_Lv3_C", "暗源方块", "REMNANT SPARK CUBE" },
+    { "GE_Accessory_SpiritShadow_Lv3", "暗源小笼", "REMNANT SPARK CAGE" },
+    { "GE_Accessory_Stance_Lv3", "机簧护心镜", "BRASS CHEST GUARD" },
+    { "GE_Accessory_Stealth_Lv2", "屏息绑带", "SILENT WRAP" },
+    { "GE_Accessory_SummonDuration_Lv2", "人偶木心", "A PUPPET'S WOODEN HEART" },
+    { "GA_Accessory_SwitchEndure_Passive_C", "神奇刀鞘", "MIRACULOUS SCABBARD" },
+    { "GE_Accessory_Tang_Lv2", "妙手在握", "QUICK HAND PENDANT" },
+    { "GA_Accessory_TimerEndure_Lv2_C", "百战魔躯", "BATTLEFORGED" },
+    { "GA_Accessory_UltimateBreak_Lv2_C", "绝技护符", "ULTIMATE TALISMAN" },
+    { "GE_Accessory_UltimateCharge_Lv3", "无名大师的扳指", "NAMELESS THUMB RING" },
 }
 AIL.ACC_SLOTS, AIL.MAX_MED = 4, 10
 
@@ -9556,7 +9828,7 @@ function NETUI.aiLoadItems(lb, items, toPage)
     end
     items[#items + 1] = { label = T("（改了下招生效；血低于四成喝；房间关了血瓶就不喝）",
                                     "(APPLIES MID-FIGHT; DRINKS UNDER 40% HP; NOT WHEN POTIONS ARE OFF)") }
-    items[#items + 1] = { label = T("返回", "BACK"), act = toPage("main") }
+    items[#items + 1] = { label = T("返回", "BACK"), act = toPage("training") }     -- 11-26 V2：AI 装备从"AI 训练设置"进
 end
 
 function NETUI.aiPickItems(lb, items, toPage)
@@ -10025,13 +10297,12 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
     end
     -- §75 本地 AI 对战：联机程序在本机跑一个 AI 对手当客机（lobby/LocalAi.cs），面板只有开始 / 结束和难度（0 简单 / 1 普通 / 2 困难）
     local aiLv = tonumber(lb.ailevel) or 1
-    local aiLevel = { label = T("AI 难度：", "AI LEVEL: ") .. (({ [0] = T("简单", "EASY"), T("普通", "NORMAL"), T("困难", "HARD"), T("测伤木桩", "TRAINING DUMMY") })[aiLv] or "?"),
-                      act = function() netuiCmd("ailevel", "level=" .. ((aiLv + 1) % 4) .. "\n") end }     -- §342 第 4 档木桩（LocalAi.Levels 下标 3）
     local dstatBtn = { label = T("招式伤害统计…", "DAMAGE PER MOVE..."), act = page("dstat") }      -- §342
-    -- §354 AI 跟随你（存在 AI 装备里：netcfg aifol=，命令 aiload fol=）。关 = AI 原地不动、离多远都不瞬移到你面前（测距离 / 拉开打远程）
-    local aiFol = lb.aifol ~= "0"
-    local aiFollow = { label = T("AI 跟随你：", "AI FOLLOWS YOU: ") .. (aiFol and T("开", "ON") or T("关（原地不动、不瞬移）", "OFF (STAYS PUT)")),
-                       act = function() netuiCmd("aiload", "fol=" .. (aiFol and "0" or "1") .. "\n") end }
+    -- 11-26 AI 木桩 V2：AI 难度（改叫"AI 行为状态"）/ §354 跟随 / §114 装备 / 特殊资源 都挪进"AI 训练设置"（原"木桩训练设置"，base_training_ui.lua），
+    -- 首页只留一个入口，括号里写当前的行为状态
+    local trainBtn = { label = T("AI训练设置…（", "AI TRAINING SETTINGS... (")
+                           .. (({ [0] = T("1级难度", "LEVEL 1"), T("2级难度", "LEVEL 2"), T("3级难度", "LEVEL 3"), T("测试木桩", "TRAINING DUMMY") })[aiLv] or "?")
+                           .. T("）", ")"), act = page("training") }
     -- §85 AI 对战时同时开房等真人（开关）+ 开房方式（开关开着才显示；按一下换下一种，跳过 ai）；
     -- 有人进来联机程序就停掉 AI、改成和他联机（lobby.txt 的 mode 跟着变成房间的方式）
     local roomOn, roomMode = lb.airoom == "1", lb.airoommode or "lan"
@@ -10063,15 +10334,9 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
         items[#items + 1] = { label = T("连接方式：", "VIA: ") .. "< " .. netModeName(mode) .. " >", mode = true,
                               act = function() NETUI.step(1) end }
         items[#items + 1] = { label = T("开始 AI 对战", "START AI BATTLE"), act = function() netuiCmd("host") end }
-        items[#items + 1] = aiLevel
-        items[#items + 1] = aiFollow     -- §354
-        items[#items + 1] = { label = T("AI 装备…", "AI LOADOUT..."), act = page("aiload") }     -- §114
+        items[#items + 1] = trainBtn
         items[#items + 1] = dstatBtn
         aiRoomItems()
-        if aiLv == 3 then
-            items[#items + 1] = { label = T("木桩训练设置…", "DUMMY TRAINING..."), act = page("training") }
-        end
-        items[#items + 1] = { label = T("AI 特殊资源设定…", "AI RESOURCE OVERRIDES..."), act = page("training:resources") }
         if aiLv == 3 then
             -- 两条都控制在半角 56 格以内：一条写太长会把整个文字面板撑出屏幕（§398）
             items[#items + 1] = { label = T("（木桩：出招、防御与资源可在训练设置中调整）",
@@ -10080,21 +10345,15 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
                                             "(NO ACCESSORIES; DAMAGE COUNTS THE WHOLE MOVE)") }
         end
         items[#items + 1] = { label = roomOn and T("（有人进来就结束 AI 对战、改成和他打）", "(A PLAYER WHO JOINS REPLACES THE AI)")
-                                         or T("（AI 照抄你的属性，武器在「AI 装备」里选；F1 开打）", "(COPIES YOUR STATS; GEAR IN AI LOADOUT; F1 TO FIGHT)") }
+                                         or T("（AI 照抄你的属性，装备在「AI训练设置」里选；F1 开打）", "(COPIES YOUR STATS; GEAR IN AI TRAINING; F1 TO FIGHT)") }
         settingsBtns()
         return items
     end
     if lb.mode == "ai" and (lb.role or "none") ~= "none" then
         items[#items + 1] = { label = T("结束 AI 对战", "END AI BATTLE"), act = function() netuiCmd("stop") end }
-        items[#items + 1] = aiLevel
-        items[#items + 1] = aiFollow     -- §354
-        items[#items + 1] = { label = T("AI 装备…", "AI LOADOUT..."), act = page("aiload") }     -- §114
+        items[#items + 1] = trainBtn
         items[#items + 1] = dstatBtn
         aiRoomItems()
-        if aiLv == 3 then
-            items[#items + 1] = { label = T("木桩训练设置…", "DUMMY TRAINING..."), act = page("training") }
-        end
-        items[#items + 1] = { label = T("AI 特殊资源设定…", "AI RESOURCE OVERRIDES..."), act = page("training:resources") }
         if lb.aiwait == "1" then
             items[#items + 1] = { label = NETUI.viaServer(roomMode) and T("复制房间号（发给朋友）", "COPY MY ROOM CODE") or T("复制房间地址（发给朋友）", "COPY MY ADDRESS"),
                                   act = function() netuiCmd("copy"); netuiFlash(T("已复制到剪贴板", "COPIED TO THE CLIPBOARD")) end }
@@ -10298,10 +10557,10 @@ local function netuiDefaultItems(lb, tn, items, page, mode, settingsBtns)
 end
 UI.defaultItems = netuiDefaultItems
 -- F3b-5：影之刃零的面板页按名字注册回核心（内容还在上面各段里）；排位四页在排位扩展包 ext/ranked/client.lua 里注册（F4b；11-13 搬进扩展包）
-UI.page("training", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.items(lb, items, page) end, { "联机 · 木桩训练", "ONLINE · DUMMY TRAINING" })
+UI.page("training", function(lb, tn, items, page) if lb.mode ~= "ai" then return false end; TRAINUI.items(lb, items, page) end, { "联机 · AI 训练设置", "ONLINE · AI TRAINING" })     -- 11-26 V2：所有难度都能进
 UI.page("training:actions", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.actions(lb, items, page) end, { "木桩 · 重复出招", "DUMMY · REPEATED MOVES" })
-UI.page("training:defense", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.defense(lb, items, page) end, { "木桩 · 防御闪避", "DUMMY · GUARD AND DODGE" })
-UI.page("training:health", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.health(lb, items, page) end, { "木桩 · 血量杀气", "DUMMY · HEALTH AND CHI" })
+-- §456 防御闪避 / 血量杀气两页并进"木桩训练"那一页；重复间隔单独一页（拖动条）
+UI.page("training:interval", function(lb, tn, items, page) if lb.mode ~= "ai" or tonumber(lb.ailevel) ~= 3 then return false end; TRAINUI.interval(lb, items, page) end, { "木桩 · 重复间隔", "DUMMY · REPEAT INTERVAL" })
 UI.page("training:resources", function(lb, tn, items, page)
     if lb.mode ~= "ai" or (BASEHOOK.mp and BASEHOOK.mp.inMp and BASEHOOK.mp.inMp()) then return false end
     if TRAINING then TRAINING.items(lb, items, page, netuiFlash) end
@@ -10313,11 +10572,9 @@ UI.page("accban", function(lb, tn, items, page) NETUI.accBanItems(lb, items, pag
 for k in pairs(WBAN.LIST) do UI.page(k, function(lb, tn, items, page) NETUI.wbanItems(k, lb, items, page) end) end     -- §180 禁用武器 / 影之武装
 UI.page("phrases", function(lb, tn, items, page) if not CHAT.phraseItems(lb, items, page) then return false end end, { "联机 · 快捷语", "ONLINE · QUICK PHRASES" })     -- §150 快捷短语
 UI.page("thanks", function(lb, tn, items, page)     -- v0.27.21 感谢名单（设置里的一页）：参与测试并反馈了 bug 的玩家
-        items[#items + 1] = { label = T("特别感谢：", "SPECIAL THANKS:") }     -- 11-15 用户：伊格尼斯单独列出，感谢一直以来对数值平衡的贡献
-        items[#items + 1] = { label = "  " .. T("伊格尼斯 —— 一直以来对数值平衡做出的贡献", "伊格尼斯 - for the ongoing contributions to damage balance") }
-        items[#items + 1] = { label = "  " .. T("Decision of Fate 与其小伙伴 —— 技术与测试支持", "Decision of Fate and friends - for technical and testing support") }     -- 11-23 用户加
-        items[#items + 1] = { label = T("参与测试并反馈了 bug 的玩家（B 站）：", "PLAYERS WHO TESTED AND REPORTED BUGS (BILIBILI):") }
-        for _, n in ipairs({ "成步堂芦苇", "谦逊的刘恒宇", "亦如黎明中的花朵_", "絡訸", "化境", "一一清梦以及他的小伙伴们", "、（你没看错）" }) do items[#items + 1] = { label = "  " .. n } end
+        items[#items + 1] = { label = T("参与测试并反馈了 bug 的玩家（B 站/QQ，以首字拼音排序）：", "PLAYERS WHO TESTED AND REPORTED BUGS (BILIBILI/QQ, BY PINYIN):") }     -- 11-27 用户：一个列表、按首字拼音排序（同音看第二个字，"、"没拼音放最后）
+        for _, n in ipairs({ "成步堂芦苇", T("Decision of Fate 与其小伙伴", "Decision of Fate and friends"), "肥格fager、苏苏、风魔唯以及其工作室的小伙伴们", "化境", "絡訸", "谦逊的刘恒宇",
+                             T("伊格尼斯：一直以来对数值平衡做出的贡献", "伊格尼斯 - for the ongoing contributions to damage balance"), "一一清梦以及他的小伙伴们", "亦如黎明中的花朵_", "、（你没看错）" }) do items[#items + 1] = { label = "  " .. n } end
         items[#items + 1] = { label = T("返回", "BACK"), act = page("settings") }
 end, { "联机 · 感谢名单", "ONLINE · THANKS" })
 -- ---- L3（docs/FORNET_LAYERS.md）：基础联机包给其他玩法 mod 的面板接口（服务 ui）+ "已装的玩法"页。全局：主块 local 满 200 个
@@ -10663,7 +10920,7 @@ end
 -- 输入框在下一轮 CHAT.step 才开：刚打开的鼠标面板这一轮才建好，建的时候会关掉已经开着的输入框（guiRoot）
 function CHAT.open(fromPanel)
     if NETUI.edit then return end            -- 在输入框里按 Delete 是删字
-    local okP, paused = pcall(function() return gstat():IsGamePaused(getP1PC()) end)
+    local okP, paused = pcall(function() return G.menuOpen() end)     -- 11-26 游戏菜单真开着（UUU 相机 mod 的暂停不算）
     if okP and paused == true then return end
     if not CHAT.can(netuiRead(now())) then
         CHAT.add(nil, T("没连上对方，不能发快捷语", "NOT CONNECTED, NO QUICK PHRASES"), "sys")
@@ -10760,10 +11017,36 @@ GUI.mouseTick = function()      -- 表字段不占 local（M4 里 local 也快�
     end
 end
 
+-- §456 鼠标面板的拖动条（用户 11-26"点击切换太麻烦，改成鼠标拖动条"）：面板项带 slider = { drag = fn(比例), commit = fn(比例) }。
+-- 按住那一行左右拖：整行宽度 = 最小值 … 最大值，拖的时候 drag 改显示，松手 commit。
+-- 鼠标位置用 WidgetLayoutLibrary:GetMousePositionOnViewport（Slate 单位，PBZ_MC 实测鼠标坐标能读到；按钮的
+-- GetCachedGeometry 读出来全是 0、不能用）；面板水平居中、宽 GUI.sizeW → 行的左右边按视口宽算。读不到就返回 nil（只剩 ± 按钮）
+SLIDER = { off = false }
+function SLIDER.frac()
+    if SLIDER.off then return nil end
+    local ok, r = pcall(function()
+        local wll = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary")
+        if not valid(wll) then error("找不到 WidgetLayoutLibrary") end
+        local pc = getP1PC()
+        local m = wll:GetMousePositionOnViewport(pc)
+        local size, scale = wll:GetViewportSize(pc), wll:GetViewportScale(pc)
+        if not (m and size and type(scale) == "number" and scale > 0) then error("读不到视口") end
+        local vw, w = size.X / scale, GUI.sizeW or UI.GUI_W or 640
+        local left = (vw - w) / 2
+        if not SLIDER.logged then
+            SLIDER.logged = true
+            out("§456 拖动条：鼠标 %.0f，视口宽 %.0f（缩放 %.2f），面板 %.0f–%.0f", m.X, vw, scale, left, left + w)
+        end
+        return math.max(0, math.min(1, (m.X - left) / w))
+    end)
+    if not ok then SLIDER.off = true; out("!! §456 拖动条读不到鼠标位置（%s），只能用加减按钮", tostring(r)); return nil end
+    return r
+end
+
 -- 每 33ms 一次：按 NETUI.view 摆内容、查点击。点了东西就执行并结束这一轮（内容下一轮按新状态重摆）
 local function guiTick(v)
     if UI.guiTickBegin then UI.guiTickBegin() end     -- 11-14 快速点击：这一拍有没有左键钩子记到的按下
-    local okP, paused = pcall(function() return gstat():IsGamePaused(getP1PC()) end)
+    local okP, paused = pcall(function() return G.menuOpen() end)     -- 11-26 游戏菜单真开着（UUU 相机 mod 的暂停不算）
     local vis = (okP and paused == true) and 1 or 4     -- 游戏菜单打开时藏起来（同屏幕文字）
     if GUI.shownVis ~= vis then
         -- v0.26.4 游戏暂停（菜单 / 切出窗口）回来时游戏会把输入模式改回去：重新放鼠标
@@ -10937,6 +11220,15 @@ local function guiTick(v)
                 local clicked = guiClicked(r)
                 if r.entered then NETUI.sel = i; NETUI.selTarget = nil end    -- 鼠标移上去 = 选中（键盘接着从这里走）
                 guiBg(r, (r.down and BG_DOWN) or (i == NETUI.sel and BG_SEL) or (r.hov and BG_HOVER) or BG_ROW)
+                if it.slider then                                              -- §456 拖动条：按住拖改显示、松手生效
+                    local f = (r.down or clicked) and SLIDER.frac() or nil
+                    if f and r.down and it.slider.drag then it.slider.drag(f) end
+                    if clicked then
+                        NETUI.sel = i
+                        if f and it.slider.commit then out("联机面板：拖动条「%s」松手（%.2f）", it.label, f); it.slider.commit(f) end
+                        return
+                    end
+                end
                 if clicked then
                     out("联机面板：点击「%s」", it.label)
                     NETUI.sel = i
@@ -12666,7 +12958,7 @@ function OPPBAR.step(tn)
         if dirty or not L.hp or math.abs(p - L.hp) > 0.0005 then v.hp = p end
     end
     -- v0.25.0 只显示血：杀气条藏起来（档位变了或血条被拉回时重做）；对方本来也不发杀气了
-    local shOn = mode >= 2
+    local shOn = mode >= 2 or NET.rdummy == true      -- §456 木桩一律显示杀气条（用户 11-26"AI 木桩的杀气完全看不见"）
     if shOn ~= L.shOn or (dirty and not shOn) then
         if G.bossBarShachiShow(bar, shOn) then
             if shOn ~= L.shOn and L.shOn ~= nil or not shOn and L.shOn == nil then out("对手血条：杀气条%s", shOn and "显示" or "藏起（房间设置只显示血）") end
@@ -13328,11 +13620,13 @@ bind(Key.INS, function() UIM.next("Insert") end, "界面三态")       -- §314 
 -- §342 招式伤害统计（base_dstat.lua；面板页 "dstat"，在本地 AI 那两页里进）
 -- §352 本地 AI 按真人那套：我还在放的招（act=）、替身挨打 / 被控（pst=）（base_aisync.lua）
 AISYNC = BASEPARTS.load("aisync", { out = function(...) return out(...) end, NET = NET, ST = ST, G = G, isAttackAbility = isAttackAbility,
+    dummyStay = function() return TRAINCTX ~= nil and TRAINCTX.stay() end,     -- §456 木桩什么时候报 trainPos=
     attrOf = function(...) return attrOf(...) end })      -- §353 psq=：替身本机杀气
 DSTAT = BASEPARTS.load("dstat", { out = function(...) return out(...) end, NET = NET, G = G,
     touchTotal = function(id) return (TOUCH.dmg and TOUCH.dmg[id]) or (TOUCH.lingerDmg and TOUCH.lingerDmg[id]) end })     -- §342.4 T / 颜色模块里经 EXTCTX 现取（这里的 T / COL_* 是 nil）
 TRAINUI = BASEPARTS.load("training_ui", {
     command = function(...) local X = EXTCTX; if X and X.netuiCmd then return X.netuiCmd(...) end end,
+    training = function() return TRAINING end, now = function() return now() end,     -- §456 木桩页的无限 HP；拖动条计时
     status = function() return NET.rtrainUnsupported end })
 TRAINCTX = {}
 function TRAINCTX.roomScope()
@@ -13365,7 +13659,80 @@ function TRAINCTX.emptyBreak(pup)
     local ok = RECM.activateOnPuppet(pup, "GA_Hun_BreakEscape_C", NET.sub, "木桩空杀气破防")
     if not ok then out("木桩空杀气：本轮破防技能未激活，不重复强制播放") end
 end
+-- ============================================================ §456 木桩（用户 11-26 新功能单）
+-- 木桩的杀气以替身为准（psq=，§353）。替身在你游戏里并没有真的举架势挡下（替身没有输入，架势技能撑不住），
+-- 普防是联机程序判的 → 游戏不扣替身杀气，杀气条一直满、格挡也永远不会被打破（"杀气完全看不见"）。
+-- 普防结果回来时，最近 BLOCK_SEEN 秒里替身杀气没掉过（游戏自己没扣）就由模组扣 BLOCK_CHI（同联机程序 §353 之前的模型）；
+-- 扣到 0 播破防（同"清空（破防）"那条路）。杀气锁满（无限杀气）时不扣
+TRAINCTX.BLOCK_CHI, TRAINCTX.BLOCK_SEEN = 300, 0.6
+function TRAINCTX.on() return NET.rdummy == true and TRAINING ~= nil and TRAINING.allowed() end
+function TRAINCTX.blockChi(pup, tn)
+    if not TRAINCTX.on() or NET.rtrainChi == "locked" or not valid(pup) then return nil end
+    if not (AISYNC and AISYNC.ownShachi and AISYNC.ownShachi()) then return nil end
+    if TRAINCTX.chiDropAt and tn - TRAINCTX.chiDropAt < TRAINCTX.BLOCK_SEEN then return "游戏已扣替身杀气" end
+    local cur = attrOf(pup, "Shachi")
+    if type(cur) ~= "number" then return nil end
+    local after = math.max(0, cur - TRAINCTX.BLOCK_CHI)
+    setAttr(pup, "Shachi", after)
+    TRAINCTX.chiSeen, TRAINCTX.chiFloor = after, after
+    if after <= 0 then
+        local ok = RECM.activateOnPuppet(pup, "GA_Hun_BreakEscape_C", NET.sub, "木桩普防杀气打空")
+        return string.format("木桩普防扣杀气 %.0f → 0，破防%s", cur, ok and "" or "（破防技能没激活）")
+    end
+    return string.format("木桩普防扣杀气 %.0f → %.0f", cur, after)
+end
+-- 每收一包（NET.recvOne）：① 记替身杀气什么时候掉过；② 杀气"损耗后不恢复"（trainChi=normal）：交手中只许往下走；
+-- ③ 精纯杀气 / 暗源：无限 = 一直补满；N 个 = 每回合（换回合 / 改设置时）定成 N、之后不补（大招 / 影之武装用掉就没了）
+function TRAINCTX.packet(pup, tn)
+    if not (TRAINCTX.on() and valid(pup)) then TRAINCTX.chiFloor, TRAINCTX.chiSeen, TRAINCTX.resTok = nil, nil, nil; return end
+    local cur = attrOf(pup, "Shachi")
+    if type(cur) == "number" then
+        -- §456.2 完美招架：替身没举架势也会被游戏按中招 / 普通格挡扣杀气（每刀约 300；11-26 实测 800 → 500 → 51 → 0 破防），
+        -- 而一套连段只回一次"精防"结果、回来时杀气已经扣了。完美招架本来每刀都精防、不该掉杀气 → 交手中掉的杀气一律补回
+        -- （包括被不可防御招打中那几下；木桩自己出招一般用精纯杀气 / 暗源，不吃杀气）
+        if NET.rtrainGuard == "perfect" and MATCH.state == "fight" and TRAINCTX.chiSeen and cur < TRAINCTX.chiSeen - 0.5 then
+            setAttr(pup, "Shachi", TRAINCTX.chiSeen)
+            TRAINCTX.parryKept = (TRAINCTX.parryKept or 0) + 1
+            if TRAINCTX.parryKept <= 5 then out("§456.2 木桩完美招架：游戏扣的杀气 %.0f → %.0f 补回（第 %d 次）", TRAINCTX.chiSeen, cur, TRAINCTX.parryKept) end
+            cur = TRAINCTX.chiSeen
+        end
+        if TRAINCTX.chiSeen and cur < TRAINCTX.chiSeen - 0.5 then TRAINCTX.chiDropAt = tn end
+        if NET.rtrainChi == "normal" and MATCH.state == "fight" then
+            if TRAINCTX.chiFloor and cur > TRAINCTX.chiFloor + 0.5 then setAttr(pup, "Shachi", TRAINCTX.chiFloor); cur = TRAINCTX.chiFloor
+            else TRAINCTX.chiFloor = cur end
+        else TRAINCTX.chiFloor = nil end
+        TRAINCTX.chiSeen = cur
+    end
+    TRAINCTX.resTok = TRAINCTX.resTok or {}
+    for _, r in ipairs({ { "UltimateChargeCount", NET.rtrainUlt }, { "SpiritShadow", NET.rtrainSp } }) do
+        local attr, want = r[1], r[2]
+        local c, mx = attrOf(pup, attr), attrOf(pup, attr .. "_Max")
+        if want == "normal" then
+            TRAINCTX.resTok[attr] = nil      -- 11-26 AI 木桩 V2"通常"：不补也不定数，按游戏原样
+        elseif type(c) == "number" and type(mx) == "number" and mx > 0 then
+            if want == nil or want == "inf" then
+                if c < mx then setAttr(pup, attr, mx) end
+                TRAINCTX.resTok[attr] = nil
+            else
+                local n = math.min(tonumber(want) or mx, mx)
+                local tok = tostring(MATCH.id) .. ":" .. tostring(MATCH.round) .. ":" .. tostring(want)
+                if TRAINCTX.resTok[attr] ~= tok then
+                    TRAINCTX.resTok[attr] = tok
+                    if math.abs(c - n) > 0.01 then setAttr(pup, attr, n) end
+                    out("§456 木桩%s：定成 %d 个（第 %s 回合，原来 %.0f，上限 %.0f）", attr == "SpiritShadow" and "暗源" or "精纯杀气", n, tostring(MATCH.round), c, mx)
+                end
+            end
+        end
+    end
+end
+-- 精纯杀气是有限个数时，替身放大招不再自动补 1 格（ULT.topUp）
+function TRAINCTX.ultCapped() return TRAINCTX.on() and NET.rtrainUlt ~= nil and NET.rtrainUlt ~= "inf" end
+-- §456 自动归位（用户 11-26）：准备后进入对局的那一下（第 1 回合倒计时）归位一次，之后不再归位
+function TRAINCTX.returns(round) return NET.rdummy == true and NET.rtrainReturn ~= false and (round or 1) <= 1 end
+-- 木桩站在游戏把它放的地方（不归位、不跟随）：除了第 1 回合倒计时（开了自动归位时）那一下，一直如此
+function TRAINCTX.stay() return NET.rdummy == true and not (MATCH.state == "cd" and TRAINCTX.returns(MATCH.round)) end
 TRAINING = BASEPARTS.load("training", { G = G, DSTAT = DSTAT, NET_DIR = NET_DIR,
+    dummy = function() return NET.rdummy == true end,     -- §456
     T = function(a, b) local X = EXTCTX; return X and X.T and X.T(a, b) or a end,
     scope = TRAINCTX.scope,
     members = function()

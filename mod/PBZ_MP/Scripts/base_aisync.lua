@@ -60,6 +60,25 @@ function A.wireRed(tn)
     table.sort(ids)
     return table.concat(ids, ",")
 end
+-- §456 木桩：除了红光，别的不可防御招（用户 11-26"红光技、黑光技等不可防御的招式"）。L1 + 圈 / 三角的特殊技
+-- （瞬杀 / 裂斩 / 影杀、杀气钩 C，资产里没有红蓝光提示，HANDOVER 9.3）和处决类。只发给联机程序判木桩格挡用（tunb=），不触发红光闪避
+A.UNBLOCK_EXACT = { GA_Hun_ShachiHook_C_C = true }
+function A.isUnblock(n)
+    if type(n) ~= "string" or A.isRed(n) then return false end
+    if A.UNBLOCK_EXACT[n] then return true end
+    if n:match("^GA_GlobalActionAbilit[iy]e?s?_%a+_C") then return true end       -- GA_GlobalActionAbility_ShunSha_C_C / _CB_C、GA_GlobalActionAbilities_YingSha_C_C
+    return n:find("Execution", 1, true) ~= nil or n:find("_GEx", 1, true) ~= nil
+end
+function A.wireUnb(tn)
+    local latest = {}
+    for id, r in pairs(A.mine) do
+        if tn - r.at <= A.KEEP and A.isUnblock(r.n) and (not latest[r.n] or id > latest[r.n]) then latest[r.n] = id end
+    end
+    local ids = {}
+    for _, id in pairs(latest) do ids[#ids + 1] = id end
+    table.sort(ids)
+    return table.concat(ids, ",")
+end
 function A.trainingBusy()
     if type(G.activeAbilities) ~= "function" then return false end
     local pup = G.puppet()
@@ -178,8 +197,11 @@ function A.wire(tn)
     local s = "act=" .. A.wireAct(tn) .. "\npst=" .. A.wirePst(tn) .. "\n"
     if ST.ticks % A.EVERY == 0 or A.trainBusy == nil then A.trainBusy = A.trainingBusy() end
     s = s .. "tred=" .. A.wireRed(tn) .. "\ntrainBusy=" .. (A.trainBusy and "1" or "0") .. "\n"
-    if NET.rdummy then s = s .. A.wireBreak(tn) end
-    if NET.rdummy and NET.rtrainReturn == false and type(G.trainingPosition) == "function" then
+    if NET.rdummy then s = s .. A.wireBreak(tn) .. "tunb=" .. A.wireUnb(tn) .. "\n" end     -- §456
+    -- §456 木桩站在原地时（不归位，或已过第 1 回合倒计时那次归位）报替身实际位置；ctx.dummyStay 由 main.lua 给（TRAINCTX.stay）
+    local stay
+    if ctx.dummyStay then stay = ctx.dummyStay() else stay = NET.rtrainReturn == false end
+    if NET.rdummy and stay and type(G.trainingPosition) == "function" then
         local ok, pos = pcall(G.trainingPosition, G.puppet())
         if ok and type(pos) == "string" then s = s .. "trainPos=" .. pos .. "\n" end
     end

@@ -473,7 +473,7 @@ end
 -- §276.9（移植 0.33 分支 §269.11）11-13 观战"人和车没同步"：真人驾车 10 秒多（松了键车照样跑），以前发送方按蓄力招算——松键就发 rel=、
 -- 按满 JUDGE_MAX 8 秒也发，接收方 8 秒没等到也自己取消 → 替身提早下车，人（跟着网络位置）和车分开。现在马车发送方只在下车时发 rel=
 -- （§276.10：播到下车动作 AM_JumpOffHorseCart，或技能真结束），接收方兜底放宽到 MAX 秒（旧版对方松键就发的 rel= 照旧会让替身提早下车）
-CHG.VEHICLE = { names = { GA_HorseCart_Charge_C = 1 }, MAX = 30.0, logN = 0 }
+CHG.VEHICLE = { names = { GA_HorseCart_Charge_C = 1 }, MAX = 30.0, logN = 0, OFF = "AM_JumpOffHorseCart" }
 
 function CHG.vehicleOff(pup, id, f, tn, why)
     if f.vehOff then return end
@@ -481,10 +481,21 @@ function CHG.vehicleOff(pup, id, f, tn, why)
     f.vehOff = true
     local gone = G.cancelAbilities(pup, function(n) return n == f.name end)
     local landed = #gone > 0 and G.hover(pup, false)
+    -- §459 11-26 用户"看对方放完马车后，马车消失了人还在播驾驶动作"：§437 力荡时模组自己给替身播的 AM_DriveHorseCart
+    -- 不归马车技能管，取消技能车没了、这个动作照播（19:12:39 / 19:13:00 / 19:13:06 / 19:13:27 取消后替身再没换过动作）。
+    -- 取消后替身还在上车 / 驾车动作就播下车动作（和发送方一样），播不了就直接收掉
+    local am = G.activeMontage or (LAT and LAT.activeMontage)
+    local mon = am and select(3, am(pup))
+    local stopped
+    if type(mon) == "string" and mon:find("HorseCart", 1, true) and not mon:find("JumpOff", 1, true) then
+        if playNamed(pup, CHG.VEHICLE.OFF) then stopped = "播下车 " .. CHG.VEHICLE.OFF
+        else stopped = (G.retract and G.retract(pup)) and ("收掉 " .. mon) or ("收不掉 " .. mon) end
+    end
     if CHG.VEHICLE.logN < 30 then
         CHG.VEHICLE.logN = CHG.VEHICLE.logN + 1
-        out("马车：远端#%d %s 放出 %.2f 秒，%s → 替身取消技能 %s%s", id, f.name, tn - f.at, why,
-            #gone > 0 and table.concat(gone, ",") or "（已经没在放）", landed and "，放回走路" or "")
+        out("马车：远端#%d %s 放出 %.2f 秒，%s → 替身取消技能 %s%s%s", id, f.name, tn - f.at, why,
+            #gone > 0 and table.concat(gone, ",") or "（已经没在放）", landed and "，放回走路" or "",
+            stopped and ("，替身动作 " .. stopped) or "")
     end
 end
 
@@ -554,7 +565,9 @@ INP = { KEYS = { GA_TanLang_Normal_C = INP_HOLD2, GA_JinGua_RoAttack_C = INP_HOL
                  -- 约 1 秒后技能照样结束、盾收掉，之后只剩补的举盾姿势）。发送方举盾时按着的是影武键（"开始 GA_ZhuoBiDun_C 时
                  -- 按着的输入 IA_ShachiAbility_Hold"）。替身按住影武键让技能自己一直举着；松开：对方 rel= 到点（pupStep）/
                  -- 下一招 / HOLD_MAX / 回合切换（SHIELD.holdOne 收尾）。拉回暂停留着当兜底（按住不生效时）
-                 GA_ZhuoBiDun_C = INP_SHACHI },
+                 -- §455 只按影武长按键（发送方举盾时 HoldingInputs 只有 IA_ShachiAbility_Hold）；以前连 IA_ShachiAbility 一起按，
+                 -- 和对方实际按着的不一样。举盾技能格挡后看这个键松没松决定要不要盾反（替身没按着 = 格挡完马上自己盾反）
+                 GA_ZhuoBiDun_C = { "/PBZInput/InputActions/IA_ShachiAbility_Hold.IA_ShachiAbility_Hold" } },
         -- §432 这些招只在对方发 rel=（新版）时才按住：等不到松手会一直按到记录过期，替身每拳都打满档
         -- §439 举盾同理：旧版对方等不到松手会举满 45 秒
         NEED_REL = { GA_TieKuangQuanTao_Charge_A_C = true, GA_TieKuangQuanTao_Charge_AA_C = true, GA_TieKuangQuanTao_Charge_AAA_C = true,

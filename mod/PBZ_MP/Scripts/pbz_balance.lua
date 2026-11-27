@@ -95,7 +95,7 @@ dot = { ChiRen = 0.25, GA_GlobalActionAbility_LieZhan_CB_C = 0.05, GA_GlobalActi
 ctrl = { frost = 1 },
 chill = { dmg = 0 },
 sdmg = { ZiMingJian_HuoQiang = 2.1 },
-segments = { JueYingClone = 0.25, B_Hun_Horizontal_BladeWave_Stand_01 = 1.75, B_Hun_Horizontal_BladeWave_Stand_02 = 1.75, B_Hun_Horizontal_BladeWave_DashIn_02 = 3.8, B_Hun_JigSaw_C_01 = 1.5, B_Hun_JigSaw_C_02 = 1.5, B_Hun_JigSaw_C_03 = 1.5, BD_Hun_BronzeSword_HoldB_Release_02_03 = 1.145, BD_Hun_BronzeSword_BA_02 = 1.5, TipsyLight = 0.72, TipsyHeavy = 0.71, DrunkHeavy = 1.63, ChaosFireHeavy = 1.5, BD_Hun_BrutalAxe_Release_01_01 = 0.67213, BD_Hun_BrutalAxe_Release_02_Shock = 0.393443, BD_Hun_BrutalAxe_Release_03_Shock_01 = 0.393443, BD_Hun_BrutalAxe_Release_03_Shock_02 = 0.393443, B_TigerCannon_Normal = 1.6, B_TigerCannon_Explosion_Normal = 1.6, B_TigerCannon_Ultimate_01 = 0.08, B_LionHead_Start = 0.083333, B_LionHead_Start_Chaos = 0.083333, BD_GA_DuYan_Bow_Normal_P1_01 = 1.36744, BD_GA_DuYan_Bow_Normal_P3_01 = 0.930233, B_YouLongCha_Normal = 1.57424, BulletData_JinGua_RoAttack_03 = 0.550847, BulletData_TanLang_Normal_03 = 0.294118, BD_ZhuoBiDun_CounterAttack_Wave = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_02 = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_Sub = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_Sub_02 = 0.48, BD_Hun_HuoLiuXing_DB_GroundFire_01 = 1.35135, BD_NiTouChe_Overlap_TurnAttack = 0.0816, BulletData_JinGua_ExtraAttack_02 = 2.22222, BD_Hun_JinGua_Release_03_Charge2 = 0.43, BD_Hun_JinGua_Release_03_Charge3 = 0.64, BulletData_TieKuangQuanTao_Charge_A_Lv2_02 = 0.83, BulletData_TieKuangQuanTao_Charge_AA_Lv2 = 0.83, BulletData_TieKuangQuanTao_Charge_AAA_Lv2 = 0.83, BD_Hun_BrutalAxe_Release_02_01 = 0.5, BD_Hun_BrutalAxe_Release_02_02 = 0.5, BD_Hun_BrutalAxe_Release_03_01 = 0.7, BD_Hun_BrutalAxe_Release_03_02 = 0.7, BD_Hun_BrutalAxe_Release_03_03 = 0.7, B_GA_UnnamedBow_Dash_L_01 = 0.566667, B_GA_UnnamedBow_Dash_L_02 = 0.566667, B_GA_UnnamedBow_Dash_L_03 = 0.566667, B_GA_UnnamedBow_Dash_R_01 = 0.566667, B_GA_UnnamedBow_Dash_R_02 = 0.566667, BD_GA_Hun_Double_JueYing_C_Crow_Summon = 0.25, BD_GA_Hun_Double_JueYing_C_Crow_Near_Summon = 0.25, BD_GA_Hun_Double_JueYing_C_Sweep_Summon = 0.25, BD_GA_Hun_JueYing_C_End_Summon = 0.25, B_Hun_JueYing_C_01_Summon = 0.25, B_Hun_JueYing_C_02_Summon = 0.25 },
+segments = { JueYingClone = 0.25, B_Hun_Horizontal_BladeWave_Stand_01 = 1.75, B_Hun_Horizontal_BladeWave_Stand_02 = 1.75, B_Hun_Horizontal_BladeWave_DashIn_02 = 3.8, B_Hun_JigSaw_C_01 = 1.5, B_Hun_JigSaw_C_02 = 1.5, B_Hun_JigSaw_C_03 = 1.5, BD_Hun_BronzeSword_HoldB_Release_02_03 = 1.145, BD_Hun_BronzeSword_BA_02 = 1.5, TipsyLight = 0.72, TipsyHeavy = 0.71, DrunkHeavy = 1.63, ChaosFireHeavy = 1.5, BD_Hun_BrutalAxe_Release_01_01 = 0.67213, BD_Hun_BrutalAxe_Release_02_Shock = 0.393443, BD_Hun_BrutalAxe_Release_03_Shock_01 = 0.393443, BD_Hun_BrutalAxe_Release_03_Shock_02 = 0.393443, B_TigerCannon_Normal = 1.6, B_TigerCannon_Explosion_Normal = 1.6, B_TigerCannon_Ultimate_01 = 0.08, B_LionHead_Start = 0.083333, B_LionHead_Start_Chaos = 0.083333, BD_GA_DuYan_Bow_Normal_P1_01 = 1.36744, BD_GA_DuYan_Bow_Normal_P3_01 = 0.930233, B_YouLongCha_Normal = 1.57424, BulletData_JinGua_RoAttack_03 = 0.550847, BulletData_TanLang_Normal_03 = 0.294118, BD_ZhuoBiDun_CounterAttack_Wave = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_02 = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_Sub = 0.48, BD_ZhuoBiDun_CounterAttack_Wave_Sub_02 = 0.48, BD_Hun_HuoLiuXing_DB_GroundFire_01 = 1.35135, BD_NiTouChe_Overlap_TurnAttack = 0.0816, BulletData_JinGua_ExtraAttack_02 = 2.22222, BD_Hun_JinGua_Release_03_Charge2 = 0.43, BD_Hun_JinGua_Release_03_Charge3 = 0.64, BulletData_TieKuangQuanTao_Charge_A_Lv2_02 = 0.83, BulletData_TieKuangQuanTao_Charge_AA_Lv2 = 0.83, BulletData_TieKuangQuanTao_Charge_AAA_Lv2 = 0.83, BD_Hun_BrutalAxe_Release_02_01 = 0.5, BD_Hun_BrutalAxe_Release_02_02 = 0.5, BD_Hun_BrutalAxe_Release_03_01 = 0.7, BD_Hun_BrutalAxe_Release_03_02 = 0.7, BD_Hun_BrutalAxe_Release_03_03 = 0.7, B_GA_UnnamedBow_Dash_L_01 = 0.566667, B_GA_UnnamedBow_Dash_L_02 = 0.566667, B_GA_UnnamedBow_Dash_L_03 = 0.566667, B_GA_UnnamedBow_Dash_R_01 = 0.566667, B_GA_UnnamedBow_Dash_R_02 = 0.566667, BD_GA_Hun_Double_JueYing_C_Crow_Summon = 0.25, BD_GA_Hun_Double_JueYing_C_Crow_Near_Summon = 0.25, BD_GA_Hun_Double_JueYing_C_Sweep_Summon = 0.25, BD_GA_Hun_JueYing_C_End_Summon = 0.25, B_Hun_JueYing_C_01_Summon = 0.25, B_Hun_JueYing_C_02_Summon = 0.25, BulletData_TanLang_ExtraAttack_01 = 0.613426, BulletData_TanLang_ExtraAttack_02 = 0.8, B_GA_UnnamedBow_Dash_B_01 = 2.361671 },
 moves = {
 
 -- ==== 黑伤双刃 · 空中（Air，3 招）
@@ -1035,12 +1035,12 @@ moves = {
   GA_HuangJinHuoChong_Normal_04_C = 0.27,
 
 -- ==== 影之武装 · 火流星（HuoLiuXing，6 招）
-  GA_Hun_HuoLiuXing_AAAA_C = 0.4158,
-  GA_Hun_HuoLiuXing_AAA_C = 0.092169,
-  GA_Hun_HuoLiuXing_AA_C = 0.092169,
-  GA_Hun_HuoLiuXing_A_C = 0.092169,
-  GA_Hun_HuoLiuXing_A_Short_C = 1.459342,
-  GA_Hun_HuoLiuXing_DB_C = 0.162393,
+  GA_Hun_HuoLiuXing_AAAA_C = 0.428274,
+  GA_Hun_HuoLiuXing_AAA_C = 0.0949341,
+  GA_Hun_HuoLiuXing_AA_C = 0.0949341,
+  GA_Hun_HuoLiuXing_A_C = 0.0949341,
+  GA_Hun_HuoLiuXing_A_Short_C = 1.50312,
+  GA_Hun_HuoLiuXing_DB_C = 0.167265,
 
 -- ==== 影之武装 · 剑客召集令（JianKeZhaoJiLing，1 招）
   GA_JianKeZhaoJiLing_Normal_01_C = 3.0,
@@ -1068,14 +1068,14 @@ moves = {
   GA_Lute_Dash_C = 0.18225,
 
 -- ==== 影之武装 · 妙手飞刀（MiaoShouFeiDao，8 招）
-  GA_MiaoShouFeiDao_DB_C = 0.4725,
+  GA_MiaoShouFeiDao_DB_C = 0.4914,
   GA_MiaoShouFeiDao_Escape_01_C = 0.15,
   GA_MiaoShouFeiDao_Escape_02_C = 0.15,
   GA_MiaoShouFeiDao_Escape_03_C = 0.15,
-  GA_MiaoShouFeiDao_Escape_C = 0.9954,
-  GA_MiaoShouFeiDao_Normal_01_C = 0.1246,
-  GA_MiaoShouFeiDao_Normal_02_C = 0.1246,
-  GA_MiaoShouFeiDao_Normal_03_C = 0.1246,
+  GA_MiaoShouFeiDao_Escape_C = 1.03522,
+  GA_MiaoShouFeiDao_Normal_01_C = 0.129584,
+  GA_MiaoShouFeiDao_Normal_02_C = 0.129584,
+  GA_MiaoShouFeiDao_Normal_03_C = 0.129584,
 
 -- ==== 影之武装 · 墨血无痕（MoJian，6 招）
   GA_Hun_MoJian_PerfectDodge_C = 0.35,
@@ -1128,7 +1128,7 @@ moves = {
   GA_TigerCannon_Counter_C = 0.35,
   GA_TigerCannon_Dash_C = 0.3843,
   GA_TigerCannon_QuickCharge_C = 0.3213,  -- 11.20 二重咆哮：修复漏判，继承父GA规范基准0.17*2.7；非旧日志倍率保证
-  GA_TigerCannon_Ultimate_C = 0.66,
+  GA_TigerCannon_Ultimate_C = 0.5337,
 
 -- ==== 影之武装 · 羽弓（UnnamedBow，3 招）
   GA_UnnamedBow_C = 0.32844,
@@ -1154,8 +1154,8 @@ moves = {
   GA_YouLongCha_Normal_C = 0.317613,
 
 -- ==== 影之武装 · 游龙头（YouLongHead，2 招）
-  GA_YouLongHead_WaterCannon_C = 0.20148,
-  GA_YouLongHead_Water_C = 2.86651,
+  GA_YouLongHead_WaterCannon_C = 0.211554,
+  GA_YouLongHead_Water_C = 3.00984,
 
 -- ==== 影之武装 · 拙壁盾（ZhuoBiDun，2 招）
   GA_ZhuoBiDun_C = 0.35,

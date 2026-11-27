@@ -921,6 +921,7 @@ function SP.tagFrame()
     if not valid(pc) then return end
     local paused = false
     pcall(function()
+        if G.menuOpen then paused = G.menuOpen() == true; return end     -- 11-26 游戏菜单真开着（UUU 相机 mod 的暂停不算）
         SP.gs = SP.gs or StaticFindObject("/Script/Engine.Default__GameplayStatics")
         paused = SP.gs:IsGamePaused(pc) == true
     end)

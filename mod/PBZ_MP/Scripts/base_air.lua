@@ -854,6 +854,7 @@ end
 -- §362.2 按角色类收：自己 + 所有替身（多人房每人一个）放的一次扫完；p1 拿不到时退回只收替身的
 function RT.stopBullets(p1, pup, phase)
     if CART and CART.live and #CART.live > 0 then pcall(CART.kill, phase) end   -- §442 力荡判定
+    if CARTCAP and CARTCAP.reset then CARTCAP.reset() end                      -- §460 马车封顶计数
     if not G.stopBullets then return end
     local who, a = "自己和替身", p1
     if not valid(a) then who, a = "替身", pup end

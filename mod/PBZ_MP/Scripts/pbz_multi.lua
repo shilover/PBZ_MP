@@ -2589,7 +2589,8 @@ end
 
 -- ---- 观战视角（自己出局后）：藏起自己、冻住、镜头放到还活着的人身后（小键盘 * 换人）
 -- 【适配】SetActorHiddenInGame / CharacterMovement:DisableMovement / PC:SetIgnoreMoveInput / SpawnActor(CameraActor) / SetViewTargetWithBlend
-local SPEC = { on = false, cam = nil, idx = 1, target = nil }
+local SPEC = { on = false, cam = nil, idx = 1, target = nil,
+               INV_GE = "/Game/PBZContent/Blueprint/FlowGraph/GameplayEffect/GE_FlowInvulnerable.GE_FlowInvulnerable_C" }
 MP.specView = SPEC
 local function specTargets()
     local list = {}
@@ -2616,6 +2617,15 @@ local function specStart(kind)
     local cm = rawProp(p1, "CharacterMovement")
     if valid(cm) then pcall(function() cm.Velocity = { X = 0.0, Y = 0.0, Z = 0.0 } end); pcall(function() cm:DisableMovement() end) end
     pcall(function() pc:SetIgnoreMoveInput(true) end)
+    -- §461 11-26 用户："观战的人好像不是完全无敌，突然扣血然后显示我的血条"：多人房 / 对决观战以前只藏人 + 锁血（锁血只保证不死、照样扣血，
+    -- 交手中第一位选手在观众那里是敌方，他的招 / 分身能打到藏着的观众）。挂和旧版观战（§223.2）/ 倒计时（§173）同一个游戏无敌效果
+    if ctx.LO and ctx.LO.applyGE then SPEC.inv = ctx.LO.applyGE(p1, SPEC.INV_GE, "多人观战 自己无敌") and true or nil end
+    -- §461.1 观战时按攻击 / 闪避，藏着的自己会出招、游戏把自己的血条亮出来（11-26 用户确认）：出招类输入整组摘掉，specStop 挂回
+    if G.uiCtxStrip and G.combatCtx and not SPEC.ctx then
+        local okS, list, desc = pcall(G.uiCtxStrip, G.combatCtx())
+        SPEC.ctx = okS and list or nil
+        out("§461.1 观战摘出招输入：%s", okS and tostring(desc) or ("!! 出错 " .. tostring(list)))
+    end
     if not valid(SPEC.cam) then
         local cls = StaticFindObject("/Script/Engine.CameraActor")
         local l = loc(p1)
@@ -2646,6 +2656,14 @@ local function specStop()
         pcall(function() p1:SetActorHiddenInGame(false) end)
         local cm = rawProp(p1, "CharacterMovement")
         if valid(cm) then pcall(function() cm:SetMovementMode(1, 0) end) end
+        -- §461 撤观战无敌（只撤自己挂的；上场的倒计时无敌在 specStop 之后才挂，不会被这里撤掉）
+        if SPEC.inv and ctx.LO and ctx.LO.removeGE then ctx.LO.removeGE(p1, SPEC.INV_GE, "多人观战结束 撤自己无敌") end
+    end
+    SPEC.inv = nil
+    if SPEC.ctx then
+        local okR, ok, desc = pcall(G.uiCtxRestore, SPEC.ctx)
+        out("§461.1 退出观战挂回出招输入：%s", okR and tostring(desc) or ("!! 出错 " .. tostring(ok)))
+        SPEC.ctx = nil
     end
     if valid(pc) then
         pcall(function() pc:ResetIgnoreMoveInput() end)

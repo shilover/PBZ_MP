@@ -5182,6 +5182,14 @@ end
 --   RemoveMappingContext(IMC, FModifyContextOptions) / AddMappingContext(IMC, 优先级, FModifyContextOptions)
 do
 local UICTX = { "/Game/PBZContent/Input/IMC_HUDInput.IMC_HUDInput", "/Game/PBZContent/Input/IMC_Interaction.IMC_Interaction" }
+-- §461.1 11-26 用户确认"观战时按攻击之类的会显示血条"：观战（藏着、冻住）时把出招类输入整组摘掉、退出观战挂回。
+--   IMC_Default = 轻 / 重攻击、跳、影之武装、大招、锁定、红光闪避；IMC_Deflect = 闪避 / 格挡 / 精防 / 架势；IMC_Execution = 处决；
+--   IMC_ChangeWeapon = 切武器 / 切影之武装；IMC_HUDInput_Meidicne = 上下格喝药（资产名本来就拼错）。
+--   看视角的 IMC_Locomotion 不摘（自由视角要转镜头）。组名 / 里面的 IA 是 utoc 里读 IMC_* 资产名字表查的
+E.COMBAT_CTX = {
+    "/PBZInput/IMC_Default.IMC_Default", "/PBZInput/IMC_Deflect.IMC_Deflect", "/PBZInput/IMC_Execution.IMC_Execution",
+    "/PBZInput/IMC_ChangeWeapon.IMC_ChangeWeapon", "/Game/PBZContent/Input/IMC_HUDInput_Meidicne.IMC_HUDInput_Meidicne",
+}
 -- 【适配】玩家1 的 LocalPlayer（PlayerController.Player）+ FindAllOf("EnhancedInputLocalPlayerSubsystem") 里 Outer 是它的那个
 local function eiSub()
     local pc = getP1PC()
@@ -5213,11 +5221,12 @@ local function hasCtx(sub, c)
 end
 -- 摘：返回 摘掉的列表（给 uiCtxRestore）, 日志说明
 -- 【适配】EnhancedInputLocalPlayerSubsystem:RemoveMappingContext(IMC, FModifyContextOptions)，摘完再 HasMappingContext 核对
-function E.uiCtxStrip()
+-- §461.1 paths 不传 = UICTX（§260 开界面那两组）；观战传 E.COMBAT_CTX
+function E.uiCtxStrip(paths)
     local sub, why = eiSub()
     if not sub then return {}, why end
     local got, parts = {}, {}
-    for _, path in ipairs(UICTX) do
+    for _, path in ipairs(paths or UICTX) do
         local nm = path:match("%.([%w_]+)$")
         local c = StaticFindObject(path)
         if not valid(c) then parts[#parts + 1] = nm .. " 没加载"
@@ -5271,6 +5280,19 @@ function E.unpause()
     if not valid(pc) then return false, "没有玩家控制器" end
     local ok, err = pcall(function() gstat():SetGamePaused(pc, false) end)
     return ok, ok and nil or tostring(err)
+end
+-- 11-26 游戏菜单真开着（Esc / 角色菜单）：IsGamePaused 之外还要有"谁暂停的"（WorldSettings.PauserPlayerState）。
+-- 相机 mod UUU 的小键盘 0 暂停把 UWorld::IsPaused 直接改成 true、不设暂停者——那不是菜单：模组照常显示 / 藏、不取消暂停。
+-- 游戏里实测：Esc 菜单 paused=true pauser=有；UUU 暂停 paused=true pauser=没有。读不到暂停者（结构变了）按暂停算 = 旧行为
+-- 【适配】GameplayStatics:IsGamePaused / Controller:GetWorld().PersistentLevel.WorldSettings.PauserPlayerState
+function E.menuOpen()
+    local pc = getP1PC()
+    local okP, p = pcall(function() return gstat():IsGamePaused(pc) end)
+    if not (okP and p == true) then return false end
+    local okW, who = pcall(function() return pc:GetWorld().PersistentLevel.WorldSettings.PauserPlayerState end)
+    if not okW then return true end
+    local okV, v = pcall(valid, who)
+    return okV and v == true
 end
 end
 
@@ -6080,10 +6102,11 @@ end
 return {
     nameTagNew = NAMETAG.new, nameTagSet = NAMETAG.set, nameTagBar = NAMETAG.bar, nameTagBarColor = NAMETAG.barColor, nameTagStyle = NAMETAG.style, nameTagPlace = NAMETAG.place, nameTagRemove = NAMETAG.remove,
     hudShow = E.hudShow,      -- §314 界面三态
+    menuOpen = E.menuOpen,    -- 11-26 游戏菜单真开着（UUU 暂停不算）
     hudLayout = E.hudLayout,  -- 11.23 当前在屏幕上的 HUD（多人房血条认 HUD 换没换）
     tagsMatching = tagsMatching, puppetDiag = puppetDiag, discardPuppet = discardPuppet, stashAway = stashAway,
     guardRecoveryCount = E.guardRecoveryCount, guardRecoveryIdleMontage = E.guardRecoveryIdleMontage, guardRecoveryEffects = E.guardRecoveryEffects, guardRecoveryReceiveFrames = E.guardRecoveryReceiveFrames, guardRecoveryRemove = E.guardRecoveryRemove, looseTag = E.looseTag,
-    montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, flushInput = HOLDC.flushRun, gameInputBlock = E.gameInputBlock, inputFlushMsg = function() return E.flushMsg end, uiCtxStrip = E.uiCtxStrip, uiCtxRestore = E.uiCtxRestore, unpause = E.unpause, capsuleSize = E.capsuleSize, spawnFxAt = E.spawnFxAt, fxActive = E.fxActive, worldFx = E.worldFx, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = E.holdTaskProbe, inputEnsure = E.inputEnsure, worldTime = E.worldTime, linkAbilityInput = E.linkAbilityInput, inputHold = E.inputHold, inputHoldDump = E.inputHoldDump,
+    montageSection = montageSection, specInput = specInput, inputProbe = inputProbe, holdingInputs = holdingInputs, flushInput = HOLDC.flushRun, gameInputBlock = E.gameInputBlock, inputFlushMsg = function() return E.flushMsg end, uiCtxStrip = E.uiCtxStrip, uiCtxRestore = E.uiCtxRestore, combatCtx = function() return E.COMBAT_CTX end, unpause = E.unpause, capsuleSize = E.capsuleSize, spawnFxAt = E.spawnFxAt, fxActive = E.fxActive, worldFx = E.worldFx, abilityField = abilityField, montagePause = montagePause, inputCompInfo = inputCompInfo, holdTaskProbe = E.holdTaskProbe, inputEnsure = E.inputEnsure, worldTime = E.worldTime, linkAbilityInput = E.linkAbilityInput, inputHold = E.inputHold, inputHoldDump = E.inputHoldDump,
     teleportTo = teleportTo, traceHit = traceHit, traceActor = E.traceActor, actorInfo = E.actorInfo, setHidden = E.setHidden, overlapActors = TUBE.overlapActors, hismList = TUBE.hismList, hismInstancesIn = TUBE.hismInstancesIn, hismXf = TUBE.hismXf, hismSetXf = TUBE.hismSetXf, meshHalf = TUBE.meshHalf, tubeProbe = TUBE.probe, floorBelow = floorBelow, laserBeamSpawn = E.laserBeamSpawn, aimComps = E.aimComps, destroyComps = E.destroyComps, rotateComps = E.rotateComps, setControlRot = E.setControlRot, compRotStr = E.compRotStr, bulletSubsysProbe = E.bulletSubsysProbe, findObj = E.findObj, countBullets = E.countBullets, summonCount = E.summonCount, hitSources = E.hitSources, snapshotEffects = E.snapshotEffects, damagePartSnapshot = E.damagePartSnapshot, hitOwnerOf = E.hitOwnerOf, tensionLast = E.tensionLast, bulletScan = E.bulletScan, bulletWhere = E.bulletWhere,
     laserEmitterSpawn = E.laserEmitterSpawn, vehicleMesh = E.vehicleMesh, playOnMesh = E.playOnMesh, emitterInfo = E.emitterInfo, moveEmitter = E.moveEmitter, destroyActor = E.destroyActor, stopBullets = E.stopBullets,
     full = full, pathOf = pathOf, valid = valid, try = try, rawProp = rawProp, shortName = shortName,

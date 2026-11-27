@@ -165,7 +165,9 @@ function R.step(tn)
         if flags and ctx.G.valid(a.actor) then
             for i, key in ipairs(keys) do
                 -- C# owns AI HP; only room AI need Lua to enforce their Shachi flag.
-                if flags[key] and not (ai and (i == 1 or (i == 2 and s.kind ~= "room"))) and not (i == 1 and s.deferHP == true) then
+                -- §456 本地 AI 木桩的精纯杀气 / 暗源由木桩设置管（无限 / N 个，main.lua TRAINCTX.packet），这里不补
+                local dummyRes = ai and s.kind == "local_ai" and (i == 3 or i == 4) and ctx.dummy and ctx.dummy()
+                if flags[key] and not dummyRes and not (ai and (i == 1 or (i == 2 and s.kind ~= "room"))) and not (i == 1 and s.deferHP == true) then
                     local attr = attrs[i]
                     local cur, mx = ctx.G.attrOf(a.actor, attr), ctx.G.attrOf(a.actor, attr .. "_Max")
                     if type(cur) == "number" and type(mx) == "number" and mx > 0 and cur < mx and (i ~= 1 or cur > 0) then ctx.G.attrModSet(a.actor, attr, mx) end
@@ -195,13 +197,20 @@ local function toggles(items, flags, valid)
         end }
     end
 end
+-- §456 木桩设置页的"AI 对手 HP 状态 · 无限 HP"：改本地 AI 的无限 HP（和"AI 特殊资源设定"同一份）；不能改时返回 false
+function R.aiFlag(key) return R.cfg.ai[key] == true end
+function R.setAiFlag(key, on)
+    local s = state()
+    if not editable(s, "local_ai") then return false end
+    R.cfg.ai[key] = on == true; R.changed(); return true
+end
 function R.items(lb, items, toPage, flash)
     local s = state()
     if editable(s, "local_ai") then
         local session = s.session
         toggles(items, R.cfg.ai, function() local now = state(); if editable(now, "local_ai") and now.session == session then return R.cfg.ai end end)
     else denied(items) end
-    if toPage then items[#items + 1] = { label = T("返回", "BACK"), act = toPage("main") } end
+    if toPage then items[#items + 1] = { label = T("返回", "BACK"), act = toPage("training") } end     -- 11-26 V2：从"AI 训练设置"进
 end
 function R.roomItems(items, selectCallback, backCallback)
     local s = state()
